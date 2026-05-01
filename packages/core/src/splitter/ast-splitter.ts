@@ -11,6 +11,7 @@ const Go = require('tree-sitter-go');
 const Rust = require('tree-sitter-rust');
 const CSharp = require('tree-sitter-c-sharp');
 const Scala = require('tree-sitter-scala');
+const Haxe = require('tree-sitter-haxe');
 
 // Node types that represent logical code units
 const SPLITTABLE_NODE_TYPES = {
@@ -22,7 +23,8 @@ const SPLITTABLE_NODE_TYPES = {
     go: ['function_declaration', 'method_declaration', 'type_declaration', 'var_declaration', 'const_declaration'],
     rust: ['function_item', 'impl_item', 'struct_item', 'enum_item', 'trait_item', 'mod_item'],
     csharp: ['method_declaration', 'class_declaration', 'interface_declaration', 'struct_declaration', 'enum_declaration'],
-    scala: ['method_declaration', 'class_declaration', 'interface_declaration', 'constructor_declaration']
+    scala: ['method_declaration', 'class_declaration', 'interface_declaration', 'constructor_declaration'],
+    haxe: ['ClassType', 'EnumType', 'AbstractType', 'DefType', 'ClassMethod']
 };
 
 export class AstCodeSplitter implements Splitter {
@@ -53,7 +55,11 @@ export class AstCodeSplitter implements Splitter {
             console.log(`🌳 Using AST splitter for ${language} file: ${filePath || 'unknown'}`);
 
             this.parser.setLanguage(langConfig.parser);
-            const tree = this.parser.parse(code);
+            // Stream input via callback to bypass tree-sitter@0.21 32KB string limit
+            const CHUNK_SIZE = 8 * 1024;
+            const parserInput = (index: number) =>
+                index >= code.length ? null : code.slice(index, index + CHUNK_SIZE);
+            const tree = this.parser.parse(parserInput);
 
             if (!tree.rootNode) {
                 console.warn(`[ASTSplitter] ⚠️  Failed to parse AST for ${language}, falling back to LangChain: ${filePath || 'unknown'}`);
@@ -100,7 +106,9 @@ export class AstCodeSplitter implements Splitter {
             'rs': { parser: Rust, nodeTypes: SPLITTABLE_NODE_TYPES.rust },
             'cs': { parser: CSharp, nodeTypes: SPLITTABLE_NODE_TYPES.csharp },
             'csharp': { parser: CSharp, nodeTypes: SPLITTABLE_NODE_TYPES.csharp },
-            'scala': { parser: Scala, nodeTypes: SPLITTABLE_NODE_TYPES.scala }
+            'scala': { parser: Scala, nodeTypes: SPLITTABLE_NODE_TYPES.scala },
+            'haxe': { parser: Haxe, nodeTypes: SPLITTABLE_NODE_TYPES.haxe },
+            'hx': { parser: Haxe, nodeTypes: SPLITTABLE_NODE_TYPES.haxe }
         };
 
         return langMap[language.toLowerCase()] || null;
@@ -263,7 +271,8 @@ export class AstCodeSplitter implements Splitter {
     static isLanguageSupported(language: string): boolean {
         const supportedLanguages = [
             'javascript', 'js', 'typescript', 'ts', 'python', 'py',
-            'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala'
+            'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala',
+            'haxe', 'hx'
         ];
         return supportedLanguages.includes(language.toLowerCase());
     }

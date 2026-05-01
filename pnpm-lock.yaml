@@ -178,6 +178,9 @@ importers:
       tree-sitter-go:
         specifier: ^0.21.0
         version: 0.21.2(tree-sitter@0.21.1)
+      tree-sitter-haxe:
+        specifier: file:../../../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz
+        version: file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz(tree-sitter@0.21.1)
       tree-sitter-java:
         specifier: ^0.21.0
         version: 0.21.0(tree-sitter@0.21.1)
@@ -3191,6 +3194,10 @@ packages:
     resolution: {integrity: sha512-D9DI/gXHvVmjHS08SVch0Em8G5S1P+QWtU31appcKT/8wFSPRcdHadIFSAntdMMVM5zz+/DL+bL/gz3UDppqtg==}
     engines: {node: ^18 || ^20 || >= 21}
 
+  node-addon-api@8.7.0:
+    resolution: {integrity: sha512-9MdFxmkKaOYVTV+XVRG8ArDwwQ77XIgIPyKASB1k3JPq3M8fGQQQE3YpMOrKm6g//Ktx8ivZr8xo1Qmtqub+GA==}
+    engines: {node: ^18 || ^20 || >= 21}
+
   node-domexception@1.0.0:
     resolution: {integrity: sha512-/jKZoMpw0F8GRwl4/eLROPA3cfcXtLApP0QzLmUT/HuPCZWyB7IY9ZrMeKw2O/nFIqPQB3PVM9aYm0F312AXDQ==}
     engines: {node: '>=10.5.0'}
@@ -3977,6 +3984,15 @@ packages:
       tree_sitter: '*'
     peerDependenciesMeta:
       tree_sitter:
+        optional: true
+
+  tree-sitter-haxe@file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz:
+    resolution: {integrity: sha512-yzFklqUCo+XW15FnSfl4xZhS376aBk6V/UygqtFAcGXoQM3hbS2c623nx1QbijOLi4AUei98nSZBmbmeAkfriw==, tarball: file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz}
+    version: 0.4.6
+    peerDependencies:
+      tree-sitter: ^0.25.0
+    peerDependenciesMeta:
+      tree-sitter:
         optional: true
 
   tree-sitter-java@0.21.0:
@@ -7801,6 +7817,8 @@ snapshots:
 
   node-addon-api@8.4.0: {}
 
+  node-addon-api@8.7.0: {}
+
   node-domexception@1.0.0: {}
 
   node-fetch@2.7.0:
@@ -8629,6 +8647,13 @@ snapshots:
     dependencies:
       node-addon-api: 8.4.0
       node-gyp-build: 4.8.4
+      tree-sitter: 0.21.1
+
+  tree-sitter-haxe@file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz(tree-sitter@0.21.1):
+    dependencies:
+      node-addon-api: 8.7.0
+      node-gyp-build: 4.8.4
+    optionalDependencies:
       tree-sitter: 0.21.1
 
   tree-sitter-java@0.21.0(tree-sitter@0.21.1):
