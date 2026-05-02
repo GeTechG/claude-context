@@ -23,6 +23,16 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { FileSynchronizer } from './sync/synchronizer';
 
+function parseHeadingPath(raw: string | undefined): string[] | undefined {
+    if (!raw) return undefined;
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed.map(String) : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
     '.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.cpp', '.c', '.h', '.hpp',
@@ -569,7 +579,12 @@ export class Context {
                 startLine: result.document.startLine,
                 endLine: result.document.endLine,
                 language: result.document.metadata.language || 'unknown',
-                score: result.score
+                score: result.score,
+                content_type: result.document.content_type,
+                symbol_name: result.document.symbol_name,
+                symbol_kind: result.document.symbol_kind,
+                parent_symbol: result.document.parent_symbol,
+                heading_path: parseHeadingPath(result.document.heading_path),
             }));
 
             const dedupedResults = this.deduplicateResults(results);
@@ -598,7 +613,12 @@ export class Context {
                 startLine: result.document.startLine,
                 endLine: result.document.endLine,
                 language: result.document.metadata.language || 'unknown',
-                score: result.score
+                score: result.score,
+                content_type: result.document.content_type,
+                symbol_name: result.document.symbol_name,
+                symbol_kind: result.document.symbol_kind,
+                parent_symbol: result.document.parent_symbol,
+                heading_path: parseHeadingPath(result.document.heading_path),
             }));
 
             const dedupedResults = this.deduplicateResults(results);
