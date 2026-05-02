@@ -29,7 +29,7 @@ const DEFAULT_SUPPORTED_EXTENSIONS = [
     '.cs', '.go', '.rs', '.php', '.rb', '.swift', '.kt', '.scala', '.m', '.mm',
     '.dart', '.hx', '.hxml',
     // Text and markup files
-    '.md', '.markdown', '.ipynb',
+    '.md', '.markdown', '.rst', '.ipynb',
     // '.txt',  '.json', '.yaml', '.yml', '.xml', '.html', '.htm',
     // '.css', '.scss', '.less', '.sql', '.sh', '.bash', '.env'
 ];
@@ -944,7 +944,11 @@ export class Context {
 
                 const relativePath = path.relative(codebasePath, chunk.metadata.filePath);
                 const fileExtension = path.extname(chunk.metadata.filePath);
-                const { filePath, startLine, endLine, ...restMetadata } = chunk.metadata;
+                const {
+                    filePath, startLine, endLine,
+                    content_type, symbol_kind, symbol_name, parent_symbol, heading_path,
+                    ...restMetadata
+                } = chunk.metadata;
 
                 return {
                     id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
@@ -959,7 +963,12 @@ export class Context {
                         codebasePath,
                         language: chunk.metadata.language || 'unknown',
                         chunkIndex: index
-                    }
+                    },
+                    content_type,
+                    symbol_kind,
+                    symbol_name,
+                    parent_symbol,
+                    heading_path: heading_path ? JSON.stringify(heading_path) : undefined,
                 };
             });
 
@@ -974,7 +983,11 @@ export class Context {
 
                 const relativePath = path.relative(codebasePath, chunk.metadata.filePath);
                 const fileExtension = path.extname(chunk.metadata.filePath);
-                const { filePath, startLine, endLine, ...restMetadata } = chunk.metadata;
+                const {
+                    filePath, startLine, endLine,
+                    content_type, symbol_kind, symbol_name, parent_symbol, heading_path,
+                    ...restMetadata
+                } = chunk.metadata;
 
                 return {
                     id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
@@ -989,7 +1002,12 @@ export class Context {
                         codebasePath,
                         language: chunk.metadata.language || 'unknown',
                         chunkIndex: index
-                    }
+                    },
+                    content_type,
+                    symbol_kind,
+                    symbol_name,
+                    parent_symbol,
+                    heading_path: heading_path ? JSON.stringify(heading_path) : undefined,
                 };
             });
 
@@ -1026,7 +1044,10 @@ export class Context {
             '.dart': 'dart',
             '.hx': 'haxe',
             '.hxml': 'haxe',
-            '.ipynb': 'jupyter'
+            '.ipynb': 'jupyter',
+            '.md': 'markdown',
+            '.markdown': 'markdown',
+            '.rst': 'rst'
         };
         return languageMap[ext] || 'text';
     }

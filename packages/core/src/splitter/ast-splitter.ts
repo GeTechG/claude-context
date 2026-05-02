@@ -1,5 +1,6 @@
 import Parser from 'tree-sitter';
 import { Splitter, CodeChunk } from './index';
+import { MarkdownSplitter } from './markdown-splitter';
 
 // Language parsers
 const JavaScript = require('tree-sitter-javascript');
@@ -27,11 +28,56 @@ const SPLITTABLE_NODE_TYPES = {
     haxe: ['ClassType', 'EnumType', 'AbstractType', 'DefType', 'ClassMethod']
 };
 
+// Map a tree-sitter node type to a normalized symbol_kind tag.
+const NODE_TYPE_TO_SYMBOL_KIND: Record<string, string> = {
+    function_declaration: 'function',
+    function_definition: 'function',
+    function_item: 'function',
+    arrow_function: 'function',
+    async_function_definition: 'function',
+    method_declaration: 'method',
+    method_definition: 'method',
+    class_declaration: 'class',
+    class_definition: 'class',
+    class_specifier: 'class',
+    struct_item: 'class',
+    struct_declaration: 'class',
+    impl_item: 'class',
+    interface_declaration: 'interface',
+    trait_item: 'interface',
+    enum_declaration: 'enum',
+    enum_item: 'enum',
+    type_alias_declaration: 'typedef',
+    type_declaration: 'typedef',
+    constructor_declaration: 'method',
+    namespace_definition: 'class',
+    mod_item: 'class',
+    decorated_definition: 'function',
+    export_statement: 'function',
+    var_declaration: 'typedef',
+    const_declaration: 'typedef',
+    declaration: 'function',
+    ClassType: 'class',
+    EnumType: 'enum',
+    AbstractType: 'abstract',
+    DefType: 'typedef',
+    ClassMethod: 'method',
+};
+
+// Tree-sitter node types that introduce a symbol scope worth recording as a parent.
+const PARENT_SCOPE_NODE_TYPES = new Set<string>([
+    'class_declaration', 'class_definition', 'class_specifier', 'struct_item', 'struct_declaration',
+    'interface_declaration', 'trait_item', 'impl_item', 'enum_declaration', 'enum_item',
+    'namespace_definition', 'mod_item',
+    'ClassType', 'EnumType', 'AbstractType', 'DefType',
+]);
+
 export class AstCodeSplitter implements Splitter {
     private chunkSize: number = 2500;
     private chunkOverlap: number = 300;
     private parser: Parser;
     private langchainFallback: any; // LangChainCodeSplitter for fallback
+    private markdownSplitter: MarkdownSplitter;
 
     constructor(chunkSize?: number, chunkOverlap?: number) {
         if (chunkSize) this.chunkSize = chunkSize;
@@ -41,9 +87,17 @@ export class AstCodeSplitter implements Splitter {
         // Initialize fallback splitter
         const { LangChainCodeSplitter } = require('./langchain-splitter');
         this.langchainFallback = new LangChainCodeSplitter(chunkSize, chunkOverlap);
+        this.markdownSplitter = new MarkdownSplitter(chunkSize, chunkOverlap);
     }
 
     async split(code: string, language: string, filePath?: string): Promise<CodeChunk[]> {
+        // Markdown / reStructuredText go through a structure-aware splitter that
+        // preserves heading_path and breaks fenced code blocks out as code_example.
+        const lower = language.toLowerCase();
+        if (lower === 'markdown' || lower === 'md' || lower === 'rst' || lower === 'restructuredtext') {
+            return this.markdownSplitter.split(code, language, filePath);
+        }
+
         // Check if language is supported by AST splitter
         const langConfig = this.getLanguageConfig(language);
         if (!langConfig) {
@@ -124,15 +178,19 @@ export class AstCodeSplitter implements Splitter {
         const chunks: CodeChunk[] = [];
         const codeLines = code.split('\n');
 
-        const traverse = (currentNode: Parser.SyntaxNode) => {
-            // Check if this node type should be split into a chunk
-            if (splittableTypes.includes(currentNode.type)) {
+        const traverse = (currentNode: Parser.SyntaxNode, parentScope?: string) => {
+            const isSplittable = splittableTypes.includes(currentNode.type);
+            let scopeForChildren = parentScope;
+
+            if (isSplittable) {
                 const startLine = currentNode.startPosition.row + 1;
                 const endLine = currentNode.endPosition.row + 1;
                 const nodeText = code.slice(currentNode.startIndex, currentNode.endIndex);
 
-                // Only create chunk if it has meaningful content
                 if (nodeText.trim().length > 0) {
+                    const symbolName = this.extractSymbolName(currentNode);
+                    const symbolKind = NODE_TYPE_TO_SYMBOL_KIND[currentNode.type];
+
                     chunks.push({
                         content: nodeText,
                         metadata: {
@@ -140,14 +198,23 @@ export class AstCodeSplitter implements Splitter {
                             endLine,
                             language,
                             filePath,
+                            content_type: 'code',
+                            symbol_kind: symbolKind,
+                            symbol_name: symbolName,
+                            parent_symbol: parentScope,
                         }
                     });
+
+                    // If this node introduces a parent scope (class/interface/struct/etc.),
+                    // its descendants inherit it as parent_symbol.
+                    if (PARENT_SCOPE_NODE_TYPES.has(currentNode.type) && symbolName) {
+                        scopeForChildren = symbolName;
+                    }
                 }
             }
 
-            // Continue traversing child nodes
             for (const child of currentNode.children) {
-                traverse(child);
+                traverse(child, scopeForChildren);
             }
         };
 
@@ -162,11 +229,56 @@ export class AstCodeSplitter implements Splitter {
                     endLine: codeLines.length,
                     language,
                     filePath,
+                    content_type: 'code',
                 }
             });
         }
 
         return chunks;
+    }
+
+    /**
+     * Find the identifier child of a tree-sitter node and return its text.
+     * Tree-sitter conventions vary across grammars; we try a few common shapes.
+     */
+    private extractSymbolName(node: Parser.SyntaxNode): string | undefined {
+        // Try field names that grammars commonly use for the symbol identifier.
+        const fieldCandidates = ['name', 'identifier'];
+        for (const field of fieldCandidates) {
+            const fieldNode = (node as any).childForFieldName?.(field);
+            if (fieldNode && fieldNode.text) {
+                return fieldNode.text;
+            }
+        }
+
+        // Fall back to the first identifier-shaped direct child.
+        for (const child of node.children) {
+            if (
+                child.type === 'identifier' ||
+                child.type === 'type_identifier' ||
+                child.type === 'property_identifier' ||
+                child.type === 'field_identifier' ||
+                child.type === 'name' ||
+                child.type === 'IDENTIFIER'
+            ) {
+                if (child.text) return child.text;
+            }
+        }
+
+        // decorated_definition (Python) wraps a function/class — recurse into its inner def.
+        if (node.type === 'decorated_definition') {
+            for (const child of node.children) {
+                if (
+                    child.type === 'function_definition' ||
+                    child.type === 'class_definition' ||
+                    child.type === 'async_function_definition'
+                ) {
+                    return this.extractSymbolName(child);
+                }
+            }
+        }
+
+        return undefined;
     }
 
     private async refineChunks(chunks: CodeChunk[], originalCode: string): Promise<CodeChunk[]> {
@@ -192,20 +304,22 @@ export class AstCodeSplitter implements Splitter {
         let currentStartLine = chunk.metadata.startLine;
         let currentLineCount = 0;
 
+        // Sub-chunks inherit content_type / symbol info from the parent AST node so
+        // every piece keeps its semantic tag after large-chunk splitting.
+        const inheritedMetadata = (startLine: number, endLine: number) => ({
+            ...chunk.metadata,
+            startLine,
+            endLine,
+        });
+
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
             const lineWithNewline = i === lines.length - 1 ? line : line + '\n';
 
             if (currentChunk.length + lineWithNewline.length > this.chunkSize && currentChunk.length > 0) {
-                // Create a sub-chunk
                 subChunks.push({
                     content: currentChunk.trim(),
-                    metadata: {
-                        startLine: currentStartLine,
-                        endLine: currentStartLine + currentLineCount - 1,
-                        language: chunk.metadata.language,
-                        filePath: chunk.metadata.filePath,
-                    }
+                    metadata: inheritedMetadata(currentStartLine, currentStartLine + currentLineCount - 1),
                 });
 
                 currentChunk = lineWithNewline;
@@ -217,16 +331,10 @@ export class AstCodeSplitter implements Splitter {
             }
         }
 
-        // Add the last sub-chunk
         if (currentChunk.trim().length > 0) {
             subChunks.push({
                 content: currentChunk.trim(),
-                metadata: {
-                    startLine: currentStartLine,
-                    endLine: currentStartLine + currentLineCount - 1,
-                    language: chunk.metadata.language,
-                    filePath: chunk.metadata.filePath,
-                }
+                metadata: inheritedMetadata(currentStartLine, currentStartLine + currentLineCount - 1),
             });
         }
 

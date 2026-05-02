@@ -8,6 +8,15 @@ export interface VectorDocument {
     endLine: number;
     fileExtension: string;
     metadata: Record<string, any>;
+    // Phase 0: rich metadata as top-level columns so Milvus can filter on them
+    // (filter exprs only see schema fields, not the JSON metadata blob).
+    content_type?: string;
+    symbol_kind?: string;
+    symbol_name?: string;
+    parent_symbol?: string;
+    // heading_path is stored as a JSON-encoded string in Milvus to keep the
+    // schema simple; consumers JSON.parse on read.
+    heading_path?: string;
 }
 
 export interface SearchOptions {

@@ -39,6 +39,7 @@ export class LangChainCodeSplitter implements Splitter {
                             endLine: lines.to,
                             language,
                             filePath,
+                            content_type: 'code' as const,
                         },
                     };
                 });
@@ -107,6 +108,7 @@ export class LangChainCodeSplitter implements Splitter {
                     endLine: lines.end,
                     language,
                     filePath,
+                    content_type: 'code' as const,
                 },
             };
         });

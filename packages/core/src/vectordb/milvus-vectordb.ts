@@ -265,6 +265,42 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 data_type: DataType.VarChar,
                 max_length: 65535,
             },
+            // Phase 0: rich metadata for filtering / per-domain multi-query / symbol enrichment.
+            {
+                name: 'content_type',
+                description: 'code | doc | docstring | code_example',
+                data_type: DataType.VarChar,
+                max_length: 32,
+                nullable: true,
+            },
+            {
+                name: 'symbol_kind',
+                description: 'function | class | method | interface | enum | typedef | abstract',
+                data_type: DataType.VarChar,
+                max_length: 64,
+                nullable: true,
+            },
+            {
+                name: 'symbol_name',
+                description: 'Symbol name from AST',
+                data_type: DataType.VarChar,
+                max_length: 512,
+                nullable: true,
+            },
+            {
+                name: 'parent_symbol',
+                description: 'Parent symbol name for nested code symbols',
+                data_type: DataType.VarChar,
+                max_length: 512,
+                nullable: true,
+            },
+            {
+                name: 'heading_path',
+                description: 'Markdown heading path as JSON-encoded string array',
+                data_type: DataType.VarChar,
+                max_length: 2048,
+                nullable: true,
+            },
         ];
 
         const createCollectionParams = {
@@ -360,6 +396,11 @@ export class MilvusVectorDatabase implements VectorDatabase {
             endLine: doc.endLine,
             fileExtension: doc.fileExtension,
             metadata: JSON.stringify(doc.metadata),
+            content_type: doc.content_type ?? null,
+            symbol_kind: doc.symbol_kind ?? null,
+            symbol_name: doc.symbol_name ?? null,
+            parent_symbol: doc.parent_symbol ?? null,
+            heading_path: doc.heading_path ?? null,
         }));
 
         await this.client.insert({
@@ -380,10 +421,10 @@ export class MilvusVectorDatabase implements VectorDatabase {
             collection_name: collectionName,
             data: [queryVector],
             limit: options?.topK || 10,
-            output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata'],
+            output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata', 'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path'],
         };
 
-        // Apply boolean expression filter if provided (e.g., fileExtension in [".ts",".py"]) 
+        // Apply boolean expression filter if provided (e.g., fileExtension in [".ts",".py"])
         if (options?.filterExpr && options.filterExpr.trim().length > 0) {
             searchParams.expr = options.filterExpr;
         }
@@ -412,6 +453,11 @@ export class MilvusVectorDatabase implements VectorDatabase {
                     endLine: result.endLine,
                     fileExtension: result.fileExtension,
                     metadata,
+                    content_type: result.content_type ?? undefined,
+                    symbol_kind: result.symbol_kind ?? undefined,
+                    symbol_name: result.symbol_name ?? undefined,
+                    parent_symbol: result.parent_symbol ?? undefined,
+                    heading_path: result.heading_path ?? undefined,
                 },
                 score: result.score,
             };
@@ -533,6 +579,42 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 data_type: DataType.VarChar,
                 max_length: 65535,
             },
+            // Phase 0: rich metadata for filtering / per-domain multi-query / symbol enrichment.
+            {
+                name: 'content_type',
+                description: 'code | doc | docstring | code_example',
+                data_type: DataType.VarChar,
+                max_length: 32,
+                nullable: true,
+            },
+            {
+                name: 'symbol_kind',
+                description: 'function | class | method | interface | enum | typedef | abstract',
+                data_type: DataType.VarChar,
+                max_length: 64,
+                nullable: true,
+            },
+            {
+                name: 'symbol_name',
+                description: 'Symbol name from AST',
+                data_type: DataType.VarChar,
+                max_length: 512,
+                nullable: true,
+            },
+            {
+                name: 'parent_symbol',
+                description: 'Parent symbol name for nested code symbols',
+                data_type: DataType.VarChar,
+                max_length: 512,
+                nullable: true,
+            },
+            {
+                name: 'heading_path',
+                description: 'Markdown heading path as JSON-encoded string array',
+                data_type: DataType.VarChar,
+                max_length: 2048,
+                nullable: true,
+            },
         ];
 
         // Add BM25 function
@@ -616,6 +698,11 @@ export class MilvusVectorDatabase implements VectorDatabase {
             endLine: doc.endLine,
             fileExtension: doc.fileExtension,
             metadata: JSON.stringify(doc.metadata),
+            content_type: doc.content_type ?? null,
+            symbol_kind: doc.symbol_kind ?? null,
+            symbol_name: doc.symbol_name ?? null,
+            parent_symbol: doc.parent_symbol ?? null,
+            heading_path: doc.heading_path ?? null,
         }));
 
         await this.client.insert({
@@ -679,7 +766,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 data: [search_param_1, search_param_2],
                 limit: options?.limit || searchRequests[0]?.limit || 10,
                 rerank: rerank_strategy,
-                output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata'],
+                output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata', 'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path'],
             };
 
             if (options?.filterExpr && options.filterExpr.trim().length > 0) {
@@ -726,6 +813,11 @@ export class MilvusVectorDatabase implements VectorDatabase {
                         endLine: result.endLine,
                         fileExtension: result.fileExtension,
                         metadata,
+                        content_type: result.content_type ?? undefined,
+                        symbol_kind: result.symbol_kind ?? undefined,
+                        symbol_name: result.symbol_name ?? undefined,
+                        parent_symbol: result.parent_symbol ?? undefined,
+                        heading_path: result.heading_path ?? undefined,
                     },
                     score: result.score,
                 };

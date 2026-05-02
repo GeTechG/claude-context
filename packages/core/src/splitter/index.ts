@@ -6,6 +6,13 @@ export interface CodeChunk {
         endLine: number;
         language?: string;
         filePath?: string;
+        // Phase 0: rich metadata for hybrid retrieval and per-domain filtering.
+        // All optional for backward compatibility with chunks that predate the schema.
+        content_type?: 'code' | 'doc' | 'docstring' | 'code_example';
+        symbol_kind?: string;
+        symbol_name?: string;
+        parent_symbol?: string;
+        heading_path?: string[];
     };
 }
 
@@ -48,3 +55,4 @@ export interface Splitter {
 // Implementation class exports
 export * from './langchain-splitter';
 export * from './ast-splitter';
+export * from './markdown-splitter';
