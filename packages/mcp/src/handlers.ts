@@ -778,6 +778,14 @@ export class ToolHandlers {
             }
             resultMessage += `\n\n${formattedResults}`;
 
+            // Phase 3: surface candidate symbols extracted from the result
+            // pool so the agent can hand them to Serena's find_symbol for
+            // full-definition lookup (see local-rag SKILL.md).
+            const candidateSymbols = (searchResults[0] as any)?.candidateSymbols;
+            if (Array.isArray(candidateSymbols) && candidateSymbols.length > 0) {
+                resultMessage += `\n\nCandidate symbols (top ${candidateSymbols.length}, for Serena \`find_symbol\` enrichment): ${candidateSymbols.join(', ')}`;
+            }
+
             if (isIndexing) {
                 resultMessage += `\n\n💡 **Tip**: This codebase is still being indexed. More results may become available as indexing progresses.`;
             }

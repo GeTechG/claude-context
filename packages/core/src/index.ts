@@ -7,3 +7,4 @@ export * from './sync/synchronizer';
 export * from './utils';
 export * from './search';
 export * from './reranker';
+export * from './enrichment';

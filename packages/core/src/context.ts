@@ -20,6 +20,7 @@ import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
 import { classifyQuery, weightsForIntent, DomainWeights } from './search/query-classifier';
 import { Reranker } from './reranker';
+import { extractCandidateSymbols } from './enrichment';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
@@ -141,6 +142,12 @@ export class Context {
     private warnedOverrideSanitization = new Set<string>();
     private synchronizers = new Map<string, FileSynchronizer>();
     private reranker?: Reranker;
+    // Phase 3: per-run bootstrap of the symbol vocabulary. Populated during
+    // indexCodebase, written to <codebasePath>/.symbols-vocab.json at the
+    // end, then nulled. Search-time vocab loading is independent of this
+    // (see loadSymbolVocabulary below).
+    private indexedSymbols: Set<string> | null = null;
+    private symbolVocabCache = new Map<string, ReadonlySet<string> | null>();
 
     constructor(config: ContextConfig = {}) {
         // Initialize services
@@ -440,6 +447,9 @@ export class Context {
         // retaining file-based patterns from previous codebases.
         const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
 
+        // Phase 3: start a fresh symbol-vocabulary collector for this run.
+        this.indexedSymbols = new Set<string>();
+
         // 2. Check and prepare vector collection
         progressCallback?.({ phase: 'Preparing collection...', current: 0, total: 100, percentage: 0 });
         console.log(`Debug2: Preparing vector collection for codebase${forceReindex ? ' (FORCE REINDEX)' : ''}`);
@@ -481,6 +491,10 @@ export class Context {
         );
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
+
+        // Phase 3: persist the collected symbol vocabulary so search-time
+        // candidate extraction can filter out false positives.
+        await this.persistSymbolVocabulary(codebasePath);
 
         progressCallback?.({
             phase: 'Indexing complete!',
@@ -764,6 +778,7 @@ export class Context {
             if (finalResults.length > 0) {
                 console.log(`[Context] 🔍 Top result score: ${finalResults[0].score}, path: ${finalResults[0].relativePath}`);
             }
+            await this.attachCandidateSymbols(finalResults, codebasePath);
             return finalResults;
         } else {
             // Regular semantic search
@@ -794,8 +809,27 @@ export class Context {
 
             const dedupedResults = this.deduplicateResults(results);
             console.log(`[Context] ✅ Found ${results.length} results, ${dedupedResults.length} after dedup`);
+            await this.attachCandidateSymbols(dedupedResults, codebasePath);
             return dedupedResults;
         }
+    }
+
+    /**
+     * Phase 3: extract candidate symbol names from the final result pool and
+     * attach them to the first result. The list belongs to the response (not
+     * the chunk), but staying inside SemanticSearchResult keeps the existing
+     * return-shape contract intact for older callers.
+     */
+    private async attachCandidateSymbols(
+        results: SemanticSearchResult[],
+        codebasePath: string,
+    ): Promise<void> {
+        if (!results || results.length === 0) return;
+        const vocabulary = (await this.loadSymbolVocabulary(codebasePath)) ?? undefined;
+        const candidates = extractCandidateSymbols(results, { vocabulary });
+        if (candidates.length === 0) return;
+        results[0].candidateSymbols = candidates;
+        console.log(`[Context] 🧩 Candidate symbols (top ${candidates.length}): ${candidates.slice(0, 5).join(', ')}${candidates.length > 5 ? ', …' : ''}`);
     }
 
     /**
@@ -1009,6 +1043,64 @@ export class Context {
         }
 
         return kept;
+    }
+
+    /**
+     * Phase 3: filename for the per-codebase symbol vocabulary cache. We
+     * stash it next to the codebase so a `git clean` style refresh wipes
+     * the stale vocab automatically.
+     */
+    private getSymbolVocabPath(codebasePath: string): string {
+        return path.join(codebasePath, '.symbols-vocab.json');
+    }
+
+    /**
+     * Write the symbol vocabulary collected during indexCodebase. Best-effort:
+     * a write failure is logged but does not abort the indexing run, since the
+     * vocab only gates search-time false-positive filtering.
+     */
+    private async persistSymbolVocabulary(codebasePath: string): Promise<void> {
+        const collected = this.indexedSymbols;
+        this.indexedSymbols = null;
+        if (!collected || collected.size === 0) return;
+        const vocabPath = this.getSymbolVocabPath(codebasePath);
+        const sorted = Array.from(collected).sort();
+        const payload = JSON.stringify({ symbols: sorted, generatedAt: new Date().toISOString() }, null, 2);
+        try {
+            await fs.promises.writeFile(vocabPath, payload, 'utf-8');
+            this.symbolVocabCache.set(codebasePath, new Set(sorted));
+            console.log(`[Context] 📚 Wrote symbol vocabulary (${sorted.length} unique symbols) → ${vocabPath}`);
+        } catch (err) {
+            console.warn(`[Context] ⚠️ Failed to persist symbol vocabulary: ${err}`);
+        }
+    }
+
+    /**
+     * Load (and cache) the symbol vocabulary written by a prior indexCodebase
+     * run. Returns null if the file does not exist or fails to parse — callers
+     * fall back to unfiltered candidate extraction.
+     */
+    async loadSymbolVocabulary(codebasePath: string): Promise<ReadonlySet<string> | null> {
+        if (this.symbolVocabCache.has(codebasePath)) {
+            return this.symbolVocabCache.get(codebasePath) ?? null;
+        }
+        const vocabPath = this.getSymbolVocabPath(codebasePath);
+        try {
+            const raw = await fs.promises.readFile(vocabPath, 'utf-8');
+            const parsed = JSON.parse(raw);
+            const list: unknown = parsed?.symbols;
+            if (!Array.isArray(list)) {
+                this.symbolVocabCache.set(codebasePath, null);
+                return null;
+            }
+            const set = new Set<string>(list.filter((s): s is string => typeof s === 'string' && s.length > 0));
+            this.symbolVocabCache.set(codebasePath, set);
+            console.log(`[Context] 📚 Loaded symbol vocabulary (${set.size} symbols) from ${vocabPath}`);
+            return set;
+        } catch {
+            this.symbolVocabCache.set(codebasePath, null);
+            return null;
+        }
     }
 
     /**
@@ -1308,6 +1400,16 @@ export class Context {
      */
     private async processChunkBatch(chunks: CodeChunk[], codebasePath: string): Promise<void> {
         const isHybrid = this.getIsHybrid();
+
+        // Phase 3: harvest symbol names into the vocabulary collector.
+        if (this.indexedSymbols) {
+            for (const chunk of chunks) {
+                const sym = (chunk.metadata as any).symbol_name;
+                const parent = (chunk.metadata as any).parent_symbol;
+                if (typeof sym === 'string' && sym.length > 0) this.indexedSymbols.add(sym);
+                if (typeof parent === 'string' && parent.length > 0) this.indexedSymbols.add(parent);
+            }
+        }
 
         // Generate embedding vectors
         const chunkContents = chunks.map(chunk => chunk.content);

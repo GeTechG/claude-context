@@ -18,4 +18,9 @@ export interface SemanticSearchResult {
     symbol_kind?: string;
     parent_symbol?: string;
     heading_path?: string[];
+    // Phase 3: candidate symbol names extracted from the full result pool.
+    // Populated only on the first element of the result array (a denormalised
+    // list that belongs to the response, not the chunk). MCP handlers lift it
+    // out into the JSON response. Older clients ignore it without harm.
+    candidateSymbols?: string[];
 }
