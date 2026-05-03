@@ -14,7 +14,8 @@ import {
     VectorSearchResult,
     HybridSearchRequest,
     HybridSearchOptions,
-    HybridSearchResult
+    HybridSearchResult,
+    RerankStrategy
 } from './vectordb';
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
@@ -52,6 +53,16 @@ const DEFAULT_GUARANTEE_DOC = 5;
 // overridable through env so eval / tuning runs can sweep without rebuilds.
 const DEFAULT_RERANKER_INPUT_K = 50;
 const DEFAULT_RERANKER_OUTPUT_K = 15;
+
+// Outer weighted-RRF smoothing constant for cross-pool merge (code/doc).
+// Smaller k = more weight on top ranks of each pool. Tunable via RRF_K env.
+const DEFAULT_RRF_K = 60;
+
+// Inner Milvus per-channel reranker (across dense / sparse_bm25 / sparse_learned).
+// 'rrf' is uniform across channels; switch to 'weighted' if any
+// CHANNEL_WEIGHT_* env var is set, with weights aligned to the channel order
+// emitted by buildRequests (dense, sparse_bm25, sparse_learned).
+const DEFAULT_MILVUS_RRF_K = 100;
 
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
@@ -343,6 +354,50 @@ export class Context {
 
     private getRerankerOutputK(): number {
         return this.getPositiveIntFromEnv('RERANKER_OUTPUT_K', DEFAULT_RERANKER_OUTPUT_K);
+    }
+
+    private getRrfK(): number {
+        return this.getPositiveIntFromEnv('RRF_K', DEFAULT_RRF_K);
+    }
+
+    private getMilvusRrfK(): number {
+        return this.getPositiveIntFromEnv('MILVUS_RRF_K', DEFAULT_MILVUS_RRF_K);
+    }
+
+    private getNonNegativeFloatFromEnv(name: string, fallback: number): number {
+        const raw = envManager.get(name);
+        if (raw === undefined || raw === null || raw === '') return fallback;
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n < 0) {
+            console.warn(`[Context] ⚠️ Ignoring invalid ${name}=${raw}; expected non-negative number, falling back to ${fallback}`);
+            return fallback;
+        }
+        return n;
+    }
+
+    /**
+     * Build the Milvus inner-rerank strategy for the per-pool 3-channel
+     * hybrid_search. If any CHANNEL_WEIGHT_* env var is set, switches to
+     * Milvus 'weighted' ranker with weights aligned to buildRequests order:
+     *   [dense, sparse_bm25, sparse_learned]
+     * Otherwise stays on 'rrf' with k = MILVUS_RRF_K (default 100).
+     *
+     * `hasLearnedSparse` reflects whether the third channel is included in
+     * this particular request (some queries have no learned-sparse vector).
+     */
+    private buildInnerRerankStrategy(hasLearnedSparse: boolean): RerankStrategy {
+        const dense = envManager.get('CHANNEL_WEIGHT_DENSE');
+        const bm25 = envManager.get('CHANNEL_WEIGHT_SPARSE_BM25');
+        const learned = envManager.get('CHANNEL_WEIGHT_SPARSE_LEARNED');
+        const anySet = [dense, bm25, learned].some((v) => v !== undefined && v !== null && v !== '');
+        if (!anySet) {
+            return { strategy: 'rrf', params: { k: this.getMilvusRrfK() } };
+        }
+        const wDense = this.getNonNegativeFloatFromEnv('CHANNEL_WEIGHT_DENSE', 1.0);
+        const wBm25 = this.getNonNegativeFloatFromEnv('CHANNEL_WEIGHT_SPARSE_BM25', 0.4);
+        const wLearned = this.getNonNegativeFloatFromEnv('CHANNEL_WEIGHT_SPARSE_LEARNED', 0.6);
+        const weights = hasLearnedSparse ? [wDense, wBm25, wLearned] : [wDense, wBm25];
+        return { strategy: 'weighted', params: { weights } };
     }
 
     /**
@@ -709,12 +764,15 @@ export class Context {
                     ? `${combinedFilter(userFilter)} and ${DOC_DOMAIN_FILTER}`
                     : DOC_DOMAIN_FILTER;
 
+                const innerRerank = this.buildInnerRerankStrategy(
+                    !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0)
+                );
                 const [codePool, docPool] = await Promise.all([
                     this.vectorDatabase.hybridSearch(
                         collectionName,
                         buildRequests(PER_POOL_K),
                         {
-                            rerank: { strategy: 'rrf', params: { k: 100 } },
+                            rerank: innerRerank,
                             limit: PER_POOL_K,
                             filterExpr: codeExpr,
                         }
@@ -726,7 +784,7 @@ export class Context {
                         collectionName,
                         buildRequests(PER_POOL_K),
                         {
-                            rerank: { strategy: 'rrf', params: { k: 100 } },
+                            rerank: innerRerank,
                             limit: PER_POOL_K,
                             filterExpr: docExpr,
                         }
@@ -749,7 +807,8 @@ export class Context {
                         { results: codePool, weight: weights.code },
                         { results: docPool, weight: weights.doc },
                     ],
-                    mergeLimit
+                    mergeLimit,
+                    this.getRrfK()
                 );
 
                 let semanticMerged: SemanticSearchResult[] = merged.map((r) => this.toSemanticResult(r));
@@ -776,11 +835,14 @@ export class Context {
                 const singleLimit = this.hasReranker()
                     ? Math.max(this.getRerankerInputK(), topK)
                     : topK;
+                const innerRerank = this.buildInnerRerankStrategy(
+                    !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0)
+                );
                 const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
                     collectionName,
                     buildRequests(singleLimit),
                     {
-                        rerank: { strategy: 'rrf', params: { k: 100 } },
+                        rerank: innerRerank,
                         limit: singleLimit,
                         filterExpr,
                     }
