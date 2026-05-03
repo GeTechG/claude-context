@@ -18,6 +18,7 @@ import {
 } from './vectordb';
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
+import { classifyQuery, weightsForIntent, DomainWeights } from './search/query-classifier';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
@@ -32,6 +33,17 @@ function parseHeadingPath(raw: string | undefined): string[] | undefined {
         return undefined;
     }
 }
+
+const CODE_DOMAIN_FILTER = `content_type in ["code","docstring"]`;
+const DOC_DOMAIN_FILTER = `content_type in ["doc","code_example"]`;
+const CODE_DOMAIN_TYPES = new Set(['code', 'docstring']);
+const DOC_DOMAIN_TYPES = new Set(['doc', 'code_example']);
+
+// Phase 0+ guarantee-slot threshold: if neither domain has at least this many
+// hits in top-N when reranker is off, the floors below kick in to defend
+// against RRF dropping a whole domain off the page.
+const DEFAULT_GUARANTEE_CODE = 5;
+const DEFAULT_GUARANTEE_DOC = 5;
 
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
@@ -261,6 +273,29 @@ export class Context {
             return true; // Default to true
         }
         return isHybridEnv.toLowerCase() === 'true';
+    }
+
+    /**
+     * Phase 0+: per-domain multi-query controlled by MULTI_QUERY env. Defaults
+     * to true so installs that opt into hybrid mode get domain coverage out
+     * of the box. Set MULTI_QUERY=false to fall back to single-pool hybrid.
+     */
+    private getMultiQuery(): boolean {
+        const env = envManager.get('MULTI_QUERY');
+        if (env === undefined || env === null) {
+            return true;
+        }
+        return env.toLowerCase() === 'true';
+    }
+
+    /**
+     * Phase 2 stub: reranker presence flips guarantee-slots off because the
+     * reranker arbitrates the top-N better than fixed floors. For Phase 0+
+     * the env is unset → guarantee-slots are active.
+     */
+    private hasReranker(): boolean {
+        const provider = envManager.get('RERANKER_PROVIDER');
+        return !!(provider && provider.trim().length > 0);
     }
 
     /**
@@ -536,63 +571,123 @@ export class Context {
             console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
             console.log(`[Context] 🔍 First 5 embedding values: [${queryEmbedding.vector.slice(0, 5).join(', ')}]`);
 
-            // 2. Prepare hybrid search requests
-            const searchRequests: HybridSearchRequest[] = [
+            const multiQuery = this.getMultiQuery();
+            const intent = classifyQuery(query);
+            const weights = weightsForIntent(intent);
+            console.log(`[Context] 🔍 Query intent: codeSignal=${intent.codeSignal} docSignal=${intent.docSignal} → weights code=${weights.code} doc=${weights.doc}`);
+
+            // For multi-query we pull a wider candidate pool from each domain
+            // so weighted RRF and guarantee-slot reshuffling have something
+            // to work with. PER_POOL_K is intentionally generous because
+            // RRF on a small pool tends to lock in the leaders.
+            const PER_POOL_K = Math.max(topK * 5, 25);
+
+            const buildRequests = (limit: number): HybridSearchRequest[] => ([
                 {
                     data: queryEmbedding.vector,
                     anns_field: "vector",
                     param: { "nprobe": 10 },
-                    limit: topK
+                    limit
                 },
                 {
                     data: query,
                     anns_field: "sparse_vector",
                     param: { "drop_ratio_search": 0.2 },
-                    limit: topK
+                    limit
                 }
-            ];
+            ]);
 
-            console.log(`[Context] 🔍 Search request 1 (dense): anns_field="${searchRequests[0].anns_field}", vector_dim=${queryEmbedding.vector.length}, limit=${searchRequests[0].limit}`);
-            console.log(`[Context] 🔍 Search request 2 (sparse): anns_field="${searchRequests[1].anns_field}", query_text="${query}", limit=${searchRequests[1].limit}`);
+            let mergedResults: SemanticSearchResult[];
 
-            // 3. Execute hybrid search
-            console.log(`[Context] 🔍 Executing hybrid search with RRF reranking...`);
-            const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
-                collectionName,
-                searchRequests,
-                {
-                    rerank: {
-                        strategy: 'rrf',
-                        params: { k: 100 }
-                    },
-                    limit: topK,
-                    filterExpr
+            if (multiQuery) {
+                console.log(`[Context] 🔍 MULTI_QUERY=true → running parallel code-domain + doc-domain hybrid searches (PER_POOL_K=${PER_POOL_K})`);
+
+                const combinedFilter = (extra: string | undefined): string => {
+                    if (!extra || extra.trim().length === 0) return '';
+                    return `(${extra})`;
+                };
+                const userFilter = filterExpr && filterExpr.trim().length > 0 ? filterExpr : undefined;
+                const codeExpr = userFilter
+                    ? `${combinedFilter(userFilter)} and ${CODE_DOMAIN_FILTER}`
+                    : CODE_DOMAIN_FILTER;
+                const docExpr = userFilter
+                    ? `${combinedFilter(userFilter)} and ${DOC_DOMAIN_FILTER}`
+                    : DOC_DOMAIN_FILTER;
+
+                const [codePool, docPool] = await Promise.all([
+                    this.vectorDatabase.hybridSearch(
+                        collectionName,
+                        buildRequests(PER_POOL_K),
+                        {
+                            rerank: { strategy: 'rrf', params: { k: 100 } },
+                            limit: PER_POOL_K,
+                            filterExpr: codeExpr,
+                        }
+                    ).catch((err) => {
+                        console.warn(`[Context] ⚠️ code-domain hybrid search failed: ${err}`);
+                        return [] as HybridSearchResult[];
+                    }),
+                    this.vectorDatabase.hybridSearch(
+                        collectionName,
+                        buildRequests(PER_POOL_K),
+                        {
+                            rerank: { strategy: 'rrf', params: { k: 100 } },
+                            limit: PER_POOL_K,
+                            filterExpr: docExpr,
+                        }
+                    ).catch((err) => {
+                        console.warn(`[Context] ⚠️ doc-domain hybrid search failed: ${err}`);
+                        return [] as HybridSearchResult[];
+                    }),
+                ]);
+
+                console.log(`[Context] 🔍 Pool sizes: code=${codePool.length} doc=${docPool.length}`);
+
+                const merged = this.weightedRrfMerge(
+                    [
+                        { results: codePool, weight: weights.code },
+                        { results: docPool, weight: weights.doc },
+                    ],
+                    Math.max(topK * 3, 30)
+                );
+
+                let semanticMerged: SemanticSearchResult[] = merged.map((r) => this.toSemanticResult(r));
+
+                // Guarantee-slots: defend top-N domain coverage when no
+                // reranker is in front of us. Disabled in Phase 2+ where the
+                // reranker handles balance.
+                if (!this.hasReranker() && (codePool.length > 0 || docPool.length > 0)) {
+                    semanticMerged = this.applyGuaranteeSlots(
+                        semanticMerged,
+                        codePool.map((r) => this.toSemanticResult(r)),
+                        docPool.map((r) => this.toSemanticResult(r)),
+                        topK,
+                        DEFAULT_GUARANTEE_CODE,
+                        DEFAULT_GUARANTEE_DOC
+                    );
                 }
-            );
 
-            console.log(`[Context] 🔍 Raw search results count: ${searchResults.length}`);
+                mergedResults = semanticMerged.slice(0, topK);
+            } else {
+                console.log(`[Context] 🔍 MULTI_QUERY=false → single-pool hybrid search`);
+                const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
+                    collectionName,
+                    buildRequests(topK),
+                    {
+                        rerank: { strategy: 'rrf', params: { k: 100 } },
+                        limit: topK,
+                        filterExpr,
+                    }
+                );
+                mergedResults = searchResults.map((r) => this.toSemanticResult(r));
+            }
 
-            // 4. Convert to semantic search result format
-            const results: SemanticSearchResult[] = searchResults.map(result => ({
-                content: result.document.content,
-                relativePath: result.document.relativePath,
-                startLine: result.document.startLine,
-                endLine: result.document.endLine,
-                language: result.document.metadata.language || 'unknown',
-                score: result.score,
-                content_type: result.document.content_type,
-                symbol_name: result.document.symbol_name,
-                symbol_kind: result.document.symbol_kind,
-                parent_symbol: result.document.parent_symbol,
-                heading_path: parseHeadingPath(result.document.heading_path),
-            }));
-
-            const dedupedResults = this.deduplicateResults(results);
-            console.log(`[Context] ✅ Found ${results.length} results, ${dedupedResults.length} after dedup`);
+            console.log(`[Context] 🔍 Raw merged results count: ${mergedResults.length}`);
+            const dedupedResults = this.deduplicateResults(mergedResults);
+            console.log(`[Context] ✅ Found ${mergedResults.length} results, ${dedupedResults.length} after dedup`);
             if (dedupedResults.length > 0) {
                 console.log(`[Context] 🔍 Top result score: ${dedupedResults[0].score}, path: ${dedupedResults[0].relativePath}`);
             }
-
             return dedupedResults;
         } else {
             // Regular semantic search
@@ -625,6 +720,146 @@ export class Context {
             console.log(`[Context] ✅ Found ${results.length} results, ${dedupedResults.length} after dedup`);
             return dedupedResults;
         }
+    }
+
+    /**
+     * Project a HybridSearchResult onto the SemanticSearchResult shape that
+     * external callers consume.
+     */
+    private toSemanticResult(result: HybridSearchResult): SemanticSearchResult {
+        return {
+            content: result.document.content,
+            relativePath: result.document.relativePath,
+            startLine: result.document.startLine,
+            endLine: result.document.endLine,
+            language: result.document.metadata?.language || 'unknown',
+            score: result.score,
+            content_type: result.document.content_type,
+            symbol_name: result.document.symbol_name,
+            symbol_kind: result.document.symbol_kind,
+            parent_symbol: result.document.parent_symbol,
+            heading_path: parseHeadingPath(result.document.heading_path),
+        };
+    }
+
+    /**
+     * Weighted Reciprocal Rank Fusion across pools that already came back
+     * from per-domain hybrid_search calls.
+     *
+     *   score(d) = Σ_pools weight_pool * 1 / (k_rrf + rank_in_pool(d))
+     *
+     * Documents that appear in multiple pools accumulate score, so a strong
+     * cross-domain hit naturally rises. The pool weights come from the
+     * intent classifier, so a code-shaped query nudges code-domain hits up
+     * without ever excluding doc-domain hits.
+     */
+    private weightedRrfMerge(
+        pools: { results: HybridSearchResult[]; weight: number }[],
+        k: number,
+        kRrf: number = 60
+    ): HybridSearchResult[] {
+        const scoreById = new Map<string, number>();
+        const docById = new Map<string, HybridSearchResult>();
+
+        for (const pool of pools) {
+            const { results, weight } = pool;
+            for (let rank = 0; rank < results.length; rank++) {
+                const r = results[rank];
+                const id = r.document.id;
+                if (!id) continue;
+                const contribution = weight / (kRrf + rank + 1);
+                scoreById.set(id, (scoreById.get(id) || 0) + contribution);
+                if (!docById.has(id)) {
+                    docById.set(id, r);
+                }
+            }
+        }
+
+        return Array.from(scoreById.entries())
+            .map(([id, score]) => {
+                const r = docById.get(id)!;
+                return { document: r.document, score } as HybridSearchResult;
+            })
+            .sort((a, b) => b.score - a.score)
+            .slice(0, k);
+    }
+
+    /**
+     * Phase 0+ guarantee-slots: when the merged top-N is dominated by one
+     * domain, swap in the next-best candidates from the under-represented
+     * domain until the floor is met. Operates after RRF, before final cut.
+     */
+    private applyGuaranteeSlots(
+        merged: SemanticSearchResult[],
+        codePool: SemanticSearchResult[],
+        docPool: SemanticSearchResult[],
+        topK: number,
+        minCode: number,
+        minDoc: number
+    ): SemanticSearchResult[] {
+        // Operate on a wider window so we have room to demote without
+        // losing strong general candidates from the merged list.
+        const windowSize = Math.max(topK * 2, topK + minCode + minDoc);
+        const window = merged.slice(0, windowSize);
+        const tail = merged.slice(windowSize);
+
+        const isCode = (r: SemanticSearchResult) => CODE_DOMAIN_TYPES.has(r.content_type || '');
+        const isDoc = (r: SemanticSearchResult) => DOC_DOMAIN_TYPES.has(r.content_type || '');
+
+        const idsInWindow = new Set<string>();
+        const dedupKey = (r: SemanticSearchResult) => `${r.relativePath}#${r.startLine}-${r.endLine}`;
+        for (const r of window) idsInWindow.add(dedupKey(r));
+
+        // Slice the head: we never reorder the absolute top-1 because that
+        // would override the strongest signal across both pools.
+        const head = window.slice(0, 1);
+        const body = window.slice(1);
+
+        const top = head.concat(body).slice(0, topK);
+        let codeCount = top.filter(isCode).length;
+        let docCount = top.filter(isDoc).length;
+
+        const minCodeEffective = Math.min(minCode, codePool.length);
+        const minDocEffective = Math.min(minDoc, docPool.length);
+
+        const promoteFromPool = (
+            pool: SemanticSearchResult[],
+            need: number,
+            counterPredicate: (r: SemanticSearchResult) => boolean,
+        ) => {
+            if (need <= 0) return;
+            for (const candidate of pool) {
+                if (need <= 0) break;
+                const key = dedupKey(candidate);
+                if (idsInWindow.has(key)) continue;
+                // Find the lowest-ranked counterPredicate item in the
+                // current top to evict.
+                let evictIdx = -1;
+                for (let i = top.length - 1; i >= 1; i--) {
+                    if (counterPredicate(top[i])) { evictIdx = i; break; }
+                }
+                if (evictIdx === -1) break;
+                top[evictIdx] = candidate;
+                idsInWindow.add(key);
+                need--;
+            }
+        };
+
+        if (codeCount < minCodeEffective) {
+            promoteFromPool(codePool, minCodeEffective - codeCount, isDoc);
+        }
+        // Recount before doc pass so we don't churn slots we just filled.
+        codeCount = top.filter(isCode).length;
+        docCount = top.filter(isDoc).length;
+        if (docCount < minDocEffective) {
+            promoteFromPool(docPool, minDocEffective - docCount, isCode);
+        }
+
+        // Stitch back the tail of the wider window so callers that ask for
+        // more than topK still get their longer list (the slice(0, topK) at
+        // the call-site will trim it down).
+        const remainder = window.slice(topK);
+        return top.concat(remainder).concat(tail);
     }
 
     /**

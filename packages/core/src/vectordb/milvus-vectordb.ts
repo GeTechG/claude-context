@@ -724,19 +724,32 @@ export class MilvusVectorDatabase implements VectorDatabase {
             console.log(`[MilvusDB] 🔍 Preparing hybrid search for collection: ${collectionName}`);
 
             // Prepare search requests in the correct Milvus format
-            const search_param_1 = {
+            const filterExpr = options?.filterExpr && options.filterExpr.trim().length > 0
+                ? options.filterExpr
+                : undefined;
+
+            const search_param_1: any = {
                 data: Array.isArray(searchRequests[0].data) ? searchRequests[0].data : [searchRequests[0].data],
                 anns_field: searchRequests[0].anns_field, // "vector"
                 param: searchRequests[0].param, // {"nprobe": 10}
                 limit: searchRequests[0].limit
             };
 
-            const search_param_2 = {
+            const search_param_2: any = {
                 data: searchRequests[1].data, // query text for sparse search
                 anns_field: searchRequests[1].anns_field, // "sparse_vector"
                 param: searchRequests[1].param, // {"drop_ratio_search": 0.2}
                 limit: searchRequests[1].limit
             };
+
+            // Phase 0+: push filter into each AnnSearchRequest so each channel
+            // restricts candidates separately. Top-level expr on the parent
+            // search call is honored by some Milvus versions and ignored by
+            // others — per-request expr is the documented contract.
+            if (filterExpr) {
+                search_param_1.expr = filterExpr;
+                search_param_2.expr = filterExpr;
+            }
 
             // Set rerank strategy to RRF (100) by default
             const rerank_strategy = {
@@ -769,17 +782,13 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata', 'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path'],
             };
 
-            if (options?.filterExpr && options.filterExpr.trim().length > 0) {
-                searchParams.expr = options.filterExpr;
-            }
-
             console.log(`[MilvusDB] 🔍 Complete search request:`, JSON.stringify({
                 collection_name: searchParams.collection_name,
                 data_count: searchParams.data.length,
                 limit: searchParams.limit,
                 rerank: searchParams.rerank,
                 output_fields: searchParams.output_fields,
-                expr: searchParams.expr
+                per_request_expr: filterExpr
             }, null, 2));
 
             const searchResult = await this.client.search(searchParams);
