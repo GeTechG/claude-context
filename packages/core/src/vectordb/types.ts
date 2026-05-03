@@ -17,6 +17,9 @@ export interface VectorDocument {
     // heading_path is stored as a JSON-encoded string in Milvus to keep the
     // schema simple; consumers JSON.parse on read.
     heading_path?: string;
+    // Phase 4: BGE-M3 learned-sparse channel. Populated only on v2 hybrid
+    // collections; ignored on older schemas.
+    sparse_learned?: { indices: number[]; values: number[] };
 }
 
 export interface SearchOptions {
@@ -28,9 +31,14 @@ export interface SearchOptions {
 
 // New interfaces for hybrid search
 export interface HybridSearchRequest {
-    data: number[] | string; // Query vector or text
-    anns_field: string; // Vector field name (vector or sparse_vector)
-    param: Record<string, any>; // Search parameters
+    // number[]   → dense vector channel (e.g. anns_field='vector')
+    // string     → BM25 text query (e.g. anns_field='sparse_vector' with the
+    //              attached BM25 function on the collection)
+    // dict       → SPARSE_FLOAT_VECTOR (e.g. anns_field='sparse_learned',
+    //              BGE-M3 learned sparse) as `{ "<index>": value }`
+    data: number[] | string | Record<string, number>;
+    anns_field: string;
+    param: Record<string, any>;
     limit: number;
 }
 
@@ -38,6 +46,13 @@ export interface HybridSearchOptions {
     rerank?: RerankStrategy;
     limit?: number;
     filterExpr?: string;
+}
+
+export interface HybridCollectionOptions {
+    // Phase 4: add `sparse_learned` SPARSE_FLOAT_VECTOR column + IP index for
+    // the BGE-M3 learned-sparse third channel. Default false to keep v1
+    // collections (dense + BM25) on the same code path.
+    enableLearnedSparse?: boolean;
 }
 
 export interface RerankStrategy {
@@ -69,8 +84,9 @@ export interface VectorDatabase {
      * @param collectionName Collection name
      * @param dimension Dense vector dimension
      * @param description Collection description
+     * @param options Optional schema flags (e.g. enableLearnedSparse for Phase 4)
      */
-    createHybridCollection(collectionName: string, dimension: number, description?: string): Promise<void>;
+    createHybridCollection(collectionName: string, dimension: number, description?: string, options?: HybridCollectionOptions): Promise<void>;
 
     /**
      * Drop collection

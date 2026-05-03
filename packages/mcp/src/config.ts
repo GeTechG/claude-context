@@ -21,6 +21,9 @@ export interface ContextMcpConfig {
     // Infinity sidecar configuration
     infinityUrl?: string;
     infinityDenseModel?: string;
+    // Phase 4: optional URL of the BGE-M3 learned-sparse sidecar (m3serve).
+    infinitySparseUrl?: string;
+    infinitySparseModel?: string;
     // Reranker configuration (Phase 2)
     rerankerProvider?: 'Infinity';
     rerankerModel?: string;
@@ -180,6 +183,9 @@ export function createMcpConfig(): ContextMcpConfig {
         // Infinity sidecar configuration
         infinityUrl: envManager.get('INFINITY_URL'),
         infinityDenseModel: envManager.get('INFINITY_DENSE_MODEL'),
+        // Phase 4: BGE-M3 learned-sparse sidecar (m3serve).
+        infinitySparseUrl: envManager.get('INFINITY_SPARSE_URL'),
+        infinitySparseModel: envManager.get('INFINITY_SPARSE_MODEL'),
         // Reranker configuration (Phase 2). Reranker shares the Infinity
         // sidecar by default — RERANKER_URL only needs to be set if the
         // reranker lives on a different host.
@@ -237,6 +243,12 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
         case 'Infinity':
             console.log(`[MCP]   Infinity URL: ${config.infinityUrl || 'http://localhost:7997'}`);
             console.log(`[MCP]   Infinity Dense Model: ${config.embeddingModel}`);
+            if (config.infinitySparseUrl) {
+                console.log(`[MCP]   Infinity Sparse URL: ${config.infinitySparseUrl}`);
+                console.log(`[MCP]   Infinity Sparse Model: ${config.infinitySparseModel || config.embeddingModel}`);
+            } else {
+                console.log(`[MCP]   Infinity Sparse: ❌ Not configured (Phase 4 third channel disabled)`);
+            }
             break;
     }
 

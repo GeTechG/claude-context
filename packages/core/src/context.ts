@@ -655,20 +655,42 @@ export class Context {
             const rerankerInputK = this.hasReranker() ? this.getRerankerInputK() : 0;
             const PER_POOL_K = Math.max(topK * 5, 25, rerankerInputK);
 
-            const buildRequests = (limit: number): HybridSearchRequest[] => ([
-                {
-                    data: queryEmbedding.vector,
-                    anns_field: "vector",
-                    param: { "nprobe": 10 },
-                    limit
-                },
-                {
-                    data: query,
-                    anns_field: "sparse_vector",
-                    param: { "drop_ratio_search": 0.2 },
-                    limit
+            const buildRequests = (limit: number): HybridSearchRequest[] => {
+                const reqs: HybridSearchRequest[] = [
+                    {
+                        data: queryEmbedding.vector,
+                        anns_field: "vector",
+                        param: { "nprobe": 10 },
+                        limit
+                    },
+                    {
+                        data: query,
+                        anns_field: "sparse_vector",
+                        param: { "drop_ratio_search": 0.2 },
+                        limit
+                    }
+                ];
+                // Phase 4: add BGE-M3 learned-sparse channel when the embedding
+                // provider populated it (m3serve sidecar wired through
+                // InfinityEmbedding.sparseURL). Milvus accepts the sparse vector
+                // as a dict { "<index>": value } for SPARSE_FLOAT_VECTOR fields
+                // without an attached function.
+                if (queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0) {
+                    const sparseDict: Record<string, number> = {};
+                    const { indices, values } = queryEmbedding.sparse;
+                    const len = Math.min(indices.length, values.length);
+                    for (let i = 0; i < len; i++) {
+                        sparseDict[String(indices[i])] = values[i];
+                    }
+                    reqs.push({
+                        data: sparseDict,
+                        anns_field: "sparse_learned",
+                        param: { "drop_ratio_search": 0.2 },
+                        limit,
+                    });
                 }
-            ]);
+                return reqs;
+            };
 
             let mergedResults: SemanticSearchResult[];
 
@@ -1233,7 +1255,13 @@ export class Context {
         const dirName = path.basename(codebasePath);
 
         if (isHybrid === true) {
-            await this.vectorDatabase.createHybridCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
+            const enableLearnedSparse = this.embedding.hasSparse();
+            await this.vectorDatabase.createHybridCollection(
+                collectionName,
+                dimension,
+                `codebasePath:${codebasePath}`,
+                { enableLearnedSparse },
+            );
         } else {
             await this.vectorDatabase.createCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
         }
@@ -1449,6 +1477,10 @@ export class Context {
                     symbol_name,
                     parent_symbol,
                     heading_path: heading_path ? JSON.stringify(heading_path) : undefined,
+                    // Phase 4: BGE-M3 learned sparse from the sparse sidecar.
+                    // Falsy when the embedding provider doesn't expose sparse;
+                    // insertHybrid only attaches it when present and non-empty.
+                    sparse_learned: embeddings[index].sparse,
                 };
             });
 

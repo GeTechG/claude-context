@@ -1,4 +1,4 @@
-import { Embedding, EmbeddingVector } from './base-embedding';
+import { Embedding, EmbeddingVector, SparseVector } from './base-embedding';
 
 export interface InfinityEmbeddingConfig {
     model: string;
@@ -6,6 +6,11 @@ export interface InfinityEmbeddingConfig {
     fetch?: typeof fetch;
     dimension?: number;
     maxTokens?: number;
+    // Phase 4: optional URL of the BGE-M3 learned-sparse sidecar (m3serve).
+    // When set, embed/embedBatch fan out to /sparse in parallel with the
+    // dense /embeddings call and attach `sparse: {indices, values}`.
+    sparseURL?: string;
+    sparseModel?: string;
 }
 
 interface InfinityEmbeddingsResponse {
@@ -19,12 +24,28 @@ interface InfinityEmbeddingsResponse {
     usage?: { prompt_tokens?: number; total_tokens?: number };
 }
 
+interface SparseSidecarResponse {
+    object: string;
+    data: Array<{
+        object: string;
+        indices: number[];
+        values: number[];
+        index: number;
+    }>;
+    model: string;
+}
+
 /**
  * Infinity sidecar embedding provider.
  *
  * Talks to the OpenAI-compatible `/embeddings` endpoint of an Infinity v2
- * server (https://github.com/michaelfeil/infinity). One forward pass returns
- * the dense vector; learned-sparse channel will be added in Phase 4.
+ * server (https://github.com/michaelfeil/infinity) for the dense channel.
+ *
+ * Phase 4: when `sparseURL` is configured, also POSTs to a separate sparse
+ * sidecar (m3serve) at `/sparse` in parallel and attaches BGE-M3 learned
+ * `lexical_weights` to each EmbeddingVector. Infinity 0.0.77 doesn't expose
+ * BGE-M3 sparse, so we run a second container that loads the same model
+ * via m3serve.Engine.
  */
 export class InfinityEmbedding extends Embedding {
     private config: InfinityEmbeddingConfig;
@@ -32,6 +53,8 @@ export class InfinityEmbedding extends Embedding {
     private dimensionDetected: boolean = false;
     private fetchImpl: typeof fetch;
     protected maxTokens: number = 8192;
+    private sparseURL?: string;
+    private sparseModel: string;
 
     constructor(config: InfinityEmbeddingConfig) {
         super();
@@ -52,6 +75,10 @@ export class InfinityEmbedding extends Embedding {
         if (config.maxTokens) {
             this.maxTokens = config.maxTokens;
         }
+        if (config.sparseURL) {
+            this.sparseURL = config.sparseURL.replace(/\/+$/, '');
+        }
+        this.sparseModel = config.sparseModel || config.model;
     }
 
     private async postEmbeddings(input: string | string[]): Promise<InfinityEmbeddingsResponse> {
@@ -76,6 +103,35 @@ export class InfinityEmbedding extends Embedding {
         return json;
     }
 
+    private async postSparse(input: string | string[]): Promise<SparseSidecarResponse> {
+        if (!this.sparseURL) {
+            throw new Error('[InfinityEmbedding] sparseURL not configured');
+        }
+        const url = `${this.sparseURL}/sparse`;
+        const response = await this.fetchImpl(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: this.sparseModel, input }),
+        });
+
+        if (!response.ok) {
+            const errBody = await response.text().catch(() => '');
+            throw new Error(
+                `[InfinityEmbedding] sparse ${response.status} ${response.statusText} from ${url}: ${errBody.slice(0, 500)}`,
+            );
+        }
+
+        const json = (await response.json()) as SparseSidecarResponse;
+        if (!json?.data?.length) {
+            throw new Error('[InfinityEmbedding] empty data array in sparse response');
+        }
+        return json;
+    }
+
+    private toSparseVector(item: SparseSidecarResponse['data'][number]): SparseVector {
+        return { indices: item.indices ?? [], values: item.values ?? [] };
+    }
+
     async embed(text: string): Promise<EmbeddingVector> {
         const processed = this.preprocessText(text);
 
@@ -85,6 +141,22 @@ export class InfinityEmbedding extends Embedding {
             console.log(
                 `[InfinityEmbedding] 📏 Detected dimension: ${this.dimension} for model: ${this.config.model}`,
             );
+        }
+
+        if (this.sparseURL) {
+            const [denseResp, sparseResp] = await Promise.all([
+                this.postEmbeddings(processed),
+                this.postSparse(processed),
+            ]);
+            const vector = denseResp.data[0].embedding;
+            if (!Array.isArray(vector)) {
+                throw new Error('[InfinityEmbedding] embedding is not an array');
+            }
+            return {
+                vector,
+                dimension: this.dimension,
+                sparse: this.toSparseVector(sparseResp.data[0]),
+            };
         }
 
         const json = await this.postEmbeddings(processed);
@@ -106,6 +178,25 @@ export class InfinityEmbedding extends Embedding {
             );
         }
 
+        if (this.sparseURL) {
+            const [denseResp, sparseResp] = await Promise.all([
+                this.postEmbeddings(processed),
+                this.postSparse(processed),
+            ]);
+            denseResp.data.sort((a, b) => a.index - b.index);
+            sparseResp.data.sort((a, b) => a.index - b.index);
+            if (denseResp.data.length !== sparseResp.data.length) {
+                throw new Error(
+                    `[InfinityEmbedding] dense/sparse length mismatch: ${denseResp.data.length} vs ${sparseResp.data.length}`,
+                );
+            }
+            return denseResp.data.map((item, i) => ({
+                vector: item.embedding,
+                dimension: this.dimension,
+                sparse: this.toSparseVector(sparseResp.data[i]),
+            }));
+        }
+
         const json = await this.postEmbeddings(processed);
         json.data.sort((a, b) => a.index - b.index);
         return json.data.map((item) => ({ vector: item.embedding, dimension: this.dimension }));
@@ -117,6 +208,10 @@ export class InfinityEmbedding extends Embedding {
 
     getProvider(): string {
         return 'Infinity';
+    }
+
+    hasSparse(): boolean {
+        return Boolean(this.sparseURL);
     }
 
     async detectDimension(testText: string = 'test'): Promise<number> {

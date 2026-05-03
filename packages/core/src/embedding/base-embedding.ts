@@ -1,7 +1,16 @@
 // Interface definitions
+export interface SparseVector {
+    indices: number[];
+    values: number[];
+}
+
 export interface EmbeddingVector {
     vector: number[];
     dimension: number;
+    // Phase 4: BGE-M3 learned-sparse channel. Populated only when the
+    // provider exposes lexical_weights (e.g. InfinityEmbedding with
+    // INFINITY_SPARSE_URL pointing at the sparse sidecar).
+    sparse?: SparseVector;
 }
 
 /**
@@ -73,4 +82,14 @@ export abstract class Embedding {
      * @returns Provider name
      */
     abstract getProvider(): string;
-} 
+
+    /**
+     * Whether this provider populates the optional `sparse` field on
+     * EmbeddingVector. Used by Context to decide whether to materialise the
+     * `sparse_learned` Milvus column and add a third hybrid-search channel.
+     * Default false; providers that wire up a learned-sparse path override.
+     */
+    hasSparse(): boolean {
+        return false;
+    }
+}

@@ -75,10 +75,13 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
 
         case 'Infinity':
             const infinityUrl = config.infinityUrl || 'http://localhost:7997';
-            console.log(`[EMBEDDING] 🔧 Configuring Infinity with model: ${config.embeddingModel}, url: ${infinityUrl}`);
+            const sparseUrl = config.infinitySparseUrl;
+            console.log(`[EMBEDDING] 🔧 Configuring Infinity with model: ${config.embeddingModel}, url: ${infinityUrl}, sparse: ${sparseUrl || 'disabled'}`);
             const infinityEmbedding = new InfinityEmbedding({
                 model: config.embeddingModel,
                 baseURL: infinityUrl,
+                ...(sparseUrl && { sparseURL: sparseUrl }),
+                ...(config.infinitySparseModel && { sparseModel: config.infinitySparseModel }),
             });
             console.log(`[EMBEDDING] ✅ Infinity embedding instance created successfully`);
             return infinityEmbedding;

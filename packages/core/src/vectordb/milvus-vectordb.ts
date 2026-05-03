@@ -7,6 +7,7 @@ import {
     HybridSearchRequest,
     HybridSearchOptions,
     HybridSearchResult,
+    HybridCollectionOptions,
 } from './types';
 import { ClusterManager } from './zilliz-utils';
 
@@ -16,6 +17,21 @@ export interface MilvusConfig {
     username?: string;
     password?: string;
     ssl?: boolean;
+}
+
+/**
+ * Phase 4: convert {indices, values} to the Milvus SPARSE_FLOAT_VECTOR
+ * dict form `{ "<index>": value }`. The SDK accepts either dict or pair-array
+ * representations; dict is the documented default and round-trips cleanly
+ * through the gRPC envelope.
+ */
+function sparseToDict(sparse: { indices: number[]; values: number[] }): Record<string, number> {
+    const out: Record<string, number> = {};
+    const len = Math.min(sparse.indices.length, sparse.values.length);
+    for (let i = 0; i < len; i++) {
+        out[String(sparse.indices[i])] = sparse.values[i];
+    }
+    return out;
 }
 
 
@@ -519,13 +535,15 @@ export class MilvusVectorDatabase implements VectorDatabase {
         }
     }
 
-    async createHybridCollection(collectionName: string, dimension: number, description?: string): Promise<void> {
+    async createHybridCollection(collectionName: string, dimension: number, description?: string, options?: HybridCollectionOptions): Promise<void> {
         await this.ensureInitialized();
 
+        const enableLearnedSparse = Boolean(options?.enableLearnedSparse);
         console.log('Beginning hybrid collection creation:', collectionName);
         console.log('Collection dimension:', dimension);
+        console.log('Learned-sparse channel:', enableLearnedSparse ? 'enabled' : 'disabled');
 
-        const schema = [
+        const schema: any[] = [
             {
                 name: 'id',
                 description: 'Document ID',
@@ -617,6 +635,18 @@ export class MilvusVectorDatabase implements VectorDatabase {
             },
         ];
 
+        if (enableLearnedSparse) {
+            // Phase 4: third retrieval channel — BGE-M3 learned sparse
+            // (lexical_weights). Independent of the BM25 sparse_vector
+            // produced by the analyzer; no Milvus function attached, the
+            // values come from the embedding provider.
+            schema.push({
+                name: 'sparse_learned',
+                description: 'BGE-M3 learned sparse (lexical_weights)',
+                data_type: DataType.SparseFloatVector,
+            });
+        }
+
         // Add BM25 function
         const functions = [
             {
@@ -672,6 +702,22 @@ export class MilvusVectorDatabase implements VectorDatabase {
         // Wait for sparse vector index to be ready
         await this.waitForIndexReady(collectionName, 'sparse_vector');
 
+        if (enableLearnedSparse) {
+            // BGE-M3 lexical_weights are non-negative; IP (max-inner-product)
+            // is the natural metric — same as Milvus's own guidance for
+            // learned-sparse fields without an attached function.
+            const learnedSparseIndexParams = {
+                collection_name: collectionName,
+                field_name: 'sparse_learned',
+                index_name: 'sparse_learned_index',
+                index_type: 'SPARSE_INVERTED_INDEX',
+                metric_type: MetricType.IP,
+            };
+            console.log(`[MilvusDB] 🔧 Creating learned-sparse index for field 'sparse_learned' in collection '${collectionName}'...`);
+            await this.client.createIndex(learnedSparseIndexParams);
+            await this.waitForIndexReady(collectionName, 'sparse_learned');
+        }
+
         // Load collection to memory with retry logic
         await this.loadCollectionWithRetry(collectionName);
 
@@ -689,21 +735,30 @@ export class MilvusVectorDatabase implements VectorDatabase {
             throw new Error('MilvusClient is not initialized after ensureInitialized().');
         }
 
-        const data = documents.map(doc => ({
-            id: doc.id,
-            content: doc.content,
-            vector: doc.vector,
-            relativePath: doc.relativePath,
-            startLine: doc.startLine,
-            endLine: doc.endLine,
-            fileExtension: doc.fileExtension,
-            metadata: JSON.stringify(doc.metadata),
-            content_type: doc.content_type ?? null,
-            symbol_kind: doc.symbol_kind ?? null,
-            symbol_name: doc.symbol_name ?? null,
-            parent_symbol: doc.parent_symbol ?? null,
-            heading_path: doc.heading_path ?? null,
-        }));
+        const data = documents.map(doc => {
+            const row: Record<string, any> = {
+                id: doc.id,
+                content: doc.content,
+                vector: doc.vector,
+                relativePath: doc.relativePath,
+                startLine: doc.startLine,
+                endLine: doc.endLine,
+                fileExtension: doc.fileExtension,
+                metadata: JSON.stringify(doc.metadata),
+                content_type: doc.content_type ?? null,
+                symbol_kind: doc.symbol_kind ?? null,
+                symbol_name: doc.symbol_name ?? null,
+                parent_symbol: doc.parent_symbol ?? null,
+                heading_path: doc.heading_path ?? null,
+            };
+            // Phase 4: only attach sparse_learned when present. Milvus expects
+            // dict form `{ "<index>": value }` for SPARSE_FLOAT_VECTOR fields
+            // when no function generates them.
+            if (doc.sparse_learned && doc.sparse_learned.indices.length > 0) {
+                row.sparse_learned = sparseToDict(doc.sparse_learned);
+            }
+            return row;
+        });
 
         await this.client.insert({
             collection_name: collectionName,
@@ -720,63 +775,58 @@ export class MilvusVectorDatabase implements VectorDatabase {
         }
 
         try {
-            // Generate OpenAI embedding for the first search request (dense)
-            console.log(`[MilvusDB] 🔍 Preparing hybrid search for collection: ${collectionName}`);
+            console.log(`[MilvusDB] 🔍 Preparing hybrid search for collection: ${collectionName}, channels=${searchRequests.length}`);
 
-            // Prepare search requests in the correct Milvus format
             const filterExpr = options?.filterExpr && options.filterExpr.trim().length > 0
                 ? options.filterExpr
                 : undefined;
 
-            const search_param_1: any = {
-                data: Array.isArray(searchRequests[0].data) ? searchRequests[0].data : [searchRequests[0].data],
-                anns_field: searchRequests[0].anns_field, // "vector"
-                param: searchRequests[0].param, // {"nprobe": 10}
-                limit: searchRequests[0].limit
-            };
-
-            const search_param_2: any = {
-                data: searchRequests[1].data, // query text for sparse search
-                anns_field: searchRequests[1].anns_field, // "sparse_vector"
-                param: searchRequests[1].param, // {"drop_ratio_search": 0.2}
-                limit: searchRequests[1].limit
-            };
-
-            // Phase 0+: push filter into each AnnSearchRequest so each channel
-            // restricts candidates separately. Top-level expr on the parent
-            // search call is honored by some Milvus versions and ignored by
-            // others — per-request expr is the documented contract.
-            if (filterExpr) {
-                search_param_1.expr = filterExpr;
-                search_param_2.expr = filterExpr;
-            }
+            // Build N AnnSearchRequest payloads. Phase 0/1/2 pass 2 requests
+            // (dense + BM25 sparse_vector); Phase 4 adds a third for the
+            // BGE-M3 learned sparse_learned channel. Wrapping mirrors the
+            // pre-Phase-4 behavior verified against milvus2-sdk-node:
+            // arrays pass through, scalars (strings, sparse dicts) get
+            // wrapped in a single-element array.
+            const subRequests: any[] = searchRequests.map((req) => {
+                const sub: any = {
+                    data: Array.isArray(req.data) ? req.data : [req.data],
+                    anns_field: req.anns_field,
+                    param: req.param,
+                    limit: req.limit,
+                };
+                // Phase 0+: push filter into each AnnSearchRequest so each
+                // channel restricts candidates separately. Top-level expr is
+                // honored by some Milvus versions and ignored by others —
+                // per-request expr is the documented contract.
+                if (filterExpr) {
+                    sub.expr = filterExpr;
+                }
+                return sub;
+            });
 
             // Set rerank strategy to RRF (100) by default
-            const rerank_strategy = {
-                strategy: "rrf",
-                params: {
-                    k: 100
-                }
+            const rerank_strategy = options?.rerank ?? {
+                strategy: 'rrf',
+                params: { k: 100 },
             };
 
-            console.log(`[MilvusDB] 🔍 Dense search params:`, JSON.stringify({
-                anns_field: search_param_1.anns_field,
-                param: search_param_1.param,
-                limit: search_param_1.limit,
-                data_length: Array.isArray(search_param_1.data[0]) ? search_param_1.data[0].length : 'N/A'
-            }, null, 2));
-            console.log(`[MilvusDB] 🔍 Sparse search params:`, JSON.stringify({
-                anns_field: search_param_2.anns_field,
-                param: search_param_2.param,
-                limit: search_param_2.limit,
-                query_text: typeof search_param_2.data === 'string' ? search_param_2.data.substring(0, 50) + '...' : 'N/A'
-            }, null, 2));
+            for (const sub of subRequests) {
+                console.log(`[MilvusDB] 🔍 Channel '${sub.anns_field}' params:`, JSON.stringify({
+                    param: sub.param,
+                    limit: sub.limit,
+                    data_summary: typeof sub.data === 'string'
+                        ? sub.data.substring(0, 50) + '...'
+                        : Array.isArray(sub.data)
+                            ? `array(len=${Array.isArray(sub.data[0]) ? sub.data[0].length : 'n/a'})`
+                            : typeof sub.data,
+                }, null, 2));
+            }
             console.log(`[MilvusDB] 🔍 Rerank strategy:`, JSON.stringify(rerank_strategy, null, 2));
 
             // Execute hybrid search using the correct client.search format
             const searchParams: any = {
                 collection_name: collectionName,
-                data: [search_param_1, search_param_2],
+                data: subRequests,
                 limit: options?.limit || searchRequests[0]?.limit || 10,
                 rerank: rerank_strategy,
                 output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata', 'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path'],
