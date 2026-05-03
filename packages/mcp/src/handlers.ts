@@ -180,8 +180,8 @@ export class ToolHandlers {
             // Check each collection for codebase path
             for (const collectionName of collections) {
                 try {
-                    // Skip collections that don't match the code_chunks pattern (support both legacy and new collections)
-                    if (!collectionName.startsWith('code_chunks_') && !collectionName.startsWith('hybrid_code_chunks_')) {
+                    // Skip collections that don't match the code_chunks pattern (support legacy, hybrid, and versioned hybrid_v* names)
+                    if (!collectionName.startsWith('code_chunks_') && !collectionName.startsWith('hybrid_code_chunks_') && !/^hybrid_v[0-9a-z]+_code_chunks_/.test(collectionName)) {
                         console.log(`[SYNC-CLOUD] ⏭️  Skipping non-code collection: ${collectionName}`);
                         continue;
                     }

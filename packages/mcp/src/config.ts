@@ -4,7 +4,7 @@ export interface ContextMcpConfig {
     name: string;
     version: string;
     // Embedding provider configuration
-    embeddingProvider: 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'OpenRouter';
+    embeddingProvider: 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'OpenRouter' | 'Infinity';
     embeddingModel: string;
     // Provider-specific API keys
     openaiApiKey?: string;
@@ -18,6 +18,9 @@ export interface ContextMcpConfig {
     ollamaModel?: string;
     ollamaHost?: string;
     ollamaDimension?: number;
+    // Infinity sidecar configuration
+    infinityUrl?: string;
+    infinityDenseModel?: string;
     // Vector database configuration
     milvusAddress?: string; // Optional, can be auto-resolved from token
     milvusToken?: string;
@@ -93,6 +96,8 @@ export function getDefaultModelForProvider(provider: string): string {
             return 'openai/text-embedding-3-small';
         case 'Ollama':
             return 'nomic-embed-text';
+        case 'Infinity':
+            return 'BAAI/bge-m3';
         default:
             return 'text-embedding-3-small';
     }
@@ -106,6 +111,10 @@ export function getEmbeddingModelForProvider(provider: string): string {
             const ollamaModel = envManager.get('OLLAMA_MODEL') || envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
             console.log(`[DEBUG] 🎯 Ollama model selection: OLLAMA_MODEL=${envManager.get('OLLAMA_MODEL') || 'NOT SET'}, EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${ollamaModel}`);
             return ollamaModel;
+        case 'Infinity':
+            const infinityModel = envManager.get('INFINITY_DENSE_MODEL') || envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
+            console.log(`[DEBUG] 🎯 Infinity model selection: INFINITY_DENSE_MODEL=${envManager.get('INFINITY_DENSE_MODEL') || 'NOT SET'}, EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${infinityModel}`);
+            return infinityModel;
         case 'OpenAI':
         case 'VoyageAI':
         case 'Gemini':
@@ -150,7 +159,7 @@ export function createMcpConfig(): ContextMcpConfig {
         name: envManager.get('MCP_SERVER_NAME') || "Context MCP Server",
         version: envManager.get('MCP_SERVER_VERSION') || "1.0.0",
         // Embedding provider configuration
-        embeddingProvider: (envManager.get('EMBEDDING_PROVIDER') as 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'OpenRouter') || 'OpenAI',
+        embeddingProvider: (envManager.get('EMBEDDING_PROVIDER') as 'OpenAI' | 'VoyageAI' | 'Gemini' | 'Ollama' | 'OpenRouter' | 'Infinity') || 'OpenAI',
         embeddingModel: getEmbeddingModelForProvider(envManager.get('EMBEDDING_PROVIDER') || 'OpenAI'),
         // Provider-specific API keys
         openaiApiKey: envManager.get('OPENAI_API_KEY'),
@@ -164,6 +173,9 @@ export function createMcpConfig(): ContextMcpConfig {
         ollamaModel: envManager.get('OLLAMA_MODEL'),
         ollamaHost: envManager.get('OLLAMA_HOST'),
         ollamaDimension: getPositiveIntegerFromEnv('EMBEDDING_DIMENSION'),
+        // Infinity sidecar configuration
+        infinityUrl: envManager.get('INFINITY_URL'),
+        infinityDenseModel: envManager.get('INFINITY_DENSE_MODEL'),
         // Vector database configuration - address can be auto-resolved from token
         milvusAddress: envManager.get('MILVUS_ADDRESS'), // Optional, can be resolved from token
         milvusToken: envManager.get('MILVUS_TOKEN'),
@@ -211,6 +223,10 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
             if (config.ollamaDimension) {
                 console.log(`[MCP]   Ollama Embedding Dimension: ${config.ollamaDimension}`);
             }
+            break;
+        case 'Infinity':
+            console.log(`[MCP]   Infinity URL: ${config.infinityUrl || 'http://localhost:7997'}`);
+            console.log(`[MCP]   Infinity Dense Model: ${config.embeddingModel}`);
             break;
     }
 

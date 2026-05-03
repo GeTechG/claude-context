@@ -299,11 +299,27 @@ export class Context {
     }
 
     /**
+     * Schema-version prefix from COLLECTION_VERSION env. Phase 1 introduces
+     * `v1` (BGE-M3 dim-1024 dense + BM25). Phase 4 will switch to `v2` to
+     * carry the learned-sparse channel without reorganising existing data.
+     * Empty/unset → no version segment, preserving Phase 0/0+ collection names.
+     */
+    private getCollectionVersionSegment(): string {
+        const raw = envManager.get('COLLECTION_VERSION');
+        if (!raw) {
+            return '';
+        }
+        const sanitized = raw.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+        return sanitized ? `_${sanitized}` : '';
+    }
+
+    /**
      * Generate collection name based on codebase path and hybrid mode
      */
     public getCollectionName(codebasePath: string): string {
         const isHybrid = this.getIsHybrid();
-        const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
+        const versionSegment = this.getCollectionVersionSegment();
+        const prefix = isHybrid === true ? `hybrid${versionSegment}_code_chunks` : `code_chunks${versionSegment}`;
         const normalizedPath = path.resolve(codebasePath);
         const pathHash = crypto.createHash('md5').update(normalizedPath).digest('hex').substring(0, 8);
 
