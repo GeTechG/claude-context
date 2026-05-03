@@ -21,6 +21,10 @@ export interface ContextMcpConfig {
     // Infinity sidecar configuration
     infinityUrl?: string;
     infinityDenseModel?: string;
+    // Reranker configuration (Phase 2)
+    rerankerProvider?: 'Infinity';
+    rerankerModel?: string;
+    rerankerUrl?: string;
     // Vector database configuration
     milvusAddress?: string; // Optional, can be auto-resolved from token
     milvusToken?: string;
@@ -176,6 +180,12 @@ export function createMcpConfig(): ContextMcpConfig {
         // Infinity sidecar configuration
         infinityUrl: envManager.get('INFINITY_URL'),
         infinityDenseModel: envManager.get('INFINITY_DENSE_MODEL'),
+        // Reranker configuration (Phase 2). Reranker shares the Infinity
+        // sidecar by default — RERANKER_URL only needs to be set if the
+        // reranker lives on a different host.
+        rerankerProvider: envManager.get('RERANKER_PROVIDER') as 'Infinity' | undefined,
+        rerankerModel: envManager.get('RERANKER_MODEL'),
+        rerankerUrl: envManager.get('RERANKER_URL'),
         // Vector database configuration - address can be auto-resolved from token
         milvusAddress: envManager.get('MILVUS_ADDRESS'), // Optional, can be resolved from token
         milvusToken: envManager.get('MILVUS_TOKEN'),
@@ -228,6 +238,13 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
             console.log(`[MCP]   Infinity URL: ${config.infinityUrl || 'http://localhost:7997'}`);
             console.log(`[MCP]   Infinity Dense Model: ${config.embeddingModel}`);
             break;
+    }
+
+    if (config.rerankerProvider) {
+        const url = config.rerankerUrl || config.infinityUrl || 'http://localhost:7997';
+        console.log(`[MCP]   Reranker Provider: ${config.rerankerProvider} url=${url} model=${config.rerankerModel || '(default)'}`);
+    } else {
+        console.log(`[MCP]   Reranker Provider: ❌ Not configured (Phase 0+ guarantee-slots active)`);
     }
 
     console.log(`[MCP] 🔧 Initializing server components...`);

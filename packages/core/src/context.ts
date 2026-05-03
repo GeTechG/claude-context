@@ -19,6 +19,7 @@ import {
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
 import { classifyQuery, weightsForIntent, DomainWeights } from './search/query-classifier';
+import { Reranker } from './reranker';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
@@ -44,6 +45,12 @@ const DOC_DOMAIN_TYPES = new Set(['doc', 'code_example']);
 // against RRF dropping a whole domain off the page.
 const DEFAULT_GUARANTEE_CODE = 5;
 const DEFAULT_GUARANTEE_DOC = 5;
+
+// Phase 2 reranker pool sizes. INPUT_K is how many merged candidates we
+// hand to the reranker; OUTPUT_K is the cut after reranking. Both are
+// overridable through env so eval / tuning runs can sweep without rebuilds.
+const DEFAULT_RERANKER_INPUT_K = 50;
+const DEFAULT_RERANKER_OUTPUT_K = 15;
 
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
@@ -118,6 +125,7 @@ export interface ContextConfig {
     customExtensions?: string[]; // New: custom extensions from MCP
     customIgnorePatterns?: string[]; // New: custom ignore patterns from MCP
     collectionNameOverride?: string; // Optional: custom collection name suffix
+    reranker?: Reranker; // Phase 2: cross-encoder reranker run after weighted RRF merge
 }
 
 export class Context {
@@ -132,6 +140,7 @@ export class Context {
     private collectionNameOverride?: string;
     private warnedOverrideSanitization = new Set<string>();
     private synchronizers = new Map<string, FileSynchronizer>();
+    private reranker?: Reranker;
 
     constructor(config: ContextConfig = {}) {
         // Initialize services
@@ -174,8 +183,12 @@ export class Context {
         this.baseIgnorePatterns = this.dedupePatterns(allIgnorePatterns);
         this.ignorePatterns = [...this.baseIgnorePatterns];
         this.collectionNameOverride = config.collectionNameOverride;
+        this.reranker = config.reranker;
 
         console.log(`[Context] 🔧 Initialized with ${this.supportedExtensions.length} supported extensions and ${this.ignorePatterns.length} ignore patterns`);
+        if (this.reranker) {
+            console.log(`[Context] 🎯 Reranker enabled: provider=${this.reranker.getProvider()} input_k=${this.getRerankerInputK()} output_k=${this.getRerankerOutputK()}`);
+        }
         if (envCustomExtensions.length > 0) {
             console.log(`[Context] 📎 Loaded ${envCustomExtensions.length} custom extensions from environment: ${envCustomExtensions.join(', ')}`);
         }
@@ -289,13 +302,40 @@ export class Context {
     }
 
     /**
-     * Phase 2 stub: reranker presence flips guarantee-slots off because the
-     * reranker arbitrates the top-N better than fixed floors. For Phase 0+
-     * the env is unset → guarantee-slots are active.
+     * Phase 2: reranker presence flips guarantee-slots off because the
+     * reranker arbitrates the top-N better than fixed floors. Driven by
+     * whether a Reranker instance was wired into the constructor (the MCP
+     * factory only builds one when `RERANKER_PROVIDER` is set).
      */
     private hasReranker(): boolean {
-        const provider = envManager.get('RERANKER_PROVIDER');
-        return !!(provider && provider.trim().length > 0);
+        return !!this.reranker;
+    }
+
+    /**
+     * Public accessor (mirrors getEmbedding/getVectorDatabase) so consumers
+     * can introspect or replace the reranker without subclassing Context.
+     */
+    getReranker(): Reranker | undefined {
+        return this.reranker;
+    }
+
+    private getPositiveIntFromEnv(name: string, fallback: number): number {
+        const raw = envManager.get(name);
+        if (!raw) return fallback;
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n <= 0) {
+            console.warn(`[Context] ⚠️ Ignoring invalid ${name}=${raw}; expected positive integer, falling back to ${fallback}`);
+            return fallback;
+        }
+        return n;
+    }
+
+    private getRerankerInputK(): number {
+        return this.getPositiveIntFromEnv('RERANKER_INPUT_K', DEFAULT_RERANKER_INPUT_K);
+    }
+
+    private getRerankerOutputK(): number {
+        return this.getPositiveIntFromEnv('RERANKER_OUTPUT_K', DEFAULT_RERANKER_OUTPUT_K);
     }
 
     /**
@@ -595,8 +635,11 @@ export class Context {
             // For multi-query we pull a wider candidate pool from each domain
             // so weighted RRF and guarantee-slot reshuffling have something
             // to work with. PER_POOL_K is intentionally generous because
-            // RRF on a small pool tends to lock in the leaders.
-            const PER_POOL_K = Math.max(topK * 5, 25);
+            // RRF on a small pool tends to lock in the leaders. When a
+            // reranker is downstream, also make sure each pool can supply
+            // ~RERANKER_INPUT_K candidates after merge.
+            const rerankerInputK = this.hasReranker() ? this.getRerankerInputK() : 0;
+            const PER_POOL_K = Math.max(topK * 5, 25, rerankerInputK);
 
             const buildRequests = (limit: number): HybridSearchRequest[] => ([
                 {
@@ -659,19 +702,25 @@ export class Context {
 
                 console.log(`[Context] 🔍 Pool sizes: code=${codePool.length} doc=${docPool.length}`);
 
+                // Wider merge when a reranker is downstream so it has
+                // ~RERANKER_INPUT_K candidates to arbitrate over.
+                const mergeLimit = this.hasReranker()
+                    ? Math.max(rerankerInputK, topK * 3, 30)
+                    : Math.max(topK * 3, 30);
+
                 const merged = this.weightedRrfMerge(
                     [
                         { results: codePool, weight: weights.code },
                         { results: docPool, weight: weights.doc },
                     ],
-                    Math.max(topK * 3, 30)
+                    mergeLimit
                 );
 
                 let semanticMerged: SemanticSearchResult[] = merged.map((r) => this.toSemanticResult(r));
 
                 // Guarantee-slots: defend top-N domain coverage when no
-                // reranker is in front of us. Disabled in Phase 2+ where the
-                // reranker handles balance.
+                // reranker is in front of us. Disabled when reranker is
+                // active because the reranker handles domain balance.
                 if (!this.hasReranker() && (codePool.length > 0 || docPool.length > 0)) {
                     semanticMerged = this.applyGuaranteeSlots(
                         semanticMerged,
@@ -683,15 +732,20 @@ export class Context {
                     );
                 }
 
-                mergedResults = semanticMerged.slice(0, topK);
+                mergedResults = semanticMerged;
             } else {
                 console.log(`[Context] 🔍 MULTI_QUERY=false → single-pool hybrid search`);
+                // When reranker is active, pull a wider pool for it to
+                // arbitrate over; otherwise topK is enough.
+                const singleLimit = this.hasReranker()
+                    ? Math.max(this.getRerankerInputK(), topK)
+                    : topK;
                 const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
                     collectionName,
-                    buildRequests(topK),
+                    buildRequests(singleLimit),
                     {
                         rerank: { strategy: 'rrf', params: { k: 100 } },
-                        limit: topK,
+                        limit: singleLimit,
                         filterExpr,
                     }
                 );
@@ -701,10 +755,16 @@ export class Context {
             console.log(`[Context] 🔍 Raw merged results count: ${mergedResults.length}`);
             const dedupedResults = this.deduplicateResults(mergedResults);
             console.log(`[Context] ✅ Found ${mergedResults.length} results, ${dedupedResults.length} after dedup`);
-            if (dedupedResults.length > 0) {
-                console.log(`[Context] 🔍 Top result score: ${dedupedResults[0].score}, path: ${dedupedResults[0].relativePath}`);
+
+            // Phase 2: cross-encoder rerank over the merged-and-deduped pool.
+            const finalResults = this.hasReranker()
+                ? await this.applyReranker(query, dedupedResults, topK)
+                : dedupedResults.slice(0, topK);
+
+            if (finalResults.length > 0) {
+                console.log(`[Context] 🔍 Top result score: ${finalResults[0].score}, path: ${finalResults[0].relativePath}`);
             }
-            return dedupedResults;
+            return finalResults;
         } else {
             // Regular semantic search
             // 1. Generate query vector
@@ -798,6 +858,53 @@ export class Context {
             })
             .sort((a, b) => b.score - a.score)
             .slice(0, k);
+    }
+
+    /**
+     * Phase 2: cross-encoder rerank over the merged candidate pool.
+     *
+     * Takes the top RERANKER_INPUT_K from `candidates` (already deduped),
+     * sends them to the reranker together with the query, sorts by the
+     * returned scores, then keeps the top RERANKER_OUTPUT_K (or `topK`,
+     * whichever is larger) before slicing to `topK` for the caller.
+     *
+     * On reranker error we fall back to RRF order — search must not fail
+     * because the sidecar hiccupped.
+     */
+    private async applyReranker(
+        query: string,
+        candidates: SemanticSearchResult[],
+        topK: number,
+    ): Promise<SemanticSearchResult[]> {
+        if (!this.reranker || candidates.length === 0) {
+            return candidates.slice(0, topK);
+        }
+
+        const inputK = Math.min(this.getRerankerInputK(), candidates.length);
+        const outputK = Math.max(this.getRerankerOutputK(), topK);
+        const slice = candidates.slice(0, inputK);
+        const docs = slice.map((c) => c.content);
+
+        let rerankResults;
+        try {
+            const t0 = Date.now();
+            rerankResults = await this.reranker.rerank(query, docs);
+            console.log(`[Context] 🎯 reranker (${this.reranker.getProvider()}) ranked ${docs.length} candidates in ${Date.now() - t0}ms`);
+        } catch (err) {
+            console.warn(`[Context] ⚠️ reranker failed, falling back to RRF order: ${err}`);
+            return candidates.slice(0, topK);
+        }
+
+        rerankResults.sort((a, b) => b.score - a.score);
+        const reranked: SemanticSearchResult[] = [];
+        for (const r of rerankResults) {
+            const src = slice[r.index];
+            if (!src) continue;
+            reranked.push({ ...src, score: r.score });
+            if (reranked.length >= outputK) break;
+        }
+
+        return reranked.slice(0, topK);
     }
 
     /**

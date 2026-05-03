@@ -27,6 +27,7 @@ import { MilvusVectorDatabase } from "@zilliz/claude-context-core";
 // Import our modular components
 import { createMcpConfig, logConfigurationSummary, showHelpMessage, ContextMcpConfig } from "./config.js";
 import { createEmbeddingInstance, logEmbeddingProviderInfo } from "./embedding.js";
+import { createRerankerInstance } from "./reranker.js";
 import { SnapshotManager } from "./snapshot.js";
 import { SyncManager } from "./sync.js";
 import { ToolHandlers } from "./handlers.js";
@@ -65,11 +66,15 @@ class ContextMcpServer {
             ...(config.milvusToken && { token: config.milvusToken })
         });
 
+        // Initialize reranker (optional — Phase 2)
+        const reranker = createRerankerInstance(config);
+
         // Initialize Claude Context
         this.context = new Context({
             embedding,
             vectorDatabase,
-            collectionNameOverride: config.collectionNameOverride
+            collectionNameOverride: config.collectionNameOverride,
+            ...(reranker && { reranker })
         });
 
         // Initialize managers
