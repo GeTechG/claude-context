@@ -102,3 +102,53 @@ export function weightsForIntent(intent: QueryIntent): DomainWeights {
     }
     return { code: 1.0, doc: 1.0 };
 }
+
+// Phase C (rag-code-intent-recall): qualified-name parser for symbol routing.
+//
+// Recognises three universal forms:
+//   Foo.Bar.baz       (dot-separated; JS, Python, Haxe, …)
+//   Foo::Bar::baz     (double-colon; Rust, C++)
+//   Foo/Bar/baz       (slash; path-style)
+//
+// Returns the trailing component as `methodName` and the immediately preceding
+// component as `className`. Returns null for natural-language phrases, single
+// identifiers without a separator, and malformed inputs (`a.`, `.b`, `a..b`).
+//
+// Anchored: the entire trimmed query must be a qualified name. This protects
+// downstream consumers (symbol-routing 3rd pool, reranker bypass) from
+// mixed-intent queries that contain a qualified name embedded in NL prose
+// (e.g. "Lambda.fold reduce list to single value" — these belong to the
+// general reranked pool, not symbol-routing).
+
+export interface ParsedQName {
+    className: string;
+    methodName: string;
+    fullyQualified: string;
+}
+
+const COMPONENT = /[A-Za-z_][A-Za-z0-9_]*/;
+// Whole-string qualified names with a single separator class.
+const QNAME_DOT = new RegExp(`^${COMPONENT.source}(?:\\.${COMPONENT.source})+$`);
+const QNAME_COLON = new RegExp(`^${COMPONENT.source}(?:::${COMPONENT.source})+$`);
+const QNAME_SLASH = new RegExp(`^${COMPONENT.source}(?:/${COMPONENT.source})+$`);
+
+export function parseQualifiedName(query: string): ParsedQName | null {
+    if (!query) return null;
+    const trimmed = query.trim();
+    if (trimmed.length === 0) return null;
+
+    let separator: string | null = null;
+    if (QNAME_DOT.test(trimmed)) separator = '.';
+    else if (QNAME_COLON.test(trimmed)) separator = '::';
+    else if (QNAME_SLASH.test(trimmed)) separator = '/';
+    if (separator === null) return null;
+
+    const components = trimmed.split(separator);
+    if (components.length < 2) return null;
+    // Reject empty components (`a..b` would split to ['a','','b'] for dot).
+    if (components.some((c) => c.length === 0)) return null;
+
+    const methodName = components[components.length - 1];
+    const className = components[components.length - 2];
+    return { className, methodName, fullyQualified: trimmed };
+}

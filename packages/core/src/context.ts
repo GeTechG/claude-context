@@ -19,7 +19,8 @@ import {
 } from './vectordb';
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
-import { classifyQuery, weightsForIntent, DomainWeights } from './search/query-classifier';
+import { classifyQuery, weightsForIntent, DomainWeights, parseQualifiedName } from './search/query-classifier';
+import { buildSymbolFilter } from './search/symbol-routing';
 import { Reranker } from './reranker';
 import { extractCandidateSymbols } from './enrichment';
 import * as fs from 'fs';
@@ -767,7 +768,29 @@ export class Context {
                 const innerRerank = this.buildInnerRerankStrategy(
                     !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0)
                 );
-                const [codePool, docPool] = await Promise.all([
+
+                // Phase C (rag-code-intent-recall): symbol-routing pool —
+                // when the query is a qualified name AND code-intent AND
+                // the className is in the indexed vocab, build a metadata
+                // filter that pins candidates to the symbol's chunks.
+                const symbolPoolLimit = 10;
+                const symbolFilterExpr = await this.buildSymbolPoolFilter(query, intent, codebasePath);
+                const symbolPoolPromise: Promise<HybridSearchResult[]> = symbolFilterExpr
+                    ? this.vectorDatabase.hybridSearch(
+                        collectionName,
+                        buildRequests(symbolPoolLimit),
+                        {
+                            rerank: innerRerank,
+                            limit: symbolPoolLimit,
+                            filterExpr: symbolFilterExpr,
+                        }
+                    ).catch((err) => {
+                        console.warn(`[Context] ⚠️ symbol-routing pool failed: ${err}`);
+                        return [] as HybridSearchResult[];
+                    })
+                    : Promise.resolve([] as HybridSearchResult[]);
+
+                const [codePool, docPool, symbolPool] = await Promise.all([
                     this.vectorDatabase.hybridSearch(
                         collectionName,
                         buildRequests(PER_POOL_K),
@@ -792,9 +815,10 @@ export class Context {
                         console.warn(`[Context] ⚠️ doc-domain hybrid search failed: ${err}`);
                         return [] as HybridSearchResult[];
                     }),
+                    symbolPoolPromise,
                 ]);
 
-                console.log(`[Context] 🔍 Pool sizes: code=${codePool.length} doc=${docPool.length}`);
+                console.log(`[Context] 🔍 Pool sizes: code=${codePool.length} doc=${docPool.length} symbol=${symbolPool.length}`);
 
                 // Wider merge when a reranker is downstream so it has
                 // ~RERANKER_INPUT_K candidates to arbitrate over.
@@ -802,11 +826,16 @@ export class Context {
                     ? Math.max(rerankerInputK, topK * 3, 30)
                     : Math.max(topK * 3, 30);
 
+                const SYMBOL_POOL_WEIGHT = 2.0;
+                const mergePools: { results: HybridSearchResult[]; weight: number }[] = [
+                    { results: codePool, weight: weights.code },
+                    { results: docPool, weight: weights.doc },
+                ];
+                if (symbolPool.length > 0) {
+                    mergePools.push({ results: symbolPool, weight: SYMBOL_POOL_WEIGHT });
+                }
                 const merged = this.weightedRrfMerge(
-                    [
-                        { results: codePool, weight: weights.code },
-                        { results: docPool, weight: weights.doc },
-                    ],
+                    mergePools,
                     mergeLimit,
                     this.getRrfK()
                 );
@@ -854,10 +883,23 @@ export class Context {
             const dedupedResults = this.deduplicateResults(mergedResults);
             console.log(`[Context] ✅ Found ${mergedResults.length} results, ${dedupedResults.length} after dedup`);
 
+            this.maybeDumpPreRerankCandidates(query, dedupedResults);
+
+            // Phase R (rag-code-intent-recall): when the query is a
+            // strictly-anchored qualified name AND code-intent only, allow
+            // bypass of the cross-encoder reranker. Cross-encoders trained on
+            // NL-QA distribute mass over surface-similar wrong-subject chunks
+            // for short identifier queries; the merged-RRF order (now
+            // boosted by the symbol-routing pool) is more reliable on these.
+            const rerankerBypassed = this.shouldBypassReranker(query, intent);
+
             // Phase 2: cross-encoder rerank over the merged-and-deduped pool.
-            const finalResults = this.hasReranker()
+            const finalResults = this.hasReranker() && !rerankerBypassed
                 ? await this.applyReranker(query, dedupedResults, topK)
                 : dedupedResults.slice(0, topK);
+            if (rerankerBypassed) {
+                console.log(`[Context] ⏭️  reranker bypassed for qualified-name code query "${query}"`);
+            }
 
             if (finalResults.length > 0) {
                 console.log(`[Context] 🔍 Top result score: ${finalResults[0].score}, path: ${finalResults[0].relativePath}`);
@@ -1104,8 +1146,109 @@ export class Context {
     }
 
     /**
+     * Phase R (rag-code-intent-recall): decide whether to skip the
+     * cross-encoder reranker for the current query. Gated by env
+     * RERANKER_BYPASS_FOR_QUALIFIED_NAME (default false). Same intent gate
+     * as the symbol-routing pool — code-intent only, no doc tokens, query
+     * must parse as a strictly-anchored qualified name.
+     */
+    private shouldBypassReranker(query: string, intent: { codeSignal: boolean; docSignal: boolean }): boolean {
+        if ((process.env.RERANKER_BYPASS_FOR_QUALIFIED_NAME || 'false').toLowerCase() !== 'true') return false;
+        // Same intent gate as buildSymbolPoolFilter: codeSignal alone, since
+        // the anchored parseQualifiedName already rejects embedded NL like
+        // "Lambda.fold reduce list to single value".
+        if (!intent.codeSignal) return false;
+        return parseQualifiedName(query) !== null;
+    }
+
+    /**
+     * Phase C (rag-code-intent-recall): build a Milvus filter expression for
+     * the symbol-routing pool, or return null when any gate fails (env off,
+     * intent mismatch, query is not a qualified name, vocab missing
+     * className). Pure read-side — no side effects beyond a debug log.
+     */
+    private async buildSymbolPoolFilter(
+        query: string,
+        intent: { codeSignal: boolean; docSignal: boolean },
+        codebasePath: string,
+    ): Promise<string | null> {
+        if ((process.env.SYMBOL_ROUTING || 'true').toLowerCase() === 'false') return null;
+        // Gate per spec: codeSignal must be true. Embedded NL is already
+        // rejected by parseQualifiedName's anchored regex, so we don't need
+        // an additional !docSignal check (which would falsely exclude
+        // multi-component qualified names like `haxe.io.Path.join` that the
+        // classifier flags as docSignal due to >=3 identifier-shaped words).
+        if (!intent.codeSignal) return null;
+        const parsed = parseQualifiedName(query);
+        if (!parsed) return null;
+        let vocab: ReadonlySet<string> | null = null;
+        try {
+            vocab = await this.loadSymbolVocabulary(codebasePath);
+        } catch (err) {
+            console.warn(`[Context] ⚠️ symbol-vocab load failed: ${err}`);
+            return null;
+        }
+        if (!vocab) {
+            console.warn('[Context] ⚠️ symbol-routing skipped: no .symbols-vocab.json available');
+            return null;
+        }
+        const filterExpr = buildSymbolFilter({ parsed, vocab });
+        if (!filterExpr) {
+            console.log(`[Context] 🔍 symbol-routing skipped for "${query}" (className "${parsed.className}" not in vocab)`);
+            return null;
+        }
+        console.log(`[Context] 🔎 symbol-routing pool engaged for "${query}" → ${filterExpr.slice(0, 120)}${filterExpr.length > 120 ? '…' : ''}`);
+        return filterExpr;
+    }
+
+    /**
+     * Diagnostic dump of the post-merge / pre-rerank candidate pool.
+     * Triggered only when env CANDIDATE_LOG_DIR is set; one JSON file per
+     * query, named by env CANDIDATE_LOG_QID (or a sha1 prefix of the query
+     * if QID is not provided).
+     */
+    private maybeDumpPreRerankCandidates(query: string, candidates: SemanticSearchResult[]): void {
+        const dir = (process.env.CANDIDATE_LOG_DIR || '').trim();
+        if (!dir) return;
+        try {
+            fs.mkdirSync(dir, { recursive: true });
+            const qidRaw = (process.env.CANDIDATE_LOG_QID || '').trim();
+            const safeQid = qidRaw
+                ? qidRaw.replace(/[^A-Za-z0-9_.-]/g, '_')
+                : crypto.createHash('sha1').update(query).digest('hex').slice(0, 12);
+            const top = candidates.slice(0, 50).map((r, i) => ({
+                rank: i + 1,
+                relativePath: r.relativePath,
+                startLine: r.startLine,
+                endLine: r.endLine,
+                symbol_name: r.symbol_name ?? null,
+                parent_symbol: r.parent_symbol ?? null,
+                content_type: r.content_type ?? null,
+                score: typeof r.score === 'number' ? Number(r.score.toFixed(6)) : r.score,
+            }));
+            const payload = {
+                qid: qidRaw || null,
+                query,
+                generatedAt: new Date().toISOString(),
+                count: top.length,
+                candidates: top,
+            };
+            fs.writeFileSync(path.join(dir, `${safeQid}.json`), JSON.stringify(payload, null, 2));
+        } catch (err) {
+            console.warn(`[Context] ⚠️ candidate dump failed: ${err}`);
+        }
+    }
+
+    /**
      * Deduplicate search results by file + line range overlap.
      * Keeps higher-scored result when two results from the same file overlap >50%.
+     *
+     * Phase B (rag-code-intent-recall): when CANONICAL_DEDUP is enabled (default
+     * true), follow up with a path-cluster preference pass — within each
+     * (symbol_name, basename) cluster of >1 result, demote any path containing a
+     * marker from PATH_DEMOTE_MARKERS in favour of canonical paths. This breaks
+     * ties from vendored / re-implementation / generated copies of the same
+     * symbol, language-agnostically.
      */
     private deduplicateResults(results: SemanticSearchResult[]): SemanticSearchResult[] {
         const kept: SemanticSearchResult[] = [];
@@ -1126,7 +1269,78 @@ export class Context {
             }
         }
 
-        return kept;
+        return this.applyCanonicalDedup(kept);
+    }
+
+    /**
+     * Phase B (rag-code-intent-recall): collapse each (symbol_name, basename)
+     * cluster down to its canonical (no demote-marker in path). Among multiple
+     * canonicals, keep the shortest path (fewest segments). Among ties, keep
+     * the original rerank-input order. No-op when the cluster has zero
+     * canonicals (all clones) — leaves the cluster untouched so we never
+     * accidentally drop the only available match.
+     */
+    private applyCanonicalDedup(results: SemanticSearchResult[]): SemanticSearchResult[] {
+        if ((process.env.CANONICAL_DEDUP || 'true').toLowerCase() === 'false') {
+            return results;
+        }
+        const markers = this.getPathDemoteMarkers();
+        if (markers.length === 0) return results;
+
+        const basenameOf = (p: string): string => {
+            const i = p.lastIndexOf('/');
+            return i === -1 ? p : p.slice(i + 1);
+        };
+        const segmentCount = (p: string): number => p.split('/').length;
+        const hasDemoteMarker = (p: string): boolean => {
+            const segments = p.split('/');
+            return segments.some((seg) => markers.includes(seg));
+        };
+
+        type Indexed = { result: SemanticSearchResult; idx: number };
+        const clusters = new Map<string, Indexed[]>();
+        const order: Indexed[] = results.map((r, idx) => ({ result: r, idx }));
+        for (const item of order) {
+            const sym = item.result.symbol_name;
+            if (!sym) continue;
+            const base = basenameOf(item.result.relativePath || '');
+            if (!base) continue;
+            const key = `${sym} ${base}`;
+            const bucket = clusters.get(key) || [];
+            bucket.push(item);
+            clusters.set(key, bucket);
+        }
+
+        const dropIdx = new Set<number>();
+        for (const bucket of clusters.values()) {
+            if (bucket.length <= 1) continue;
+            const canonicals = bucket.filter((b) => !hasDemoteMarker(b.result.relativePath || ''));
+            if (canonicals.length === 0) continue; // all clones — leave intact
+            // Pick the winning canonical: shortest path, then earliest rank.
+            canonicals.sort((a, b) => {
+                const segDelta = segmentCount(a.result.relativePath) - segmentCount(b.result.relativePath);
+                if (segDelta !== 0) return segDelta;
+                return a.idx - b.idx;
+            });
+            const winnerIdx = canonicals[0].idx;
+            for (const item of bucket) {
+                if (item.idx !== winnerIdx) dropIdx.add(item.idx);
+            }
+        }
+
+        if (dropIdx.size === 0) return results;
+        return order.filter((item) => !dropIdx.has(item.idx)).map((item) => item.result);
+    }
+
+    private static DEFAULT_PATH_DEMOTE_MARKERS = [
+        '_std', 'vendor', 'node_modules', 'dist', 'build', 'generated',
+        '__pycache__', 'target', 'out', '.venv', 'venv', 'site-packages',
+    ];
+
+    private getPathDemoteMarkers(): string[] {
+        const raw = (process.env.PATH_DEMOTE_MARKERS || '').trim();
+        if (!raw) return Context.DEFAULT_PATH_DEMOTE_MARKERS;
+        return raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
     }
 
     /**
