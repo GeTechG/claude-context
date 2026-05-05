@@ -13,6 +13,13 @@ export interface CodeChunk {
         symbol_name?: string;
         parent_symbol?: string;
         heading_path?: string[];
+        // rag-graph-layer Phase 1: structural fields harvested by the AST
+        // splitter (code chunks) and the markdown splitter (doc / code_example
+        // chunks). Empty arrays / undefined when not extractable.
+        imports?: string[];
+        extends?: string;
+        implements?: string[];
+        mentioned_symbols?: string[];
     };
 }
 

@@ -248,6 +248,62 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                             elementTypeParams: {
                                 max_length: 65535
                             }
+                        },
+                        // rag-graph-layer Phase 1.3: structural fields. Mirror
+                        // the gRPC schema in milvus-vectordb.ts.
+                        {
+                            fieldName: "content_type",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 32 }
+                        },
+                        {
+                            fieldName: "symbol_kind",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 64 }
+                        },
+                        {
+                            fieldName: "symbol_name",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 512 }
+                        },
+                        {
+                            fieldName: "parent_symbol",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 512 }
+                        },
+                        {
+                            fieldName: "heading_path",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 2048 }
+                        },
+                        {
+                            fieldName: "imports",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 2048 }
+                        },
+                        {
+                            fieldName: "extends",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 512 }
+                        },
+                        {
+                            fieldName: "implements",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 2048 }
+                        },
+                        {
+                            fieldName: "mentioned_symbols",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 4096 }
                         }
                     ]
                 }
@@ -374,7 +430,16 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                 startLine: doc.startLine,
                 endLine: doc.endLine,
                 fileExtension: doc.fileExtension,
-                metadata: JSON.stringify(doc.metadata) // Convert metadata object to JSON string
+                metadata: JSON.stringify(doc.metadata),
+                content_type: doc.content_type ?? null,
+                symbol_kind: doc.symbol_kind ?? null,
+                symbol_name: doc.symbol_name ?? null,
+                parent_symbol: doc.parent_symbol ?? null,
+                heading_path: doc.heading_path ?? null,
+                imports: doc.imports ?? null,
+                extends: doc.extends ?? null,
+                implements: doc.implements ?? null,
+                mentioned_symbols: doc.mentioned_symbols ?? null,
             }));
 
             const insertRequest = {
@@ -412,7 +477,16 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                     "startLine",
                     "endLine",
                     "fileExtension",
-                    "metadata"
+                    "metadata",
+                    "content_type",
+                    "symbol_kind",
+                    "symbol_name",
+                    "parent_symbol",
+                    "heading_path",
+                    "imports",
+                    "extends",
+                    "implements",
+                    "mentioned_symbols",
                 ],
                 searchParams: {
                     metricType: "COSINE", // Match the index metric type
@@ -447,7 +521,16 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                         startLine: item.startLine || 0,
                         endLine: item.endLine || 0,
                         fileExtension: item.fileExtension || '',
-                        metadata: metadata
+                        metadata: metadata,
+                        content_type: item.content_type ?? undefined,
+                        symbol_kind: item.symbol_kind ?? undefined,
+                        symbol_name: item.symbol_name ?? undefined,
+                        parent_symbol: item.parent_symbol ?? undefined,
+                        heading_path: item.heading_path ?? undefined,
+                        imports: item.imports ?? undefined,
+                        extends: item.extends ?? undefined,
+                        implements: item.implements ?? undefined,
+                        mentioned_symbols: item.mentioned_symbols ?? undefined,
                     },
                     score: item.distance || 0
                 };
@@ -598,6 +681,62 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                             elementTypeParams: {
                                 max_length: 65535
                             }
+                        },
+                        // rag-graph-layer Phase 1.3: structural fields. Mirror
+                        // the gRPC hybrid schema.
+                        {
+                            fieldName: "content_type",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 32 }
+                        },
+                        {
+                            fieldName: "symbol_kind",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 64 }
+                        },
+                        {
+                            fieldName: "symbol_name",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 512 }
+                        },
+                        {
+                            fieldName: "parent_symbol",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 512 }
+                        },
+                        {
+                            fieldName: "heading_path",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 2048 }
+                        },
+                        {
+                            fieldName: "imports",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 2048 }
+                        },
+                        {
+                            fieldName: "extends",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 512 }
+                        },
+                        {
+                            fieldName: "implements",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 2048 }
+                        },
+                        {
+                            fieldName: "mentioned_symbols",
+                            dataType: "VarChar",
+                            nullable: true,
+                            elementTypeParams: { max_length: 4096 }
                         }
                     ]
                 }
@@ -674,6 +813,15 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                 endLine: doc.endLine,
                 fileExtension: doc.fileExtension,
                 metadata: JSON.stringify(doc.metadata),
+                content_type: doc.content_type ?? null,
+                symbol_kind: doc.symbol_kind ?? null,
+                symbol_name: doc.symbol_name ?? null,
+                parent_symbol: doc.parent_symbol ?? null,
+                heading_path: doc.heading_path ?? null,
+                imports: doc.imports ?? null,
+                extends: doc.extends ?? null,
+                implements: doc.implements ?? null,
+                mentioned_symbols: doc.mentioned_symbols ?? null,
             }));
 
             const insertRequest = {
@@ -760,7 +908,7 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                 search: [search_param_1, search_param_2],
                 rerank: rerank_strategy,
                 limit: options?.limit || searchRequests[0]?.limit || 10,
-                outputFields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata'],
+                outputFields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata', 'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path', 'imports', 'extends', 'implements', 'mentioned_symbols'],
             };
 
             console.log(`[MilvusRestfulDB] 🔍 Executing REST API hybrid search...`);
@@ -793,6 +941,15 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                         endLine: result.endLine,
                         fileExtension: result.fileExtension,
                         metadata,
+                        content_type: result.content_type ?? undefined,
+                        symbol_kind: result.symbol_kind ?? undefined,
+                        symbol_name: result.symbol_name ?? undefined,
+                        parent_symbol: result.parent_symbol ?? undefined,
+                        heading_path: result.heading_path ?? undefined,
+                        imports: result.imports ?? undefined,
+                        extends: result.extends ?? undefined,
+                        implements: result.implements ?? undefined,
+                        mentioned_symbols: result.mentioned_symbols ?? undefined,
                     },
                     score: result.score || result.distance || 0,
                 };

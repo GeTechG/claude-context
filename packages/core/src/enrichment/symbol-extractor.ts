@@ -22,18 +22,22 @@ export interface SymbolExtractorOptions {
 const DEFAULT_TOP_N = 10;
 
 const NESTED_DEF = /\b(?:class|function|def|fn|interface|enum|typedef|abstract)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
-const QUALIFIED_NAME = /\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b/g;
-const MD_CODE_SPAN = /`([^`\n]{1,120})`/g;
+// rag-graph-layer Phase 1.2: shared with markdown-splitter at split time
+// (mentioned_symbols metadata) and with this module at search time
+// (candidateSymbols enrichment).
+export const QUALIFIED_NAME = /\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+\b/g;
+export const MD_CODE_SPAN = /`([^`\n]{1,120})`/g;
 const BARE_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const QUALIFIED_IDENT = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$/;
 
-const STOPWORDS = new Set([
+export const SYMBOL_STOPWORDS: ReadonlySet<string> = new Set([
     'true', 'false', 'null', 'none', 'undefined', 'self', 'this', 'super',
     'class', 'function', 'def', 'fn', 'interface', 'enum', 'typedef',
     'abstract', 'return', 'import', 'from', 'as', 'if', 'else', 'for',
     'while', 'try', 'catch', 'throw', 'new', 'delete', 'const', 'let',
     'var', 'public', 'private', 'protected', 'static', 'async', 'await',
 ]);
+const STOPWORDS = SYMBOL_STOPWORDS;
 
 function isCodeDomain(r: SemanticSearchResult): boolean {
     const t = r.content_type;
@@ -50,6 +54,50 @@ function looksLikeSymbol(token: string): boolean {
     if (STOPWORDS.has(token.toLowerCase())) return false;
     if (token.length < 2) return false;
     return BARE_IDENT.test(token) || QUALIFIED_IDENT.test(token);
+}
+
+/**
+ * rag-graph-layer Phase 1.2: extract qualified-names and markdown code-span
+ * tokens from a doc / code_example body. Used at split time to populate
+ * `chunk.metadata.mentioned_symbols`. Optionally vocab-filtered with the
+ * same logic as `extractCandidateSymbols`.
+ */
+export function extractMentionedSymbolsFromText(
+    text: string,
+    vocabulary?: ReadonlySet<string>,
+): string[] {
+    if (!text) return [];
+    const seen = new Set<string>();
+    const out: string[] = [];
+    const push = (token: string) => {
+        if (!looksLikeSymbol(token)) return;
+        if (seen.has(token)) return;
+        seen.add(token);
+        out.push(token);
+    };
+
+    let m: RegExpExecArray | null;
+    QUALIFIED_NAME.lastIndex = 0;
+    while ((m = QUALIFIED_NAME.exec(text)) !== null) {
+        push(m[0]);
+    }
+    MD_CODE_SPAN.lastIndex = 0;
+    while ((m = MD_CODE_SPAN.exec(text)) !== null) {
+        const inner = m[1].trim();
+        if (!inner) continue;
+        const stripped = inner.replace(/\s*\([^)]*\)\s*$/, '');
+        push(stripped);
+    }
+
+    if (!vocabulary || vocabulary.size === 0) return out;
+    return out.filter((name) => {
+        if (vocabulary.has(name)) return true;
+        if (!name.includes('.')) return false;
+        for (const seg of name.split('.')) {
+            if (vocabulary.has(seg)) return true;
+        }
+        return false;
+    });
 }
 
 function harvestFromCode(r: SemanticSearchResult, sink: Map<string, number>): void {

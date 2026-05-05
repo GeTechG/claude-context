@@ -21,6 +21,7 @@ import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
 import { classifyQuery, weightsForIntent, DomainWeights, parseQualifiedName } from './search/query-classifier';
 import { buildSymbolFilter } from './search/symbol-routing';
+import { GraphIndex, collectGraphCandidateIds } from './search/graph-expansion';
 import { Reranker } from './reranker';
 import { extractCandidateSymbols } from './enrichment';
 import * as fs from 'fs';
@@ -28,11 +29,51 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { FileSynchronizer } from './sync/synchronizer';
 
+// rag-graph-layer Phase 2: in-memory accumulator that records, per chunk
+// emitted during an indexCodebase run, just enough fields to build the
+// cross-domain side-index without re-querying Milvus. `code` chunks contribute
+// canonical entries; `doc`/`code_example` chunks contribute reverse-mention
+// edges via their mentioned_symbols.
+interface GraphAccumulatorChunk {
+    chunkId: string;
+    relativePath: string;
+    contentType: string | undefined;
+    symbolName: string | undefined;
+    mentionedSymbols: string[] | undefined;
+}
+
+class GraphAccumulator {
+    private chunks: GraphAccumulatorChunk[] = [];
+
+    add(entry: GraphAccumulatorChunk): void {
+        this.chunks.push(entry);
+    }
+
+    snapshot(): readonly GraphAccumulatorChunk[] {
+        return this.chunks;
+    }
+}
+
 function parseHeadingPath(raw: string | undefined): string[] | undefined {
     if (!raw) return undefined;
     try {
         const parsed = JSON.parse(raw);
         return Array.isArray(parsed) ? parsed.map(String) : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+// rag-graph-layer Phase 1.3: stored array fields are JSON-encoded VarChar
+// columns; decode on the way out. Returns undefined if missing/malformed.
+function parseStringArray(raw: string | undefined): string[] | undefined {
+    if (!raw) return undefined;
+    try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return undefined;
+        const cleaned = parsed
+            .filter((s): s is string => typeof s === 'string' && s.length > 0);
+        return cleaned.length > 0 ? cleaned : undefined;
     } catch {
         return undefined;
     }
@@ -64,6 +105,16 @@ const DEFAULT_RRF_K = 60;
 // CHANNEL_WEIGHT_* env var is set, with weights aligned to the channel order
 // emitted by buildRequests (dense, sparse_bm25, sparse_learned).
 const DEFAULT_MILVUS_RRF_K = 100;
+
+// rag-graph-layer Phase 3.5: graph-pool weight in the outer weighted RRF.
+// Lower than code/doc weights (1.0..1.5) by design — soft-bias rather
+// than dominate the merge.
+const DEFAULT_GRAPH_POOL_WEIGHT = 0.6;
+
+// rag-graph-layer Phase 3.5: top-K of the *pre-graph* primary RRF that
+// becomes seed material for the graph-expansion module. Aligned with
+// RERANKER_INPUT_K so we never expand beyond the reranker's working set.
+const DEFAULT_GRAPH_SEED_K = 50;
 
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
@@ -160,6 +211,22 @@ export class Context {
     // (see loadSymbolVocabulary below).
     private indexedSymbols: Set<string> | null = null;
     private symbolVocabCache = new Map<string, ReadonlySet<string> | null>();
+    // rag-graph-layer Phase 2: in-memory accumulator for the cross-domain
+    // graph builder. Populated by processChunkBatch as each chunk gets
+    // assigned its Milvus chunk_id; written out as `.symbols-graph.json`
+    // at the end of indexCodebase. Null outside an active indexing run.
+    private graphAccumulator: GraphAccumulator | null = null;
+    // rag-graph-layer Phase 3: search-time cache of `.symbols-graph.json`.
+    // Loaded lazily on first semanticSearch per codebasePath; null sentinel
+    // stored so we don't re-attempt loading on every query when the file
+    // is absent or malformed.
+    private graphIndexCache = new Map<string, GraphIndex | null>();
+    // Throttle warning rate for stale chunk-id misses (spec scenario
+    // "Side-файл stale"): at most one warning per minute per process.
+    private staleGraphChunkWarnedAt = 0;
+    // rag-graph-layer Phase 3.7: print the wiring banner exactly once per
+    // collection so the MCP log is grep-able for the runtime mode.
+    private graphStartupBannerLogged = new Set<string>();
 
     constructor(config: ContextConfig = {}) {
         // Initialize services
@@ -365,6 +432,89 @@ export class Context {
         return this.getPositiveIntFromEnv('MILVUS_RRF_K', DEFAULT_MILVUS_RRF_K);
     }
 
+    /**
+     * rag-graph-layer Phase 3.4: env-gated graph-expansion level.
+     *   `0` (default): pipeline runs identically to the pre-graph baseline.
+     *   `1`: 1-hop expansion through `.symbols-graph.json`.
+     *   `2`: reserved for the deferred 2-hop sub-change (D7).
+     */
+    private getGraphExpand(): number {
+        const raw = envManager.get('GRAPH_EXPAND');
+        if (!raw) return 0;
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n < 0) {
+            console.warn(`[Context] ⚠️ Ignoring invalid GRAPH_EXPAND=${raw}; expected non-negative integer, falling back to 0`);
+            return 0;
+        }
+        // Only 0/1 are wired; >=2 maps to "no-op until 2-hop sub-change ships".
+        if (n >= 2) return 1;
+        return Math.floor(n);
+    }
+
+    private getGraphPoolWeight(): number {
+        return this.getNonNegativeFloatFromEnv('GRAPH_POOL_WEIGHT', DEFAULT_GRAPH_POOL_WEIGHT);
+    }
+
+    private getGraphSeedK(): number {
+        return this.getPositiveIntFromEnv('GRAPH_SEED_K', DEFAULT_GRAPH_SEED_K);
+    }
+
+    /**
+     * rag-graph-layer Phase 3.4: lazy cached load of the per-codebase
+     * `.symbols-graph.json`. Returns null sentinel on missing/parse-error;
+     * subsequent calls hit the cache without re-reading the disk.
+     */
+    private loadGraphIndex(codebasePath: string): GraphIndex | null {
+        if (this.graphIndexCache.has(codebasePath)) {
+            return this.graphIndexCache.get(codebasePath) ?? null;
+        }
+        const sidePath = path.join(codebasePath, '.symbols-graph.json');
+        if (!fs.existsSync(sidePath)) {
+            this.graphIndexCache.set(codebasePath, null);
+            return null;
+        }
+        const idx = GraphIndex.load(sidePath);
+        this.graphIndexCache.set(codebasePath, idx);
+        if (idx) {
+            console.log(`[Context] 🕸️  Loaded graph index (${idx.symbolCount} symbols, version ${idx.version}) from ${sidePath}`);
+        }
+        return idx;
+    }
+
+    /**
+     * rag-graph-layer Phase 3.7: log the runtime graph-expansion status
+     * once per (collection, configuration) pair. Distinguishes "explicitly
+     * disabled", "side-file missing", "v2 incompatible", and "enabled" so
+     * operators can grep the MCP startup log to confirm the mode.
+     */
+    private logGraphStartupBanner(collectionName: string, codebasePath: string): void {
+        const expand = this.getGraphExpand();
+        const collectionVersion = (envManager.get('COLLECTION_VERSION') || '').trim().toLowerCase();
+        const key = `${collectionName}:${expand}:${collectionVersion}`;
+        if (this.graphStartupBannerLogged.has(key)) return;
+        this.graphStartupBannerLogged.add(key);
+        if (expand === 0) {
+            console.log('[Context] 🕸️  graph-expansion: disabled (GRAPH_EXPAND=0)');
+            return;
+        }
+        if (collectionVersion && collectionVersion !== 'v3') {
+            console.warn(
+                `[Context] ⚠️  GRAPH_EXPAND=${expand} requires COLLECTION_VERSION=v3; ` +
+                `current is "${collectionVersion}" — graph-expansion disabled`,
+            );
+            return;
+        }
+        const idx = this.loadGraphIndex(codebasePath);
+        if (!idx) {
+            console.warn(
+                '[Context] ⚠️  graph-expansion: disabled (side-file missing or malformed); ' +
+                'GRAPH_EXPAND ignored — reindex with v3 to populate `.symbols-graph.json`',
+            );
+            return;
+        }
+        console.log(`[Context] 🕸️  graph-expansion: enabled, ${idx.symbolCount} symbols loaded (hop=${expand})`);
+    }
+
     private getNonNegativeFloatFromEnv(name: string, fallback: number): number {
         const raw = envManager.get(name);
         if (raw === undefined || raw === null || raw === '') return fallback;
@@ -506,6 +656,23 @@ export class Context {
         // Phase 3: start a fresh symbol-vocabulary collector for this run.
         this.indexedSymbols = new Set<string>();
 
+        // rag-graph-layer Phase 2: begin a fresh side-index accumulator.
+        this.graphAccumulator = new GraphAccumulator();
+
+        // rag-graph-layer Phase 1.2: if a previous run wrote
+        // `.symbols-vocab.json`, hand it to the splitter so doc-side
+        // mentioned_symbols can be filtered at split time. On a fresh
+        // corpus the vocab is absent → no filter, mentioned_symbols are
+        // raw qualified-names; the side-index builder handles filtering
+        // through the post-indexing vocab.
+        try {
+            const priorVocab = await this.loadSymbolVocabulary(codebasePath);
+            const vocabProvider = priorVocab ? () => priorVocab : undefined;
+            (splitter as any).setMentionedVocabProvider?.(vocabProvider);
+        } catch {
+            // Vocab is best-effort; never block indexing on its absence.
+        }
+
         // 2. Check and prepare vector collection
         progressCallback?.({ phase: 'Preparing collection...', current: 0, total: 100, percentage: 0 });
         console.log(`Debug2: Preparing vector collection for codebase${forceReindex ? ' (FORCE REINDEX)' : ''}`);
@@ -551,6 +718,12 @@ export class Context {
         // Phase 3: persist the collected symbol vocabulary so search-time
         // candidate extraction can filter out false positives.
         await this.persistSymbolVocabulary(codebasePath);
+
+        // rag-graph-layer Phase 2: build & persist `.symbols-graph.json`
+        // from accumulator. Best-effort: a failure logs but doesn't abort
+        // the whole indexing run (search-side gracefully degrades when the
+        // file is missing or malformed).
+        await this.persistGraphSideIndex(codebasePath);
 
         progressCallback?.({
             phase: 'Indexing complete!',
@@ -834,13 +1007,52 @@ export class Context {
                 if (symbolPool.length > 0) {
                     mergePools.push({ results: symbolPool, weight: SYMBOL_POOL_WEIGHT });
                 }
-                const merged = this.weightedRrfMerge(
+                const mergedPreGraph = this.weightedRrfMerge(
                     mergePools,
                     mergeLimit,
                     this.getRrfK()
                 );
 
-                let semanticMerged: SemanticSearchResult[] = merged.map((r) => this.toSemanticResult(r));
+                let semanticMerged: SemanticSearchResult[] = mergedPreGraph.map((r) => this.toSemanticResult(r));
+
+                // rag-graph-layer Phase 3.5: graph-expansion. Build a 3rd
+                // pool from the pre-graph top-K's neighbours and re-merge
+                // with the original code/doc pools. The re-merge uses the
+                // same weighted RRF; graph weight is intentionally lower
+                // (default 0.6) so neighbours nudge order rather than
+                // dominate it.
+                this.logGraphStartupBanner(collectionName, codebasePath);
+                const graphExpand = this.getGraphExpand();
+                const collectionVersion = (envManager.get('COLLECTION_VERSION') || '').trim().toLowerCase();
+                const v3Compatible = !collectionVersion || collectionVersion === 'v3';
+                if (graphExpand >= 1 && v3Compatible) {
+                    const graphIndex = this.loadGraphIndex(codebasePath);
+                    if (graphIndex) {
+                        const seeds = semanticMerged.slice(0, this.getGraphSeedK());
+                        const neighbourIds = collectGraphCandidateIds(seeds, graphIndex);
+                        if (neighbourIds.length > 0) {
+                            const fetched = await this.fetchChunksByIds(collectionName, neighbourIds);
+                            if (fetched.length > 0) {
+                                // Convert raw HybridSearchResult to seeds and
+                                // re-run the weighted RRF with a 3rd pool.
+                                const graphPoolMerge = [
+                                    ...mergePools,
+                                    { results: fetched, weight: this.getGraphPoolWeight() },
+                                ];
+                                const reMerged = this.weightedRrfMerge(
+                                    graphPoolMerge,
+                                    mergeLimit,
+                                    this.getRrfK(),
+                                );
+                                semanticMerged = reMerged.map((r) => this.toSemanticResult(r));
+                                console.log(`[Context] 🕸️  graph-expansion: ${neighbourIds.length} candidates, ${fetched.length} fetched, weight=${this.getGraphPoolWeight()}`);
+                            } else if (Date.now() - this.staleGraphChunkWarnedAt > 60_000) {
+                                this.staleGraphChunkWarnedAt = Date.now();
+                                console.warn(`[Context] ⚠️ graph index points to ${neighbourIds.length} chunk_id(s) not present in '${collectionName}'; consider reindex`);
+                            }
+                        }
+                    }
+                }
 
                 // Guarantee-slots: defend top-N domain coverage when no
                 // reranker is in front of us. Disabled when reranker is
@@ -931,6 +1143,11 @@ export class Context {
                 symbol_kind: result.document.symbol_kind,
                 parent_symbol: result.document.parent_symbol,
                 heading_path: parseHeadingPath(result.document.heading_path),
+                chunk_id: result.document.id,
+                imports: parseStringArray(result.document.imports),
+                extends: result.document.extends,
+                implements: parseStringArray(result.document.implements),
+                mentioned_symbols: parseStringArray(result.document.mentioned_symbols),
             }));
 
             const dedupedResults = this.deduplicateResults(results);
@@ -959,6 +1176,82 @@ export class Context {
     }
 
     /**
+     * rag-graph-layer Phase 3.5: batch-fetch chunks by their Milvus
+     * primary key. Returns a HybridSearchResult[] with score=1 (ranking
+     * within the graph pool comes from the weighted RRF over its
+     * insertion order; the per-channel score is irrelevant since the
+     * pool is already a curated 1-hop expansion). Missing ids are
+     * silently dropped per spec scenario "Side-файл stale".
+     */
+    private async fetchChunksByIds(
+        collectionName: string,
+        ids: string[],
+    ): Promise<HybridSearchResult[]> {
+        if (ids.length === 0) return [];
+        // Sanitize ids to a Milvus filter expression. id is VarChar PK;
+        // we wrap each id in double-quotes and rely on the chunk_id format
+        // (`chunk_<hex16>`) being filter-safe by construction.
+        const safeIds = ids
+            .filter((id) => typeof id === 'string' && /^[A-Za-z0-9_-]+$/.test(id))
+            .map((id) => `"${id}"`);
+        if (safeIds.length === 0) return [];
+        const filter = `id in [${safeIds.join(',')}]`;
+        const outputFields = [
+            'id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata',
+            'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path',
+            'imports', 'extends', 'implements', 'mentioned_symbols',
+        ];
+        let rows: Record<string, any>[];
+        try {
+            rows = await this.vectorDatabase.query(collectionName, filter, outputFields, ids.length);
+        } catch (err) {
+            console.warn(`[Context] ⚠️ graph fetchChunksByIds query failed: ${err}`);
+            return [];
+        }
+        // Preserve the input ordering so the weighted RRF reflects the
+        // graph traversal order rather than Milvus's storage order.
+        const byId = new Map<string, Record<string, any>>();
+        for (const row of rows) {
+            const id = row?.id;
+            if (typeof id === 'string') byId.set(id, row);
+        }
+        const out: HybridSearchResult[] = [];
+        for (const id of ids) {
+            const row = byId.get(id);
+            if (!row) continue;
+            let metadata: Record<string, any> = {};
+            try {
+                metadata = JSON.parse(row.metadata || '{}');
+            } catch {
+                /* malformed json — leave empty */
+            }
+            out.push({
+                document: {
+                    id,
+                    vector: [],
+                    content: row.content || '',
+                    relativePath: row.relativePath || '',
+                    startLine: row.startLine || 0,
+                    endLine: row.endLine || 0,
+                    fileExtension: row.fileExtension || '',
+                    metadata,
+                    content_type: row.content_type ?? undefined,
+                    symbol_kind: row.symbol_kind ?? undefined,
+                    symbol_name: row.symbol_name ?? undefined,
+                    parent_symbol: row.parent_symbol ?? undefined,
+                    heading_path: row.heading_path ?? undefined,
+                    imports: row.imports ?? undefined,
+                    extends: row.extends ?? undefined,
+                    implements: row.implements ?? undefined,
+                    mentioned_symbols: row.mentioned_symbols ?? undefined,
+                },
+                score: 1,
+            });
+        }
+        return out;
+    }
+
+    /**
      * Project a HybridSearchResult onto the SemanticSearchResult shape that
      * external callers consume.
      */
@@ -975,6 +1268,14 @@ export class Context {
             symbol_kind: result.document.symbol_kind,
             parent_symbol: result.document.parent_symbol,
             heading_path: parseHeadingPath(result.document.heading_path),
+            // rag-graph-layer Phase 1.3: surface graph-edge fields and the
+            // chunk_id so search-side graph-expansion can hop without an
+            // extra Milvus fetch per neighbour.
+            chunk_id: result.document.id,
+            imports: parseStringArray(result.document.imports),
+            extends: result.document.extends,
+            implements: parseStringArray(result.document.implements),
+            mentioned_symbols: parseStringArray(result.document.mentioned_symbols),
         };
     }
 
@@ -1374,6 +1675,124 @@ export class Context {
     }
 
     /**
+     * rag-graph-layer Phase 2: build `.symbols-graph.json` from the
+     * per-run accumulator and write it next to `.symbols-vocab.json`.
+     *
+     * Schema (`v3-1`):
+     * ```
+     * {
+     *   "version": "v3-1",
+     *   "by_symbol": {
+     *     "<qualified_name>": {
+     *       "canonical_chunk_ids": [...],     // code chunks (after demote-marker
+     *                                         // dedup) whose symbol_name matches
+     *       "mentioned_by_chunk_ids": [...]  // doc/code_example chunks whose
+     *                                         // mentioned_symbols[] contains the key
+     *                                         // (capped at 20 per spec D5)
+     *     }
+     *   }
+     * }
+     * ```
+     */
+    private async persistGraphSideIndex(codebasePath: string): Promise<void> {
+        const accumulator = this.graphAccumulator;
+        this.graphAccumulator = null;
+        if (!accumulator) return;
+
+        const chunks = accumulator.snapshot();
+        if (chunks.length === 0) return;
+
+        // rag-graph-layer Phase 2.1: per-symbol map. Code chunks contribute
+        // to canonical_chunk_ids (after demote-marker dedup); doc / code_example
+        // chunks contribute to mentioned_by_chunk_ids per their mentioned_symbols.
+        const markers = this.getPathDemoteMarkers();
+        const hasDemoteMarker = (p: string): boolean => {
+            const segments = (p || '').split('/');
+            return segments.some((seg) => markers.includes(seg));
+        };
+
+        // Vocab gate (spec D8 R4): keep only known-vocab symbols in the
+        // mentioned-by edges so docs talking about JS-stdlib `array.push`
+        // don't pull random chunks. If vocab is unavailable, no gate.
+        const vocab = await this.loadSymbolVocabulary(codebasePath);
+        const inVocab = (sym: string): boolean => {
+            if (!vocab || vocab.size === 0) return true;
+            if (vocab.has(sym)) return true;
+            if (sym.includes('.')) {
+                for (const seg of sym.split('.')) {
+                    if (vocab.has(seg)) return true;
+                }
+            }
+            return false;
+        };
+
+        // Group code chunks by symbol_name, then pick canonicals (no demote
+        // marker in path). When all candidates are non-canonical (e.g. the
+        // symbol only exists in a vendored copy), keep them all so the graph
+        // never references a missing chunk.
+        const codeBySymbol = new Map<string, GraphAccumulatorChunk[]>();
+        const mentionedBySymbol = new Map<string, string[]>();
+        const MENTIONED_CAP = 20; // rag-graph-layer Phase 2.2
+
+        for (const c of chunks) {
+            if (c.contentType === 'code' && c.symbolName) {
+                const bucket = codeBySymbol.get(c.symbolName) || [];
+                bucket.push(c);
+                codeBySymbol.set(c.symbolName, bucket);
+            }
+            if ((c.contentType === 'doc' || c.contentType === 'code_example') && c.mentionedSymbols) {
+                for (const sym of c.mentionedSymbols) {
+                    if (!inVocab(sym)) continue;
+                    const bucket = mentionedBySymbol.get(sym) || [];
+                    if (bucket.length < MENTIONED_CAP) {
+                        bucket.push(c.chunkId);
+                        mentionedBySymbol.set(sym, bucket);
+                    }
+                }
+            }
+        }
+
+        const bySymbol: Record<string, { canonical_chunk_ids: string[]; mentioned_by_chunk_ids: string[] }> = {};
+
+        for (const [sym, bucket] of codeBySymbol.entries()) {
+            const canonicals = bucket.filter((b) => !hasDemoteMarker(b.relativePath));
+            const chosen = canonicals.length > 0 ? canonicals : bucket;
+            // Stable order: shortest path first, then accumulator order.
+            chosen.sort((a, b) => {
+                const segA = (a.relativePath || '').split('/').length;
+                const segB = (b.relativePath || '').split('/').length;
+                if (segA !== segB) return segA - segB;
+                return 0;
+            });
+            const ids = chosen.map((c) => c.chunkId);
+            const entry = bySymbol[sym] || { canonical_chunk_ids: [], mentioned_by_chunk_ids: [] };
+            entry.canonical_chunk_ids = ids;
+            bySymbol[sym] = entry;
+        }
+
+        for (const [sym, ids] of mentionedBySymbol.entries()) {
+            const entry = bySymbol[sym] || { canonical_chunk_ids: [], mentioned_by_chunk_ids: [] };
+            entry.mentioned_by_chunk_ids = ids;
+            bySymbol[sym] = entry;
+        }
+
+        const sidePath = path.join(codebasePath, '.symbols-graph.json');
+        const payload = {
+            version: 'v3-1',
+            generatedAt: new Date().toISOString(),
+            by_symbol: bySymbol,
+        };
+
+        try {
+            await fs.promises.writeFile(sidePath, JSON.stringify(payload, null, 2), 'utf-8');
+            const symbolCount = Object.keys(bySymbol).length;
+            console.log(`[Context] 🕸️  Wrote graph side-index (${symbolCount} symbols) → ${sidePath}`);
+        } catch (err) {
+            console.warn(`[Context] ⚠️ Failed to persist graph side-index: ${err}`);
+        }
+    }
+
+    /**
      * Load (and cache) the symbol vocabulary written by a prior indexCodebase
      * run. Returns null if the file does not exist or fails to parse — callers
      * fall back to unfiltered candidate extraction.
@@ -1719,6 +2138,27 @@ export class Context {
         const chunkContents = chunks.map(chunk => chunk.content);
         const embeddings = await this.embedding.embedBatch(chunkContents);
 
+        // rag-graph-layer Phase 2: accumulator entries are recorded inside
+        // the per-chunk map below — each chunk_id gets paired with the
+        // raw mentioned_symbols (chunk.metadata, before JSON-encoding) so
+        // the side-builder doesn't have to parse the Milvus schema string.
+        const recordToGraph = (
+            chunkId: string,
+            chunk: CodeChunk,
+        ): void => {
+            if (!this.graphAccumulator) return;
+            const meta = chunk.metadata as any;
+            this.graphAccumulator.add({
+                chunkId,
+                relativePath: path.relative(codebasePath, meta.filePath || ''),
+                contentType: meta.content_type,
+                symbolName: meta.symbol_name,
+                mentionedSymbols: Array.isArray(meta.mentioned_symbols)
+                    ? meta.mentioned_symbols.slice()
+                    : undefined,
+            });
+        };
+
         if (isHybrid === true) {
             // Create hybrid vector documents
             const documents: VectorDocument[] = chunks.map((chunk, index) => {
@@ -1731,6 +2171,7 @@ export class Context {
                 const {
                     filePath, startLine, endLine,
                     content_type, symbol_kind, symbol_name, parent_symbol, heading_path,
+                    imports, extends: extendsName, implements: implementsList, mentioned_symbols,
                     ...restMetadata
                 } = chunk.metadata;
 
@@ -1753,12 +2194,25 @@ export class Context {
                     symbol_name,
                     parent_symbol,
                     heading_path: heading_path ? JSON.stringify(heading_path) : undefined,
+                    // rag-graph-layer Phase 1.3: encode array fields as JSON
+                    // strings so the v3 Milvus VarChar columns can hold them.
+                    imports: imports && imports.length > 0 ? JSON.stringify(imports) : undefined,
+                    extends: extendsName || undefined,
+                    implements: implementsList && implementsList.length > 0 ? JSON.stringify(implementsList) : undefined,
+                    mentioned_symbols: mentioned_symbols && mentioned_symbols.length > 0 ? JSON.stringify(mentioned_symbols) : undefined,
                     // Phase 4: BGE-M3 learned sparse from the sparse sidecar.
                     // Falsy when the embedding provider doesn't expose sparse;
                     // insertHybrid only attaches it when present and non-empty.
                     sparse_learned: embeddings[index].sparse,
                 };
             });
+
+            // rag-graph-layer Phase 2: register every successfully prepared
+            // chunk into the graph accumulator. Run before the actual
+            // insertHybrid so a network/RPC failure doesn't half-record.
+            for (let i = 0; i < documents.length; i++) {
+                recordToGraph(documents[i].id, chunks[i]);
+            }
 
             // Store to vector database
             await this.vectorDatabase.insertHybrid(this.getCollectionName(codebasePath), documents);
@@ -1774,6 +2228,7 @@ export class Context {
                 const {
                     filePath, startLine, endLine,
                     content_type, symbol_kind, symbol_name, parent_symbol, heading_path,
+                    imports, extends: extendsName, implements: implementsList, mentioned_symbols,
                     ...restMetadata
                 } = chunk.metadata;
 
@@ -1796,8 +2251,16 @@ export class Context {
                     symbol_name,
                     parent_symbol,
                     heading_path: heading_path ? JSON.stringify(heading_path) : undefined,
+                    imports: imports && imports.length > 0 ? JSON.stringify(imports) : undefined,
+                    extends: extendsName || undefined,
+                    implements: implementsList && implementsList.length > 0 ? JSON.stringify(implementsList) : undefined,
+                    mentioned_symbols: mentioned_symbols && mentioned_symbols.length > 0 ? JSON.stringify(mentioned_symbols) : undefined,
                 };
             });
+
+            for (let i = 0; i < documents.length; i++) {
+                recordToGraph(documents[i].id, chunks[i]);
+            }
 
             // Store to vector database
             await this.vectorDatabase.insert(this.getCollectionName(codebasePath), documents);

@@ -317,6 +317,35 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 max_length: 2048,
                 nullable: true,
             },
+            // rag-graph-layer Phase 1.3: structural fields for graph expansion.
+            {
+                name: 'imports',
+                description: 'JSON-encoded string[] of imported module names (code chunks)',
+                data_type: DataType.VarChar,
+                max_length: 2048,
+                nullable: true,
+            },
+            {
+                name: 'extends',
+                description: 'Parent class/abstract name for class-shaped code chunks',
+                data_type: DataType.VarChar,
+                max_length: 512,
+                nullable: true,
+            },
+            {
+                name: 'implements',
+                description: 'JSON-encoded string[] of implemented interface names (class chunks)',
+                data_type: DataType.VarChar,
+                max_length: 2048,
+                nullable: true,
+            },
+            {
+                name: 'mentioned_symbols',
+                description: 'JSON-encoded string[] of qualified-names mentioned in doc / code_example chunks',
+                data_type: DataType.VarChar,
+                max_length: 4096,
+                nullable: true,
+            },
         ];
 
         const createCollectionParams = {
@@ -417,6 +446,10 @@ export class MilvusVectorDatabase implements VectorDatabase {
             symbol_name: doc.symbol_name ?? null,
             parent_symbol: doc.parent_symbol ?? null,
             heading_path: doc.heading_path ?? null,
+            imports: doc.imports ?? null,
+            extends: doc.extends ?? null,
+            implements: doc.implements ?? null,
+            mentioned_symbols: doc.mentioned_symbols ?? null,
         }));
 
         await this.client.insert({
@@ -437,7 +470,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
             collection_name: collectionName,
             data: [queryVector],
             limit: options?.topK || 10,
-            output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata', 'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path'],
+            output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata', 'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path', 'imports', 'extends', 'implements', 'mentioned_symbols'],
         };
 
         // Apply boolean expression filter if provided (e.g., fileExtension in [".ts",".py"])
@@ -474,6 +507,10 @@ export class MilvusVectorDatabase implements VectorDatabase {
                     symbol_name: result.symbol_name ?? undefined,
                     parent_symbol: result.parent_symbol ?? undefined,
                     heading_path: result.heading_path ?? undefined,
+                    imports: result.imports ?? undefined,
+                    extends: result.extends ?? undefined,
+                    implements: result.implements ?? undefined,
+                    mentioned_symbols: result.mentioned_symbols ?? undefined,
                 },
                 score: result.score,
             };
@@ -633,6 +670,35 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 max_length: 2048,
                 nullable: true,
             },
+            // rag-graph-layer Phase 1.3: structural fields for graph expansion.
+            {
+                name: 'imports',
+                description: 'JSON-encoded string[] of imported module names (code chunks)',
+                data_type: DataType.VarChar,
+                max_length: 2048,
+                nullable: true,
+            },
+            {
+                name: 'extends',
+                description: 'Parent class/abstract name for class-shaped code chunks',
+                data_type: DataType.VarChar,
+                max_length: 512,
+                nullable: true,
+            },
+            {
+                name: 'implements',
+                description: 'JSON-encoded string[] of implemented interface names (class chunks)',
+                data_type: DataType.VarChar,
+                max_length: 2048,
+                nullable: true,
+            },
+            {
+                name: 'mentioned_symbols',
+                description: 'JSON-encoded string[] of qualified-names mentioned in doc / code_example chunks',
+                data_type: DataType.VarChar,
+                max_length: 4096,
+                nullable: true,
+            },
         ];
 
         if (enableLearnedSparse) {
@@ -750,6 +816,11 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 symbol_name: doc.symbol_name ?? null,
                 parent_symbol: doc.parent_symbol ?? null,
                 heading_path: doc.heading_path ?? null,
+                // rag-graph-layer Phase 1.3: structural fields used by graph-expansion.
+                imports: doc.imports ?? null,
+                extends: doc.extends ?? null,
+                implements: doc.implements ?? null,
+                mentioned_symbols: doc.mentioned_symbols ?? null,
             };
             // Phase 4: only attach sparse_learned when present. Milvus expects
             // dict form `{ "<index>": value }` for SPARSE_FLOAT_VECTOR fields
@@ -829,7 +900,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 data: subRequests,
                 limit: options?.limit || searchRequests[0]?.limit || 10,
                 rerank: rerank_strategy,
-                output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata', 'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path'],
+                output_fields: ['id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata', 'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path', 'imports', 'extends', 'implements', 'mentioned_symbols'],
             };
 
             console.log(`[MilvusDB] 🔍 Complete search request:`, JSON.stringify({
@@ -877,6 +948,10 @@ export class MilvusVectorDatabase implements VectorDatabase {
                         symbol_name: result.symbol_name ?? undefined,
                         parent_symbol: result.parent_symbol ?? undefined,
                         heading_path: result.heading_path ?? undefined,
+                        imports: result.imports ?? undefined,
+                        extends: result.extends ?? undefined,
+                        implements: result.implements ?? undefined,
+                        mentioned_symbols: result.mentioned_symbols ?? undefined,
                     },
                     score: result.score,
                 };

@@ -20,6 +20,14 @@ export interface VectorDocument {
     // Phase 4: BGE-M3 learned-sparse channel. Populated only on v2 hybrid
     // collections; ignored on older schemas.
     sparse_learned?: { indices: number[]; values: number[] };
+    // rag-graph-layer Phase 1.3: structural fields for graph expansion.
+    // Stored as JSON-encoded string for array-shaped fields to keep the
+    // Milvus schema simple (consumers JSON.parse on read), or plain string
+    // for `extends`. All optional; older v2 collections never populate them.
+    imports?: string;
+    extends?: string;
+    implements?: string;
+    mentioned_symbols?: string;
 }
 
 export interface SearchOptions {

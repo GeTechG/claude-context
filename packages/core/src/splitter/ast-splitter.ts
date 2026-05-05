@@ -1,6 +1,7 @@
 import Parser from 'tree-sitter';
 import { Splitter, CodeChunk } from './index';
-import { MarkdownSplitter } from './markdown-splitter';
+import { MarkdownSplitter, MentionedVocabProvider } from './markdown-splitter';
+import { extractStructural, extractClassStructural } from './ast-structural-extractor';
 
 // Language parsers
 const JavaScript = require('tree-sitter-javascript');
@@ -143,6 +144,15 @@ export class AstCodeSplitter implements Splitter {
         this.langchainFallback.setChunkOverlap(chunkOverlap);
     }
 
+    /**
+     * rag-graph-layer Phase 1.2: forward the mentioned-symbols vocabulary
+     * provider to the embedded MarkdownSplitter so doc / code_example
+     * chunks get vocab-filtered `mentioned_symbols[]` at split time.
+     */
+    setMentionedVocabProvider(provider: MentionedVocabProvider | undefined): void {
+        this.markdownSplitter.setMentionedVocabProvider(provider);
+    }
+
     private getLanguageConfig(language: string): { parser: any; nodeTypes: string[] } | null {
         const langMap: Record<string, { parser: any; nodeTypes: string[] }> = {
             'javascript': { parser: JavaScript, nodeTypes: SPLITTABLE_NODE_TYPES.javascript },
@@ -178,6 +188,11 @@ export class AstCodeSplitter implements Splitter {
         const chunks: CodeChunk[] = [];
         const codeLines = code.split('\n');
 
+        // rag-graph-layer Phase 1: file-level imports computed once and
+        // attached to every code chunk emitted from this file. Per-symbol
+        // extends/implements are computed inline below per node.
+        const fileStructural = extractStructural(node, language);
+
         const traverse = (currentNode: Parser.SyntaxNode, parentScope?: string) => {
             const isSplittable = splittableTypes.includes(currentNode.type);
             let scopeForChildren = parentScope;
@@ -190,6 +205,9 @@ export class AstCodeSplitter implements Splitter {
                 if (nodeText.trim().length > 0) {
                     const symbolName = this.extractSymbolName(currentNode);
                     const symbolKind = NODE_TYPE_TO_SYMBOL_KIND[currentNode.type];
+                    const classStructural = (symbolKind === 'class' || symbolKind === 'abstract')
+                        ? extractClassStructural(currentNode, language)
+                        : {};
 
                     chunks.push({
                         content: nodeText,
@@ -202,6 +220,13 @@ export class AstCodeSplitter implements Splitter {
                             symbol_kind: symbolKind,
                             symbol_name: symbolName,
                             parent_symbol: parentScope,
+                            ...(fileStructural.imports && fileStructural.imports.length > 0
+                                ? { imports: fileStructural.imports }
+                                : {}),
+                            ...(classStructural.extends ? { extends: classStructural.extends } : {}),
+                            ...(classStructural.implements && classStructural.implements.length > 0
+                                ? { implements: classStructural.implements }
+                                : {}),
                         }
                     });
 

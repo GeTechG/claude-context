@@ -23,4 +23,14 @@ export interface SemanticSearchResult {
     // list that belongs to the response, not the chunk). MCP handlers lift it
     // out into the JSON response. Older clients ignore it without harm.
     candidateSymbols?: string[];
+    // rag-graph-layer Phase 1.3: structural fields surfaced to search
+    // pipeline so graph-expansion can resolve forward edges (imports /
+    // extends / implements / mentioned_symbols) without an extra fetch.
+    // chunk_id is the Milvus primary-key, exposed so graph-expansion can
+    // look up neighbors by id.
+    chunk_id?: string;
+    imports?: string[];
+    extends?: string;
+    implements?: string[];
+    mentioned_symbols?: string[];
 }

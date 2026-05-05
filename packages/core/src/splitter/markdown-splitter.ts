@@ -1,4 +1,12 @@
 import { Splitter, CodeChunk } from './index';
+import { extractMentionedSymbolsFromText } from '../enrichment/symbol-extractor';
+
+// rag-graph-layer Phase 1.2: provider for the vocabulary used to filter
+// `mentioned_symbols` at split time. The splitter calls `getMentionedVocab()`
+// per `split()` invocation; if it returns null/undefined the filter is
+// skipped (raw extraction). Indexing-pipeline wiring sets this provider on
+// each splitter instance to point at `<codebasePath>/.symbols-vocab.json`.
+export type MentionedVocabProvider = () => ReadonlySet<string> | null | undefined;
 
 /**
  * Section-aware splitter for markdown (.md) and reStructuredText (.rst).
@@ -16,6 +24,10 @@ import { Splitter, CodeChunk } from './index';
 export class MarkdownSplitter implements Splitter {
     private chunkSize: number;
     private chunkOverlap: number;
+    // rag-graph-layer Phase 1.2: per-instance vocab provider — populated by
+    // the indexing pipeline so split-time can filter mentioned_symbols
+    // through `.symbols-vocab.json` when available.
+    private mentionedVocabProvider?: MentionedVocabProvider;
 
     constructor(chunkSize?: number, chunkOverlap?: number) {
         this.chunkSize = chunkSize ?? 2500;
@@ -30,12 +42,20 @@ export class MarkdownSplitter implements Splitter {
         this.chunkOverlap = chunkOverlap;
     }
 
+    setMentionedVocabProvider(provider: MentionedVocabProvider | undefined): void {
+        this.mentionedVocabProvider = provider;
+    }
+
     async split(code: string, language: string, filePath?: string): Promise<CodeChunk[]> {
         const lang = language.toLowerCase();
         const isRst = lang === 'rst' || lang === 'restructuredtext';
         const sections = isRst
             ? this.parseRstSections(code)
             : this.parseMarkdownSections(code);
+
+        // rag-graph-layer Phase 1.2: resolve vocab once per file so the
+        // provider isn't re-read per chunk.
+        const vocab = this.mentionedVocabProvider?.() ?? undefined;
 
         const chunks: CodeChunk[] = [];
         for (const section of sections) {
@@ -48,6 +68,7 @@ export class MarkdownSplitter implements Splitter {
                 let lineCursor = block.startLine;
                 for (const piece of subChunks) {
                     const lineCount = piece.split('\n').length;
+                    const mentioned = extractMentionedSymbolsFromText(piece, vocab);
                     chunks.push({
                         content: piece,
                         metadata: {
@@ -57,6 +78,7 @@ export class MarkdownSplitter implements Splitter {
                             filePath,
                             content_type: isCode ? 'code_example' : 'doc',
                             heading_path: this.compactHeadings(section.headingPath),
+                            mentioned_symbols: mentioned,
                         },
                     });
                     lineCursor += lineCount;
@@ -76,6 +98,7 @@ export class MarkdownSplitter implements Splitter {
                     language: isRst ? 'rst' : 'markdown',
                     filePath,
                     content_type: 'doc',
+                    mentioned_symbols: extractMentionedSymbolsFromText(code, vocab),
                 },
             });
         }
