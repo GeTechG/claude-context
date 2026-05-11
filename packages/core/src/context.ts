@@ -22,6 +22,7 @@ import { envManager } from './utils/env-manager';
 import { classifyQuery, weightsForIntent, DomainWeights, parseQualifiedName } from './search/query-classifier';
 import { buildSymbolFilter } from './search/symbol-routing';
 import { GraphIndex, collectGraphCandidateIds } from './search/graph-expansion';
+import { applyRewriting, RewriteFlags, RewriteResult } from './search/query-rewrite';
 import { Reranker } from './reranker';
 import { extractCandidateSymbols } from './enrichment';
 import * as fs from 'fs';
@@ -385,6 +386,190 @@ export class Context {
             return true;
         }
         return env.toLowerCase() === 'true';
+    }
+
+    /**
+     * rag-query-static-rewrite: per-feature env flags for the deterministic
+     * query rewriters. All default to `false` until the per-feature bake-off
+     * gates pass. Flags read lazily per call so .mcp.json edits propagate on
+     * the next semanticSearch() invocation without process restart.
+     */
+    private getRewriteFlags(): RewriteFlags {
+        const flag = (name: string): boolean => {
+            const v = envManager.get(name);
+            return typeof v === 'string' && v.toLowerCase() === 'true';
+        };
+        return {
+            split: flag('QUERY_REWRITE_COMPARISON_SPLIT'),
+            case: flag('QUERY_REWRITE_CASE_EXPANSION'),
+            abbrev: flag('QUERY_REWRITE_ABBREV_EXPANSION'),
+        };
+    }
+
+    /**
+     * Build the per-channel hybrid-search requests for a single subject.
+     * Dense and learned-sparse channels use the original `query` (rewriters
+     * never touch them — see design D3); the BM25 sparse channel receives
+     * `query` plus any whitelist/case extras appended as whitespace-joined
+     * tokens.
+     */
+    private buildHybridRequests(
+        queryEmbedding: EmbeddingVector,
+        subject: string,
+        sparseExtra: string[],
+        limit: number,
+    ): HybridSearchRequest[] {
+        const sparseData = sparseExtra && sparseExtra.length > 0
+            ? `${subject} ${sparseExtra.join(' ')}`
+            : subject;
+        const reqs: HybridSearchRequest[] = [
+            { data: queryEmbedding.vector, anns_field: 'vector', param: { nprobe: 10 }, limit },
+            { data: sparseData, anns_field: 'sparse_vector', param: { drop_ratio_search: 0.2 }, limit },
+        ];
+        if (queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0) {
+            const sparseDict: Record<string, number> = {};
+            const { indices, values } = queryEmbedding.sparse;
+            const len = Math.min(indices.length, values.length);
+            for (let i = 0; i < len; i++) {
+                sparseDict[String(indices[i])] = values[i];
+            }
+            reqs.push({
+                data: sparseDict,
+                anns_field: 'sparse_learned',
+                param: { drop_ratio_search: 0.2 },
+                limit,
+            });
+        }
+        return reqs;
+    }
+
+    /**
+     * rag-query-static-rewrite (task 3.3): run the full multi-query hybrid
+     * pipeline for a single subject string. Used once per call in the
+     * non-split path and twice in the comparison-split path. Returns the
+     * pre-graph merged result + the underlying pools so the caller can
+     * apply graph-expansion / guarantee-slots as it sees fit.
+     */
+    private async runSubjectHybridPipeline(
+        subject: string,
+        sparseExtra: string[],
+        codebasePath: string,
+        collectionName: string,
+        filterExpr: string | undefined,
+        perPoolK: number,
+        mergeLimit: number,
+    ): Promise<{
+        mergedPreGraph: HybridSearchResult[];
+        mergePools: { results: HybridSearchResult[]; weight: number }[];
+        codePool: HybridSearchResult[];
+        docPool: HybridSearchResult[];
+        symbolPool: HybridSearchResult[];
+    }> {
+        console.log(`[Context] 🔍 Generating embeddings for subject: "${subject}"`);
+        const queryEmbedding: EmbeddingVector = await this.embedding.embed(subject);
+        console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
+
+        const intent = classifyQuery(subject);
+        const weights = weightsForIntent(intent);
+        console.log(`[Context] 🔍 Subject intent: codeSignal=${intent.codeSignal} docSignal=${intent.docSignal} → weights code=${weights.code} doc=${weights.doc}`);
+
+        const combinedFilter = (extra: string | undefined): string => {
+            if (!extra || extra.trim().length === 0) return '';
+            return `(${extra})`;
+        };
+        const userFilter = filterExpr && filterExpr.trim().length > 0 ? filterExpr : undefined;
+        const codeExpr = userFilter
+            ? `${combinedFilter(userFilter)} and ${CODE_DOMAIN_FILTER}`
+            : CODE_DOMAIN_FILTER;
+        const docExpr = userFilter
+            ? `${combinedFilter(userFilter)} and ${DOC_DOMAIN_FILTER}`
+            : DOC_DOMAIN_FILTER;
+
+        const innerRerank = this.buildInnerRerankStrategy(
+            !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0)
+        );
+
+        const symbolPoolLimit = 10;
+        const symbolFilterExpr = await this.buildSymbolPoolFilter(subject, intent, codebasePath);
+        const symbolPoolPromise: Promise<HybridSearchResult[]> = symbolFilterExpr
+            ? this.vectorDatabase.hybridSearch(
+                collectionName,
+                this.buildHybridRequests(queryEmbedding, subject, sparseExtra, symbolPoolLimit),
+                {
+                    rerank: innerRerank,
+                    limit: symbolPoolLimit,
+                    filterExpr: symbolFilterExpr,
+                }
+            ).catch((err) => {
+                console.warn(`[Context] ⚠️ symbol-routing pool failed: ${err}`);
+                return [] as HybridSearchResult[];
+            })
+            : Promise.resolve([] as HybridSearchResult[]);
+
+        const [codePool, docPool, symbolPool] = await Promise.all([
+            this.vectorDatabase.hybridSearch(
+                collectionName,
+                this.buildHybridRequests(queryEmbedding, subject, sparseExtra, perPoolK),
+                { rerank: innerRerank, limit: perPoolK, filterExpr: codeExpr },
+            ).catch((err) => {
+                console.warn(`[Context] ⚠️ code-domain hybrid search failed: ${err}`);
+                return [] as HybridSearchResult[];
+            }),
+            this.vectorDatabase.hybridSearch(
+                collectionName,
+                this.buildHybridRequests(queryEmbedding, subject, sparseExtra, perPoolK),
+                { rerank: innerRerank, limit: perPoolK, filterExpr: docExpr },
+            ).catch((err) => {
+                console.warn(`[Context] ⚠️ doc-domain hybrid search failed: ${err}`);
+                return [] as HybridSearchResult[];
+            }),
+            symbolPoolPromise,
+        ]);
+
+        console.log(`[Context] 🔍 Pool sizes for "${subject}": code=${codePool.length} doc=${docPool.length} symbol=${symbolPool.length}`);
+
+        const SYMBOL_POOL_WEIGHT = 2.0;
+        const mergePools: { results: HybridSearchResult[]; weight: number }[] = [
+            { results: codePool, weight: weights.code },
+            { results: docPool, weight: weights.doc },
+        ];
+        if (symbolPool.length > 0) {
+            mergePools.push({ results: symbolPool, weight: SYMBOL_POOL_WEIGHT });
+        }
+        const mergedPreGraph = this.weightedRrfMerge(mergePools, mergeLimit, this.getRrfK());
+        return { mergedPreGraph, mergePools, codePool, docPool, symbolPool };
+    }
+
+    /**
+     * rag-query-static-rewrite (task 3.4): single-line log describing what
+     * the rewriters fired on this query. No log emitted when no flag is on
+     * (no-op preserves the pre-change log surface).
+     */
+    private logQueryRewrite(query: string, rewrite: RewriteResult, flags: RewriteFlags): void {
+        const anyFlagOn = flags.split || flags.case || flags.abbrev;
+        if (!anyFlagOn) return;
+        const parts: string[] = [];
+        if (flags.split) {
+            if (rewrite.kind === 'split') {
+                parts.push(`split={${rewrite.left}}|{${rewrite.right}}`);
+            } else if (rewrite.debug.comparisonMatchedTrigger) {
+                parts.push(`split=rejected (trigger="${rewrite.debug.comparisonMatchedTrigger}", subject length guard)`);
+            }
+        }
+        if (flags.case && rewrite.debug.caseExpansions.length > 0) {
+            const items = rewrite.debug.caseExpansions
+                .map((e) => `${e.from}→${e.to.join('|')}`)
+                .join(', ');
+            parts.push(`case+={${items}}`);
+        }
+        if (flags.abbrev && rewrite.debug.abbrevExpansions.length > 0) {
+            const items = rewrite.debug.abbrevExpansions
+                .map((e) => `${e.from}→${e.to.join('|')}`)
+                .join(', ');
+            parts.push(`abbrev+={${items}}`);
+        }
+        if (parts.length === 0) return;
+        console.log(`[Context] 🔍 Query rewrite: ${parts.join(' | ')}`);
     }
 
     /**
@@ -864,154 +1049,93 @@ export class Context {
                 console.log(`[Context] ⚠️  Collection '${collectionName}' exists but may be empty or not properly indexed:`, error);
             }
 
-            // 1. Generate query vector
-            console.log(`[Context] 🔍 Generating embeddings for query: "${query}"`);
-            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
-            console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
-            console.log(`[Context] 🔍 First 5 embedding values: [${queryEmbedding.vector.slice(0, 5).join(', ')}]`);
+            // rag-query-static-rewrite: apply env-gated query rewriters before
+            // the retrieval fan-out. `applyRewriting` is a pure function: when
+            // all flags are off it returns kind='single' with empty extras
+            // (no-op, behavior identical to pre-change baseline).
+            const rewriteFlags = this.getRewriteFlags();
+            const rewrite = applyRewriting(query, rewriteFlags);
+            this.logQueryRewrite(query, rewrite, rewriteFlags);
 
-            const multiQuery = this.getMultiQuery();
+            // Outer-level intent: used downstream for reranker-bypass decision.
+            // The helper recomputes intent per-subject for split fan-out — the
+            // outer intent reflects the original (unsplit) query.
             const intent = classifyQuery(query);
-            const weights = weightsForIntent(intent);
-            console.log(`[Context] 🔍 Query intent: codeSignal=${intent.codeSignal} docSignal=${intent.docSignal} → weights code=${weights.code} doc=${weights.doc}`);
-
-            // For multi-query we pull a wider candidate pool from each domain
-            // so weighted RRF and guarantee-slot reshuffling have something
-            // to work with. PER_POOL_K is intentionally generous because
-            // RRF on a small pool tends to lock in the leaders. When a
-            // reranker is downstream, also make sure each pool can supply
-            // ~RERANKER_INPUT_K candidates after merge.
+            const multiQuery = this.getMultiQuery();
             const rerankerInputK = this.hasReranker() ? this.getRerankerInputK() : 0;
             const PER_POOL_K = Math.max(topK * 5, 25, rerankerInputK);
-
-            const buildRequests = (limit: number): HybridSearchRequest[] => {
-                const reqs: HybridSearchRequest[] = [
-                    {
-                        data: queryEmbedding.vector,
-                        anns_field: "vector",
-                        param: { "nprobe": 10 },
-                        limit
-                    },
-                    {
-                        data: query,
-                        anns_field: "sparse_vector",
-                        param: { "drop_ratio_search": 0.2 },
-                        limit
-                    }
-                ];
-                // Phase 4: add BGE-M3 learned-sparse channel when the embedding
-                // provider populated it (m3serve sidecar wired through
-                // InfinityEmbedding.sparseURL). Milvus accepts the sparse vector
-                // as a dict { "<index>": value } for SPARSE_FLOAT_VECTOR fields
-                // without an attached function.
-                if (queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0) {
-                    const sparseDict: Record<string, number> = {};
-                    const { indices, values } = queryEmbedding.sparse;
-                    const len = Math.min(indices.length, values.length);
-                    for (let i = 0; i < len; i++) {
-                        sparseDict[String(indices[i])] = values[i];
-                    }
-                    reqs.push({
-                        data: sparseDict,
-                        anns_field: "sparse_learned",
-                        param: { "drop_ratio_search": 0.2 },
-                        limit,
-                    });
-                }
-                return reqs;
-            };
+            const mergeLimit = this.hasReranker()
+                ? Math.max(rerankerInputK, topK * 3, 30)
+                : Math.max(topK * 3, 30);
 
             let mergedResults: SemanticSearchResult[];
+            // Pools surfaced from the per-subject helper(s); used by
+            // graph-expansion re-merge and guarantee-slots below.
+            let codePool: HybridSearchResult[] = [];
+            let docPool: HybridSearchResult[] = [];
+            let mergePools: { results: HybridSearchResult[]; weight: number }[] = [];
 
             if (multiQuery) {
                 console.log(`[Context] 🔍 MULTI_QUERY=true → running parallel code-domain + doc-domain hybrid searches (PER_POOL_K=${PER_POOL_K})`);
 
-                const combinedFilter = (extra: string | undefined): string => {
-                    if (!extra || extra.trim().length === 0) return '';
-                    return `(${extra})`;
-                };
-                const userFilter = filterExpr && filterExpr.trim().length > 0 ? filterExpr : undefined;
-                const codeExpr = userFilter
-                    ? `${combinedFilter(userFilter)} and ${CODE_DOMAIN_FILTER}`
-                    : CODE_DOMAIN_FILTER;
-                const docExpr = userFilter
-                    ? `${combinedFilter(userFilter)} and ${DOC_DOMAIN_FILTER}`
-                    : DOC_DOMAIN_FILTER;
+                let mergedPreGraph: HybridSearchResult[];
 
-                const innerRerank = this.buildInnerRerankStrategy(
-                    !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0)
-                );
-
-                // Phase C (rag-code-intent-recall): symbol-routing pool —
-                // when the query is a qualified name AND code-intent AND
-                // the className is in the indexed vocab, build a metadata
-                // filter that pins candidates to the symbol's chunks.
-                const symbolPoolLimit = 10;
-                const symbolFilterExpr = await this.buildSymbolPoolFilter(query, intent, codebasePath);
-                const symbolPoolPromise: Promise<HybridSearchResult[]> = symbolFilterExpr
-                    ? this.vectorDatabase.hybridSearch(
+                if (rewrite.kind === 'split' && rewrite.left && rewrite.right) {
+                    // Comparison-split fan-out: run the per-subject pipeline
+                    // twice, outer-RRF the two pre-graph merges with weights
+                    // 0.5/0.5. Graph-expansion (if enabled) runs once on the
+                    // outer-merged result with a single-pool re-merge.
+                    console.log(`[Context] 🔀 split fan-out: left="${rewrite.left}" right="${rewrite.right}"`);
+                    const [leftRun, rightRun] = await Promise.all([
+                        this.runSubjectHybridPipeline(
+                            rewrite.left,
+                            rewrite.sparseExtra,
+                            codebasePath,
+                            collectionName,
+                            filterExpr,
+                            PER_POOL_K,
+                            mergeLimit,
+                        ),
+                        this.runSubjectHybridPipeline(
+                            rewrite.right,
+                            rewrite.sparseExtra,
+                            codebasePath,
+                            collectionName,
+                            filterExpr,
+                            PER_POOL_K,
+                            mergeLimit,
+                        ),
+                    ]);
+                    mergedPreGraph = this.weightedRrfMerge(
+                        [
+                            { results: leftRun.mergedPreGraph, weight: 0.5 },
+                            { results: rightRun.mergedPreGraph, weight: 0.5 },
+                        ],
+                        mergeLimit,
+                        this.getRrfK(),
+                    );
+                    // For downstream graph-expansion re-merge and guarantee-
+                    // slots, use the outer-merged pool as the single base
+                    // (weight 1.0) and union the per-subject code/doc pools
+                    // for guarantee-slots.
+                    mergePools = [{ results: mergedPreGraph, weight: 1.0 }];
+                    codePool = [...leftRun.codePool, ...rightRun.codePool];
+                    docPool = [...leftRun.docPool, ...rightRun.docPool];
+                } else {
+                    const single = await this.runSubjectHybridPipeline(
+                        query,
+                        rewrite.sparseExtra,
+                        codebasePath,
                         collectionName,
-                        buildRequests(symbolPoolLimit),
-                        {
-                            rerank: innerRerank,
-                            limit: symbolPoolLimit,
-                            filterExpr: symbolFilterExpr,
-                        }
-                    ).catch((err) => {
-                        console.warn(`[Context] ⚠️ symbol-routing pool failed: ${err}`);
-                        return [] as HybridSearchResult[];
-                    })
-                    : Promise.resolve([] as HybridSearchResult[]);
-
-                const [codePool, docPool, symbolPool] = await Promise.all([
-                    this.vectorDatabase.hybridSearch(
-                        collectionName,
-                        buildRequests(PER_POOL_K),
-                        {
-                            rerank: innerRerank,
-                            limit: PER_POOL_K,
-                            filterExpr: codeExpr,
-                        }
-                    ).catch((err) => {
-                        console.warn(`[Context] ⚠️ code-domain hybrid search failed: ${err}`);
-                        return [] as HybridSearchResult[];
-                    }),
-                    this.vectorDatabase.hybridSearch(
-                        collectionName,
-                        buildRequests(PER_POOL_K),
-                        {
-                            rerank: innerRerank,
-                            limit: PER_POOL_K,
-                            filterExpr: docExpr,
-                        }
-                    ).catch((err) => {
-                        console.warn(`[Context] ⚠️ doc-domain hybrid search failed: ${err}`);
-                        return [] as HybridSearchResult[];
-                    }),
-                    symbolPoolPromise,
-                ]);
-
-                console.log(`[Context] 🔍 Pool sizes: code=${codePool.length} doc=${docPool.length} symbol=${symbolPool.length}`);
-
-                // Wider merge when a reranker is downstream so it has
-                // ~RERANKER_INPUT_K candidates to arbitrate over.
-                const mergeLimit = this.hasReranker()
-                    ? Math.max(rerankerInputK, topK * 3, 30)
-                    : Math.max(topK * 3, 30);
-
-                const SYMBOL_POOL_WEIGHT = 2.0;
-                const mergePools: { results: HybridSearchResult[]; weight: number }[] = [
-                    { results: codePool, weight: weights.code },
-                    { results: docPool, weight: weights.doc },
-                ];
-                if (symbolPool.length > 0) {
-                    mergePools.push({ results: symbolPool, weight: SYMBOL_POOL_WEIGHT });
+                        filterExpr,
+                        PER_POOL_K,
+                        mergeLimit,
+                    );
+                    mergedPreGraph = single.mergedPreGraph;
+                    mergePools = single.mergePools;
+                    codePool = single.codePool;
+                    docPool = single.docPool;
                 }
-                const mergedPreGraph = this.weightedRrfMerge(
-                    mergePools,
-                    mergeLimit,
-                    this.getRrfK()
-                );
 
                 let semanticMerged: SemanticSearchResult[] = mergedPreGraph.map((r) => this.toSemanticResult(r));
 
@@ -1076,12 +1200,15 @@ export class Context {
                 const singleLimit = this.hasReranker()
                     ? Math.max(this.getRerankerInputK(), topK)
                     : topK;
+                console.log(`[Context] 🔍 Generating embeddings for query: "${query}"`);
+                const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
+                console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
                 const innerRerank = this.buildInnerRerankStrategy(
                     !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0)
                 );
                 const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
                     collectionName,
-                    buildRequests(singleLimit),
+                    this.buildHybridRequests(queryEmbedding, query, rewrite.sparseExtra, singleLimit),
                     {
                         rerank: innerRerank,
                         limit: singleLimit,
