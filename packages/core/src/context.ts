@@ -50,6 +50,11 @@ interface GraphAccumulatorChunk {
     parentSymbol?: string;
     extendsName?: string;
     implementsList?: string[];
+    // rag-graph-abstract-typedef-edges v3-3: Haxe abstract / typedef relations
+    // feed the new `by_abstract_underlying` / `by_typedef_alias` side-index
+    // buckets and per-symbol forward attributes used by the comparison bridge.
+    abstractUnderlying?: string[];
+    typedefAlias?: string;
 }
 
 class GraphAccumulator {
@@ -2107,18 +2112,20 @@ export class Context {
     }
 
     /**
-     * rag-graph-layer Phase 2 + rag-graph-comparison-bridge: build
-     * `.symbols-graph.json` from the per-run accumulator and write it next
-     * to `.symbols-vocab.json`.
+     * rag-graph-layer Phase 2 + rag-graph-comparison-bridge + rag-graph-abstract-typedef-edges:
+     * build `.symbols-graph.json` from the per-run accumulator and write it
+     * next to `.symbols-vocab.json`.
      *
-     * Schema (`v3-2`, additive over v3-1):
+     * Schema (`v3-3`, additive over v3-2):
      * ```
      * {
-     *   "version": "v3-2",
-     *   "by_symbol": {                       // unchanged from v3-1
+     *   "version": "v3-3",
+     *   "by_symbol": {                       // unchanged top-level shape
      *     "<symbol_name>": {
      *       "canonical_chunk_ids": [...],
-     *       "mentioned_by_chunk_ids": [...]
+     *       "mentioned_by_chunk_ids": [...],
+     *       "abstract_underlying": [...],    // v3-3: per-abstract forward types
+     *       "typedef_alias": "<type>"        // v3-3: per-typedef alias target
      *     }
      *   },
      *   "by_package": {                      // v3-2: cross-subject siblings
@@ -2126,6 +2133,12 @@ export class Context {
      *   },
      *   "by_supertype": {                    // v3-2: interface/abstract polymorphism
      *     "<supertype>": ["<symbol_name>", ...]
+     *   },
+     *   "by_abstract_underlying": {          // v3-3: Haxe abstract underlying/from/to
+     *     "<typeName>": ["<symbol_name>", ...]
+     *   },
+     *   "by_typedef_alias": {                // v3-3: Haxe typedef alias targets
+     *     "<typeName>": ["<symbol_name>", ...]
      *   }
      * }
      * ```
@@ -2192,7 +2205,12 @@ export class Context {
             }
         }
 
-        const bySymbol: Record<string, { canonical_chunk_ids: string[]; mentioned_by_chunk_ids: string[] }> = {};
+        const bySymbol: Record<string, {
+            canonical_chunk_ids: string[];
+            mentioned_by_chunk_ids: string[];
+            abstract_underlying?: string[];
+            typedef_alias?: string;
+        }> = {};
 
         // rag-graph-comparison-bridge: v3-2 inverted indexes. Built from
         // every canonical chunk (post-demote-marker filter), not just the
@@ -2204,6 +2222,8 @@ export class Context {
         const BUCKET_CAP = 30;
         const byPackageSets = new Map<string, Set<string>>();
         const bySupertypeSets = new Map<string, Set<string>>();
+        const byAbstractUnderlyingSets = new Map<string, Set<string>>();
+        const byTypedefAliasSets = new Map<string, Set<string>>();
 
         const addToBucket = (
             bucketMap: Map<string, Set<string>>,
@@ -2232,10 +2252,27 @@ export class Context {
             const ids = chosen.map((c) => c.chunkId);
             const entry = bySymbol[sym] || { canonical_chunk_ids: [], mentioned_by_chunk_ids: [] };
             entry.canonical_chunk_ids = ids;
+            // rag-graph-abstract-typedef-edges: collapse per-chunk abstract
+            // relations into a per-symbol union — if a symbol has multiple
+            // canonical chunks (e.g. multi-target Haxe stdlib), every
+            // target's relations participate in the forward attribute.
+            const absUnderlying = new Set<string>();
+            let typedefAlias: string | undefined;
+            for (const c of chosen) {
+                if (c.abstractUnderlying) {
+                    for (const t of c.abstractUnderlying) {
+                        if (t) absUnderlying.add(t);
+                    }
+                }
+                if (c.typedefAlias && !typedefAlias) typedefAlias = c.typedefAlias;
+            }
+            if (absUnderlying.size > 0) entry.abstract_underlying = Array.from(absUnderlying).sort();
+            if (typedefAlias) entry.typedef_alias = typedefAlias;
             bySymbol[sym] = entry;
             // Feed every canonical chunk into the inverted indexes (each
             // contributes the symbol to its own derived package + any
-            // supertypes declared on that chunk).
+            // supertypes / abstract-underlying / typedef-alias targets
+            // declared on that chunk).
             for (const c of chosen) {
                 const pkg = c.parentSymbol || derivePackageFromPath(c.relativePath);
                 if (pkg) addToBucket(byPackageSets, pkg, sym);
@@ -2244,6 +2281,14 @@ export class Context {
                     for (const s of c.implementsList) {
                         if (s) addToBucket(bySupertypeSets, s, sym);
                     }
+                }
+                if (c.abstractUnderlying) {
+                    for (const t of c.abstractUnderlying) {
+                        if (t) addToBucket(byAbstractUnderlyingSets, t, sym);
+                    }
+                }
+                if (c.typedefAlias) {
+                    addToBucket(byTypedefAliasSets, c.typedefAlias, sym);
                 }
             }
         }
@@ -2266,23 +2311,34 @@ export class Context {
 
         const byPackage = finalizeBucketMap(byPackageSets);
         const bySupertype = finalizeBucketMap(bySupertypeSets);
+        const byAbstractUnderlying = finalizeBucketMap(byAbstractUnderlyingSets);
+        const byTypedefAlias = finalizeBucketMap(byTypedefAliasSets);
 
-        // rag-graph-supertype-extraction-fix: one-shot diagnostic so a
-        // post-reindex run surfaces extraction quality without manual JSON
-        // inspection. Quiet unless DEBUG_COMPARISON_BRIDGE=1.
+        // rag-graph-supertype-extraction-fix + rag-graph-abstract-typedef-edges:
+        // one-shot diagnostic so a post-reindex run surfaces extraction
+        // quality without manual JSON inspection. Quiet unless
+        // DEBUG_COMPARISON_BRIDGE=1.
         if (this.getComparisonBridgeDebug()) {
             const supKeys = Object.keys(bySupertype);
-            const sample = supKeys.slice(0, 5).map((k) => `${k} → ${bySupertype[k].length} impls`);
-            console.log(`[graph-side-index] supertype edges: ${supKeys.length} keys, sample: [${sample.join(', ')}]`);
+            const supSample = supKeys.slice(0, 5).map((k) => `${k} → ${bySupertype[k].length} impls`);
+            console.log(`[graph-side-index] supertype edges: ${supKeys.length} keys, sample: [${supSample.join(', ')}]`);
+            const absKeys = Object.keys(byAbstractUnderlying);
+            const absSample = absKeys.slice(0, 5).map((k) => `${k} → ${byAbstractUnderlying[k].length}`);
+            console.log(`[graph-side-index] abstract_underlying edges: ${absKeys.length} keys, sample: [${absSample.join(', ')}]`);
+            const tdKeys = Object.keys(byTypedefAlias);
+            const tdSample = tdKeys.slice(0, 5).map((k) => `${k} → ${byTypedefAlias[k].length}`);
+            console.log(`[graph-side-index] typedef_alias edges: ${tdKeys.length} keys, sample: [${tdSample.join(', ')}]`);
         }
 
         const sidePath = path.join(codebasePath, '.symbols-graph.json');
         const payload = {
-            version: 'v3-2',
+            version: 'v3-3',
             generatedAt: new Date().toISOString(),
             by_symbol: bySymbol,
             by_package: byPackage,
             by_supertype: bySupertype,
+            by_abstract_underlying: byAbstractUnderlying,
+            by_typedef_alias: byTypedefAlias,
         };
 
         try {
@@ -2290,7 +2346,9 @@ export class Context {
             const symbolCount = Object.keys(bySymbol).length;
             const pkgCount = Object.keys(byPackage).length;
             const supCount = Object.keys(bySupertype).length;
-            console.log(`[Context] 🕸️  Wrote graph side-index v3-2 (${symbolCount} symbols, ${pkgCount} packages, ${supCount} supertypes) → ${sidePath}`);
+            const absCount = Object.keys(byAbstractUnderlying).length;
+            const tdCount = Object.keys(byTypedefAlias).length;
+            console.log(`[Context] 🕸️  Wrote graph side-index v3-3 (${symbolCount} symbols, ${pkgCount} packages, ${supCount} supertypes, ${absCount} abstract_underlying, ${tdCount} typedef_alias) → ${sidePath}`);
         } catch (err) {
             console.warn(`[Context] ⚠️ Failed to persist graph side-index: ${err}`);
         }
@@ -2671,6 +2729,16 @@ export class Context {
                     : undefined,
                 implementsList: Array.isArray(meta.implements) && meta.implements.length > 0
                     ? meta.implements.slice()
+                    : undefined,
+                // rag-graph-abstract-typedef-edges v3-3: surface the relations
+                // emitted by ast-structural-extractor for Haxe abstracts /
+                // typedefs into the graph accumulator. Other languages produce
+                // no such fields, so the lookups silently return undefined.
+                abstractUnderlying: Array.isArray(meta.abstract_underlying) && meta.abstract_underlying.length > 0
+                    ? meta.abstract_underlying.slice()
+                    : undefined,
+                typedefAlias: typeof meta.typedef_alias === 'string' && meta.typedef_alias.length > 0
+                    ? meta.typedef_alias
                     : undefined,
             });
         };

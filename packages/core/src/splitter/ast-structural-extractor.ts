@@ -19,6 +19,23 @@ export interface ClassStructural {
     implements?: string[];
 }
 
+// rag-graph-abstract-typedef-edges: per-declaration relations for Haxe
+// `abstract` and `typedef` types. Both feed the v3-3 side-index buckets
+// `by_abstract_underlying` and `by_typedef_alias`.
+//
+// `abstract_underlying` is the dedup'd union of the abstract's underlying
+// type (parens-form), `from`-list types, and `to`-list types — normalized
+// to bare class identifiers. Empty for `@:coreType abstract Void {}` and
+// similar declarations carrying no underlying / from / to relations.
+//
+// `typedef_alias` is the normalized alias-target identifier for `typedef
+// X = T`. Skipped (undefined) for structural aliases (`typedef X = {...}`)
+// and self-references (`typedef X = X`).
+export interface TypeRelations {
+    abstract_underlying?: string[];
+    typedef_alias?: string;
+}
+
 const STOPWORDS_IDENT = new Set(['true', 'false', 'null', 'none', 'undefined']);
 
 function looksLikeIdentifier(text: string): boolean {
@@ -448,4 +465,243 @@ export function extractClassStructural(node: Parser.SyntaxNode, language: string
     } catch {
         return {};
     }
+}
+
+// ----------------------- abstract / typedef relations (Haxe-only) -----------------------
+//
+// rag-graph-abstract-typedef-edges: Haxe-specific structural relations for
+// `abstract` and `typedef` declarations. tree-sitter-haxe@0.4.6 emits clean
+// `AbstractType` and `DefType` nodes for the parens-form abstract and
+// well-formed typedefs, but chokes on bare-form abstracts that carry
+// `@:meta` prefixes (e.g. `@:coreType abstract Int to Float {}` in
+// `StdTypes.hx` — most of the standard scalar abstracts). The regex
+// fallback below is the production path for those, anchored at
+// start-of-line so `* abstract Foo` inside docblocks does not match.
+
+const HAXE_TYPENAME_NODES = new Set<string>([
+    'type_name', 'TypeName',
+    'identifier', 'IDENTIFIER',
+]);
+
+// Pluck the bare type identifier from a `TypePath` / `ComplexType` /
+// directly-nested type_name. Walks one level deep so `haxe.ds.IntMap<V>`
+// recovers `IntMap` via `normalizeTypeName` on the joined dotted-path text.
+function extractTypePathName(node: Parser.SyntaxNode | null | undefined): string | null {
+    if (!node) return null;
+    // Direct `type_name` child — most common shape for `TypePath`.
+    for (const child of node.children) {
+        if (!child) continue;
+        if (HAXE_TYPENAME_NODES.has(child.type)) {
+            const norm = normalizeTypeName(child.text);
+            if (norm) return norm;
+        }
+    }
+    // `ComplexType` wraps a `TypePath` — descend.
+    for (const child of node.children) {
+        if (!child) continue;
+        if (child.type === 'TypePath' || child.type === 'type_path') {
+            const norm = extractTypePathName(child);
+            if (norm) return norm;
+        }
+    }
+    // Fallback: normalize the node's own text (handles `haxe.ds.IntMap<V>`).
+    return normalizeTypeName(node.text || '');
+}
+
+function extractAbstractRelationsFromAst(node: Parser.SyntaxNode): TypeRelations {
+    const out = new Set<string>();
+    let mode: 'none' | 'from' | 'to' = 'none';
+    let sawOpenParen = false;
+    let sawCloseParen = false;
+    for (const child of node.children) {
+        if (!child) continue;
+        const t = child.type;
+        if (t === '(') {
+            sawOpenParen = true;
+            mode = 'none';
+            continue;
+        }
+        if (t === ')') {
+            sawCloseParen = true;
+            mode = 'none';
+            continue;
+        }
+        if (t === 'from') { mode = 'from'; continue; }
+        if (t === 'to') { mode = 'to'; continue; }
+        // Underlying type lives inside the (parens) block as a `ComplexType` /
+        // `TypePath`. After the closing paren or at the start of a no-parens
+        // abstract, `TypePath` siblings only appear after `from` / `to`.
+        if (t === 'ComplexType' || t === 'complex_type' || t === 'TypePath' || t === 'type_path') {
+            const name = extractTypePathName(child);
+            if (name) {
+                if (mode !== 'none' || (sawOpenParen && !sawCloseParen)) {
+                    out.add(name);
+                    if (mode === 'from' || mode === 'to') {
+                        // Stay in mode until another keyword resets — Haxe's
+                        // grammar parses `from A from B` as two `from` clauses,
+                        // but a single `from A, B` is not legal syntax.
+                        mode = 'none';
+                    }
+                }
+            }
+            continue;
+        }
+        if (t === '{' || t === 'EBlock' || t === 'block') break;
+    }
+    const arr = Array.from(out);
+    return arr.length > 0 ? { abstract_underlying: arr } : {};
+}
+
+function extractTypedefRelationFromAst(node: Parser.SyntaxNode, selfName: string | undefined): TypeRelations {
+    let sawEquals = false;
+    for (const child of node.children) {
+        if (!child) continue;
+        const t = child.type;
+        if (t === '=') { sawEquals = true; continue; }
+        if (!sawEquals) continue;
+        if (t === 'ComplexType' || t === 'complex_type') {
+            // ComplexType direct child may be TAnonymous (struct alias — skip)
+            // or TypePath (name alias — capture).
+            for (const sub of child.children) {
+                if (!sub) continue;
+                if (sub.type === 'TAnonymous' || sub.type === 't_anonymous' || sub.type === 'TFunction' || sub.type === 't_function') {
+                    return {};
+                }
+                if (sub.type === 'TypePath' || sub.type === 'type_path') {
+                    const name = extractTypePathName(sub);
+                    if (name && (!selfName || name !== selfName)) {
+                        return { typedef_alias: name };
+                    }
+                    return {};
+                }
+            }
+            // ComplexType had no recognized child — try its raw text.
+            const norm = normalizeTypeName(child.text || '');
+            if (norm && (!selfName || norm !== selfName)) {
+                return { typedef_alias: norm };
+            }
+            return {};
+        }
+        if (t === 'TypePath' || t === 'type_path') {
+            const name = extractTypePathName(child);
+            if (name && (!selfName || name !== selfName)) {
+                return { typedef_alias: name };
+            }
+            return {};
+        }
+    }
+    return {};
+}
+
+function extractHaxeDeclarationName(node: Parser.SyntaxNode): string | undefined {
+    for (const child of node.children) {
+        if (!child) continue;
+        if (child.type === 'type_name' || child.type === 'TypeName') {
+            const txt = (child.text || '').replace(/\s+/g, '');
+            if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(txt)) return txt;
+        }
+    }
+    return undefined;
+}
+
+// Line-anchored regex fallback for bare-form abstracts/typedefs whose AST
+// is broken by `@:meta` prefixes (tree-sitter-haxe@0.4.6 emits `hasError=true`
+// and collapses the heritage tokens to bare identifiers). Anchored at
+// start-of-line so `* abstract Foo` inside docstring blocks does not match.
+function extractAbstractRelationsViaRegex(source: string, declName: string | undefined): TypeRelations {
+    if (!source) return {};
+    const namePat = declName
+        ? declName.replace(/[\\^$.|?*+(){}\[\]]/g, '\\$&')
+        : '\\w+';
+    const headerRe = new RegExp(
+        `^\\s*(?:@:?\\w+(?:\\([^)]*\\))?\\s+)*(?:extern\\s+|private\\s+|public\\s+|final\\s+)*abstract\\s+${namePat}(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?\\s*([^{]{0,500})`,
+        'm',
+    );
+    const m = source.match(headerRe);
+    if (!m) return {};
+    const tail = m[1] || '';
+    const out = new Set<string>();
+    // Underlying: `(Type)` immediately after the name.
+    const underlyingRe = /^\s*\(([^()]+(?:\([^()]*\)[^()]*)*)\)/;
+    const um = tail.match(underlyingRe);
+    let rest = tail;
+    if (um) {
+        const norm = normalizeTypeName(um[1].trim());
+        if (norm) out.add(norm);
+        rest = tail.slice(um[0].length);
+    }
+    // from / to clauses: scan left-to-right for `\b(from|to)\s+<type-expression>`.
+    const heritageRe = /\b(from|to)\s+([\w.]+(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?)/g;
+    let hm: RegExpExecArray | null;
+    while ((hm = heritageRe.exec(rest)) !== null) {
+        const norm = normalizeTypeName(hm[2]);
+        if (norm) out.add(norm);
+    }
+    const arr = Array.from(out);
+    return arr.length > 0 ? { abstract_underlying: arr } : {};
+}
+
+function extractTypedefRelationViaRegex(source: string, declName: string | undefined): TypeRelations {
+    if (!source) return {};
+    // Capture-group form so we can recover the declared name from the
+    // source when the AST didn't surface one (e.g. test fake nodes with
+    // no children, or grammar errors that swallow the type_name).
+    const headerRe = new RegExp(
+        `^\\s*(?:@:?\\w+(?:\\([^)]*\\))?\\s+)*(?:extern\\s+|private\\s+|public\\s+)*typedef\\s+(\\w+)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?\\s*=\\s*([^;{]{0,500})`,
+        'm',
+    );
+    const m = source.match(headerRe);
+    if (!m) return {};
+    const matchedName = m[1];
+    const effectiveName = declName || matchedName;
+    const aliasTail = m[2].trim();
+    if (!aliasTail || aliasTail[0] === '{' || aliasTail[0] === '(') return {};
+    const aliasMatch = aliasTail.match(/^([\w.]+(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?)/);
+    if (!aliasMatch) return {};
+    const norm = normalizeTypeName(aliasMatch[1]);
+    if (!norm) return {};
+    if (effectiveName && norm === effectiveName) return {}; // self-reference: skip silently
+    return { typedef_alias: norm };
+}
+
+export function extractAbstractHaxe(node: Parser.SyntaxNode): TypeRelations {
+    if (!node) return {};
+    const ast = extractAbstractRelationsFromAst(node);
+    if (ast.abstract_underlying && ast.abstract_underlying.length > 0) return ast;
+    const declName = extractHaxeDeclarationName(node);
+    return extractAbstractRelationsViaRegex(node.text || '', declName);
+}
+
+export function extractTypedefHaxe(node: Parser.SyntaxNode): TypeRelations {
+    if (!node) return {};
+    const declName = extractHaxeDeclarationName(node);
+    const ast = extractTypedefRelationFromAst(node, declName);
+    if (ast.typedef_alias) return ast;
+    // Even when AST gives us a structural alias (TAnonymous), the regex
+    // fallback would also surface nothing — but if AST failed entirely
+    // (rare for typedefs in this grammar) the regex still covers us.
+    return extractTypedefRelationViaRegex(node.text || '', declName);
+}
+
+/**
+ * Dispatch entry: returns `{ abstract_underlying?, typedef_alias? }` per
+ * `symbol_kind`. Languages other than Haxe currently return `{}` — `abstract`
+ * and `typedef` are first-class Haxe constructs and don't have direct
+ * analogues in the other grammars we extract from.
+ */
+export function extractTypeRelations(
+    node: Parser.SyntaxNode,
+    language: string,
+    symbolKind: string | undefined,
+): TypeRelations {
+    if (!node || !symbolKind) return {};
+    const lang = language.toLowerCase();
+    if (lang !== 'haxe' && lang !== 'hx') return {};
+    try {
+        if (symbolKind === 'abstract') return extractAbstractHaxe(node);
+        if (symbolKind === 'typedef') return extractTypedefHaxe(node);
+    } catch {
+        return {};
+    }
+    return {};
 }

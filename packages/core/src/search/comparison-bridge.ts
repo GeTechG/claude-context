@@ -4,18 +4,25 @@
 // Activation gates (checked by the caller in context.ts):
 //   - intent_classifier returns query_shape === 'comparison'
 //   - COMPARISON_BRIDGE_ENABLED === '1'
-//   - .symbols-graph.json loaded with `version === 'v3-2'`
+//   - .symbols-graph.json loaded with `version === 'v3-2'` or `v3-3`
 //
 // For each canonical code seed in the primary RRF top-K, the bridge
-//   1. derives a package key from the seed itself (parent_symbol if set,
-//      otherwise the directory chain of the seed's relativePath);
-//   2. consults `by_package[pkg]` for sibling symbol_names — siblings
+//   1. consults `by_supertype[<sup>]` for each declared supertype on
+//      the seed (`extends` + `implements[]`) — highest signal;
+//   2. (rag-graph-abstract-typedef-edges, v3-3 only) consults
+//      `by_abstract_underlying[<t>]` for each type in the seed's
+//      abstract-underlying / from / to set, then directly resolves each
+//      such `t` via `lookupSymbol(t)` to surface the underlying type's
+//      canonical chunk;
+//   3. (v3-3 only) consults `by_typedef_alias[<t>]` for the seed's
+//      typedef alias target (if any), then directly resolves `t` via
+//      `lookupSymbol(t)`;
+//   4. derives a package key from the seed (parent_symbol ∥ directory
+//      chain of relativePath) and consults `by_package[pkg]` — siblings
 //      are dropped when the bucket exceeds `maxPackageFanout`;
-//   3. consults `by_supertype[<sup>]` for each declared supertype on
-//      the seed (`extends` + `implements[]`);
-//   4. resolves partner symbol_names back to canonical chunk_ids via
+//   5. resolves partner symbol_names back to canonical chunk_ids via
 //      `by_symbol[<sym>].canonical_chunk_ids[0]`;
-//   5. de-duplicates, drops chunks already in the primary top-K, and
+//   6. de-duplicates, drops chunks already in the primary top-K, and
 //      caps the pool at `cap` (default 50, aligned with RERANKER_INPUT_K).
 //
 // The bridge is pure data: it returns chunk_ids only. The caller
@@ -39,6 +46,11 @@ export interface ComparisonBridgeResult {
     seedsCount: number;
     packageHits: number;
     supertypeHits: number;
+    // rag-graph-abstract-typedef-edges (v3-3): per-axis hit counters so the
+    // sweep harness and debug log can attribute pool composition to each
+    // edge axis. Both default to 0 on v3-2 graphs.
+    abstractUnderlyingHits: number;
+    typedefAliasHits: number;
 }
 
 const DEFAULT_BRIDGE_POOL_CAP = 50;
@@ -61,7 +73,10 @@ export function buildComparisonBridgePool(
     graph: GraphIndex,
     opts: ComparisonBridgeOptions,
 ): ComparisonBridgeResult {
-    const empty: ComparisonBridgeResult = { chunkIds: [], seedsCount: 0, packageHits: 0, supertypeHits: 0 };
+    const empty: ComparisonBridgeResult = {
+        chunkIds: [], seedsCount: 0, packageHits: 0, supertypeHits: 0,
+        abstractUnderlyingHits: 0, typedefAliasHits: 0,
+    };
     if (!graph || !graph.supportsComparisonBridge()) return empty;
     if (!primaryTopK || primaryTopK.length === 0) return empty;
 
@@ -79,6 +94,8 @@ export function buildComparisonBridgePool(
     let seedsCount = 0;
     let packageHits = 0;
     let supertypeHits = 0;
+    let abstractUnderlyingHits = 0;
+    let typedefAliasHits = 0;
 
     const pushPartner = (partnerSymbol: string, seedSymbol: string): boolean => {
         if (!partnerSymbol || partnerSymbol === seedSymbol) return false;
@@ -98,21 +115,10 @@ export function buildComparisonBridgePool(
         if (!seed.symbol_name) continue;
         seedsCount++;
 
-        const pkg = seed.parent_symbol || derivePackageFromPath(seed.relativePath);
-        if (pkg && maxPartners > 0) {
-            const bucket = graph.lookupPackage(pkg);
-            if (bucket.length > 0 && bucket.length <= maxPackageFanout) {
-                let added = 0;
-                for (const partner of bucket) {
-                    if (added >= maxPartners) break;
-                    if (collected.length >= cap) break;
-                    if (pushPartner(partner, seed.symbol_name)) {
-                        added++;
-                        packageHits++;
-                    }
-                }
-            }
-        }
+        // Edge precedence (highest signal first per design.md):
+        //   by_supertype → by_abstract_underlying → by_typedef_alias → by_package.
+        // The pool's cap and per-bucket `maxPartners` knob are shared across
+        // all axes — see ComparisonBridgeOptions docstring.
 
         if (maxPartners > 0) {
             const supertypes: string[] = [];
@@ -136,11 +142,72 @@ export function buildComparisonBridgePool(
                 }
             }
         }
+
+        // rag-graph-abstract-typedef-edges (v3-3): consume the abstract /
+        // typedef axes. Both per-symbol forward attributes live on the
+        // seed's entry in `by_symbol`; older v3-2 graphs leave them
+        // undefined and the loop is a no-op.
+        const sym = graph.lookupSymbol(seed.symbol_name);
+
+        if (maxPartners > 0 && sym?.abstract_underlying && sym.abstract_underlying.length > 0) {
+            for (const t of sym.abstract_underlying) {
+                if (collected.length >= cap) break;
+                // Forward partner: resolve `t` directly — the underlying /
+                // from / to type's canonical chunk (e.g. `BytesData` chunk
+                // when seed is `Bytes`).
+                if (pushPartner(t, seed.symbol_name)) abstractUnderlyingHits++;
+                // Sibling partners: other abstracts sharing this underlying.
+                const bucket = graph.lookupAbstractUnderlying(t);
+                if (bucket.length === 0) continue;
+                let added = 0;
+                for (const partner of bucket) {
+                    if (added >= maxPartners) break;
+                    if (collected.length >= cap) break;
+                    if (pushPartner(partner, seed.symbol_name)) {
+                        added++;
+                        abstractUnderlyingHits++;
+                    }
+                }
+            }
+        }
+
+        if (maxPartners > 0 && sym?.typedef_alias) {
+            const t = sym.typedef_alias;
+            if (collected.length < cap) {
+                if (pushPartner(t, seed.symbol_name)) typedefAliasHits++;
+                const bucket = graph.lookupTypedefAlias(t);
+                let added = 0;
+                for (const partner of bucket) {
+                    if (added >= maxPartners) break;
+                    if (collected.length >= cap) break;
+                    if (pushPartner(partner, seed.symbol_name)) {
+                        added++;
+                        typedefAliasHits++;
+                    }
+                }
+            }
+        }
+
+        const pkg = seed.parent_symbol || derivePackageFromPath(seed.relativePath);
+        if (pkg && maxPartners > 0) {
+            const bucket = graph.lookupPackage(pkg);
+            if (bucket.length > 0 && bucket.length <= maxPackageFanout) {
+                let added = 0;
+                for (const partner of bucket) {
+                    if (added >= maxPartners) break;
+                    if (collected.length >= cap) break;
+                    if (pushPartner(partner, seed.symbol_name)) {
+                        added++;
+                        packageHits++;
+                    }
+                }
+            }
+        }
     }
 
     if (opts.debug) {
         const qid = opts.queryId ? ` q=${opts.queryId}` : '';
-        console.log(`[comparison-bridge]${qid} seeds=${seedsCount} pkg_hits=${packageHits} sup_hits=${supertypeHits} pool_size=${collected.length}`);
+        console.log(`[comparison-bridge]${qid} seeds=${seedsCount} pkg_hits=${packageHits} sup_hits=${supertypeHits} abs_hits=${abstractUnderlyingHits} td_hits=${typedefAliasHits} pool_size=${collected.length}`);
     }
 
     return {
@@ -148,5 +215,7 @@ export function buildComparisonBridgePool(
         seedsCount,
         packageHits,
         supertypeHits,
+        abstractUnderlyingHits,
+        typedefAliasHits,
     };
 }

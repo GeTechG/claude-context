@@ -1,7 +1,7 @@
 import Parser from 'tree-sitter';
 import { Splitter, CodeChunk } from './index';
 import { MarkdownSplitter, MentionedVocabProvider } from './markdown-splitter';
-import { extractStructural, extractClassStructural } from './ast-structural-extractor';
+import { extractStructural, extractClassStructural, extractTypeRelations } from './ast-structural-extractor';
 
 // Language parsers
 const JavaScript = require('tree-sitter-javascript');
@@ -208,6 +208,11 @@ export class AstCodeSplitter implements Splitter {
                     const classStructural = (symbolKind === 'class' || symbolKind === 'abstract')
                         ? extractClassStructural(currentNode, language)
                         : {};
+                    // rag-graph-abstract-typedef-edges: Haxe abstract/typedef
+                    // relations feed the v3-3 side-index buckets.
+                    const typeRelations = (symbolKind === 'abstract' || symbolKind === 'typedef')
+                        ? extractTypeRelations(currentNode, language, symbolKind)
+                        : {};
 
                     chunks.push({
                         content: nodeText,
@@ -227,6 +232,10 @@ export class AstCodeSplitter implements Splitter {
                             ...(classStructural.implements && classStructural.implements.length > 0
                                 ? { implements: classStructural.implements }
                                 : {}),
+                            ...(typeRelations.abstract_underlying && typeRelations.abstract_underlying.length > 0
+                                ? { abstract_underlying: typeRelations.abstract_underlying }
+                                : {}),
+                            ...(typeRelations.typedef_alias ? { typedef_alias: typeRelations.typedef_alias } : {}),
                         }
                     });
 

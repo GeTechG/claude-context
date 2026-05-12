@@ -49,6 +49,52 @@ const V32_PAYLOAD = {
     },
 };
 
+// rag-graph-abstract-typedef-edges: v3-3 payload with both new top-level
+// indices populated and the matching per-symbol forward attributes on
+// `by_symbol`. Layout mirrors the production `persistGraphSideIndex`
+// writer: every chunk declaring `abstract Foo(T) from A to B` contributes
+// to `by_abstract_underlying[T|A|B]` with value `Foo`, and Foo's own
+// `by_symbol` entry carries the union of T/A/B in `abstract_underlying`.
+const V33_PAYLOAD = {
+    version: 'v3-3',
+    by_symbol: {
+        Bytes: {
+            canonical_chunk_ids: ['c_bytes'],
+            mentioned_by_chunk_ids: [],
+            abstract_underlying: ['Array', 'BytesData'],
+        },
+        BytesData: { canonical_chunk_ids: ['c_bd'], mentioned_by_chunk_ids: [] },
+        ReadOnlyArray: {
+            canonical_chunk_ids: ['c_roa'],
+            mentioned_by_chunk_ids: [],
+            abstract_underlying: ['Array', 'Iterable'],
+        },
+        Array: { canonical_chunk_ids: ['c_arr'], mentioned_by_chunk_ids: [] },
+        Iterable: { canonical_chunk_ids: ['c_iter'], mentioned_by_chunk_ids: [] },
+        Null: {
+            canonical_chunk_ids: ['c_null'],
+            mentioned_by_chunk_ids: [],
+            typedef_alias: 'T',
+        },
+        Maybe: {
+            canonical_chunk_ids: ['c_maybe'],
+            mentioned_by_chunk_ids: [],
+            typedef_alias: 'T',
+        },
+        T: { canonical_chunk_ids: ['c_t'], mentioned_by_chunk_ids: [] },
+    },
+    by_package: {},
+    by_supertype: {},
+    by_abstract_underlying: {
+        Array: ['Bytes', 'ReadOnlyArray'],
+        BytesData: ['Bytes'],
+        Iterable: ['ReadOnlyArray'],
+    },
+    by_typedef_alias: {
+        T: ['Null', 'Maybe'],
+    },
+};
+
 function loadGraph(): GraphIndex {
     const idx = GraphIndex.load(tmpFile(JSON.stringify(V32_PAYLOAD)));
     if (!idx) throw new Error('graph load failed in test setup');
@@ -157,13 +203,13 @@ describe('buildComparisonBridgePool', () => {
             }),
         ];
         const res = buildComparisonBridgePool(seeds, graph, { maxPartners: 8, maxPackageFanout: 30 });
-        // package "haxe.ds" → [IntMap, ObjectMap, StringMap] (self filtered) → ObjectMap, StringMap
-        // supertype IMap → [IntMap (self), ObjectMap, StringMap]; both already collected from package
-        // → bridge dedup: still just [c_om, c_sm].
+        // rag-graph-abstract-typedef-edges: edge precedence now puts
+        // supertype before package, so IMap → [ObjectMap, StringMap] is the
+        // first axis to push (supertypeHits=2). Package lookup then yields
+        // the same two, dedup-skipped (packageHits=0). Union unchanged.
         expect(res.chunkIds.sort()).toEqual(['c_om', 'c_sm']);
-        expect(res.packageHits).toBe(2);
-        // supertype lookup attempted, but partners already in collected so no new push
-        expect(res.supertypeHits).toBe(0);
+        expect(res.supertypeHits).toBe(2);
+        expect(res.packageHits).toBe(0);
     });
 
     it('drops chunk_ids that are already in primary top-K', () => {
@@ -220,6 +266,49 @@ describe('buildComparisonBridgePool', () => {
         expect(res.chunkIds.length).toBe(12);
     });
 
+    // rag-graph-abstract-typedef-edges: v3-3 axes.
+    it('bridge surfaces the underlying-type partner for an abstract seed (forward)', () => {
+        const graph = GraphIndex.load(tmpFile(JSON.stringify(V33_PAYLOAD)))!;
+        // Seed declares `abstract Bytes(BytesData) from Array<UInt8> to BytesData`.
+        // Forward path: lookup by_symbol[BytesData] / by_symbol[Array] →
+        // c_bd, c_arr land in the pool.
+        const seeds = [
+            makeSeed({ symbol_name: 'Bytes', relativePath: 'haxe/io/Bytes.hx', chunk_id: 'seed_bytes' }),
+        ];
+        const res = buildComparisonBridgePool(seeds, graph, { maxPartners: 8, maxPackageFanout: 30 });
+        expect(res.chunkIds).toContain('c_bd');  // BytesData (forward)
+        expect(res.chunkIds).toContain('c_arr'); // Array (forward)
+        // Sibling: ReadOnlyArray also has Array in its abstract_underlying →
+        // by_abstract_underlying[Array] = [Bytes (self), ReadOnlyArray] →
+        // ReadOnlyArray (c_roa) lands too.
+        expect(res.chunkIds).toContain('c_roa');
+        expect(res.abstractUnderlyingHits).toBeGreaterThan(0);
+    });
+
+    it('bridge surfaces the alias-target partner for a typedef seed (forward + sibling)', () => {
+        const graph = GraphIndex.load(tmpFile(JSON.stringify(V33_PAYLOAD)))!;
+        // Seed declares `typedef Null<T> = T`.
+        // Forward: by_symbol[T] → c_t.
+        // Sibling: by_typedef_alias[T] = [Null (self), Maybe] → c_maybe.
+        const seeds = [
+            makeSeed({ symbol_name: 'Null', relativePath: 'StdTypes.hx', chunk_id: 'seed_null' }),
+        ];
+        const res = buildComparisonBridgePool(seeds, graph, { maxPartners: 8, maxPackageFanout: 30 });
+        expect(res.chunkIds).toContain('c_t');     // T (forward)
+        expect(res.chunkIds).toContain('c_maybe'); // Maybe (sibling typedef)
+        expect(res.typedefAliasHits).toBeGreaterThan(0);
+    });
+
+    it('v3-3 axes silently degrade on a v3-2 graph (no abstract/typedef hits)', () => {
+        const graph = loadGraph(); // v3-2 fixture
+        const seeds = [
+            makeSeed({ symbol_name: 'Bytes', relativePath: 'haxe/io/Bytes.hx', chunk_id: 'seed_bytes' }),
+        ];
+        const res = buildComparisonBridgePool(seeds, graph, { maxPartners: 8, maxPackageFanout: 15 });
+        expect(res.abstractUnderlyingHits).toBe(0);
+        expect(res.typedefAliasHits).toBe(0);
+    });
+
     it('debug log emitted under queryId/debug', () => {
         const spy = jest.spyOn(console, 'log').mockImplementation(() => undefined);
         try {
@@ -233,7 +322,8 @@ describe('buildComparisonBridgePool', () => {
             const logged = spy.mock.calls.map((c) => c.join(' '));
             const match = logged.find((line) => line.startsWith('[comparison-bridge] q=q44'));
             expect(match).toBeDefined();
-            expect(match).toMatch(/seeds=1 pkg_hits=3 sup_hits=0 pool_size=3/);
+            // v3-3 log adds abs_hits / td_hits between sup_hits and pool_size.
+            expect(match).toMatch(/seeds=1 pkg_hits=3 sup_hits=0 abs_hits=0 td_hits=0 pool_size=3/);
         } finally {
             spy.mockRestore();
         }

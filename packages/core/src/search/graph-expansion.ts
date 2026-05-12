@@ -33,6 +33,12 @@ export function derivePackageFromPath(relativePath: string | undefined): string 
 export interface GraphSymbolEntry {
     canonical_chunk_ids?: string[];
     mentioned_by_chunk_ids?: string[];
+    // rag-graph-abstract-typedef-edges v3-3: per-symbol forward attributes
+    // used by the comparison bridge to surface the underlying / alias
+    // partner without an extra Milvus round-trip. Present only on chunks
+    // declared as `abstract` / `typedef` respectively.
+    abstract_underlying?: string[];
+    typedef_alias?: string;
 }
 
 interface GraphPayload {
@@ -41,35 +47,49 @@ interface GraphPayload {
     // rag-graph-comparison-bridge v3-2: optional cross-subject indexes.
     by_package?: Record<string, string[]>;
     by_supertype?: Record<string, string[]>;
+    // rag-graph-abstract-typedef-edges v3-3: optional cross-subject indexes
+    // keyed by the underlying/from/to (resp. alias-target) type names.
+    by_abstract_underlying?: Record<string, string[]>;
+    by_typedef_alias?: Record<string, string[]>;
 }
 
 // rag-graph-comparison-bridge: schema versions for which advanced graph
 // pools (graph-expansion + comparison-bridge) are permitted to activate.
 // Anything outside this set triggers graceful degradation per spec.
-export const RECOGNIZED_GRAPH_VERSIONS: ReadonlySet<string> = new Set(['v3-1', 'v3-2']);
+export const RECOGNIZED_GRAPH_VERSIONS: ReadonlySet<string> = new Set(['v3-1', 'v3-2', 'v3-3']);
 
 export class GraphIndex {
     private readonly bySymbol: Map<string, GraphSymbolEntry>;
     private readonly byPackage: Map<string, string[]>;
     private readonly bySupertype: Map<string, string[]>;
+    private readonly byAbstractUnderlying: Map<string, string[]>;
+    private readonly byTypedefAlias: Map<string, string[]>;
     public readonly version: string;
     public readonly symbolCount: number;
     public readonly packageCount: number;
     public readonly supertypeCount: number;
+    public readonly abstractUnderlyingCount: number;
+    public readonly typedefAliasCount: number;
 
     private constructor(
         bySymbol: Map<string, GraphSymbolEntry>,
         byPackage: Map<string, string[]>,
         bySupertype: Map<string, string[]>,
+        byAbstractUnderlying: Map<string, string[]>,
+        byTypedefAlias: Map<string, string[]>,
         version: string,
     ) {
         this.bySymbol = bySymbol;
         this.byPackage = byPackage;
         this.bySupertype = bySupertype;
+        this.byAbstractUnderlying = byAbstractUnderlying;
+        this.byTypedefAlias = byTypedefAlias;
         this.version = version;
         this.symbolCount = bySymbol.size;
         this.packageCount = byPackage.size;
         this.supertypeCount = bySupertype.size;
+        this.abstractUnderlyingCount = byAbstractUnderlying.size;
+        this.typedefAliasCount = byTypedefAlias.size;
     }
 
     static load(filePath: string): GraphIndex | null {
@@ -95,8 +115,17 @@ export class GraphIndex {
                 const mentioned = Array.isArray(entry.mentioned_by_chunk_ids)
                     ? entry.mentioned_by_chunk_ids.filter((s): s is string => typeof s === 'string')
                     : [];
-                if (canon.length === 0 && mentioned.length === 0) continue;
-                map.set(sym, { canonical_chunk_ids: canon, mentioned_by_chunk_ids: mentioned });
+                const absUnd = Array.isArray((entry as any).abstract_underlying)
+                    ? ((entry as any).abstract_underlying as unknown[]).filter((s): s is string => typeof s === 'string' && s.length > 0)
+                    : undefined;
+                const tdAlias = typeof (entry as any).typedef_alias === 'string' && (entry as any).typedef_alias.length > 0
+                    ? (entry as any).typedef_alias as string
+                    : undefined;
+                if (canon.length === 0 && mentioned.length === 0 && !absUnd && !tdAlias) continue;
+                const built: GraphSymbolEntry = { canonical_chunk_ids: canon, mentioned_by_chunk_ids: mentioned };
+                if (absUnd && absUnd.length > 0) built.abstract_underlying = absUnd;
+                if (tdAlias) built.typedef_alias = tdAlias;
+                map.set(sym, built);
             }
             const byPackage = new Map<string, string[]>();
             for (const [pkg, names] of Object.entries(parsed.by_package || {})) {
@@ -110,7 +139,19 @@ export class GraphIndex {
                 const clean = names.filter((s): s is string => typeof s === 'string' && s.length > 0);
                 if (clean.length > 0) bySupertype.set(sup, clean);
             }
-            return new GraphIndex(map, byPackage, bySupertype, version);
+            const byAbstractUnderlying = new Map<string, string[]>();
+            for (const [t, names] of Object.entries(parsed.by_abstract_underlying || {})) {
+                if (!Array.isArray(names)) continue;
+                const clean = names.filter((s): s is string => typeof s === 'string' && s.length > 0);
+                if (clean.length > 0) byAbstractUnderlying.set(t, clean);
+            }
+            const byTypedefAlias = new Map<string, string[]>();
+            for (const [t, names] of Object.entries(parsed.by_typedef_alias || {})) {
+                if (!Array.isArray(names)) continue;
+                const clean = names.filter((s): s is string => typeof s === 'string' && s.length > 0);
+                if (clean.length > 0) byTypedefAlias.set(t, clean);
+            }
+            return new GraphIndex(map, byPackage, bySupertype, byAbstractUnderlying, byTypedefAlias, version);
         } catch (err) {
             console.warn(`[GraphIndex] ⚠️ failed to load ${filePath}: ${err}`);
             return null;
@@ -141,15 +182,31 @@ export class GraphIndex {
         return this.bySupertype.get(sup) || [];
     }
 
+    /**
+     * rag-graph-abstract-typedef-edges: symbol_names of abstracts whose
+     * underlying / from / to type includes `t`. Used for sibling-by-relation
+     * partners in the comparison bridge.
+     */
+    lookupAbstractUnderlying(t: string): string[] {
+        if (!t) return [];
+        return this.byAbstractUnderlying.get(t) || [];
+    }
+
+    /** rag-graph-abstract-typedef-edges: symbol_names of typedefs aliased to `t`. */
+    lookupTypedefAlias(t: string): string[] {
+        if (!t) return [];
+        return this.byTypedefAlias.get(t) || [];
+    }
+
     /** rag-graph-comparison-bridge: per-symbol metadata (package, supertypes). */
     lookupSymbol(symbol: string): GraphSymbolEntry | undefined {
         if (!symbol) return undefined;
         return this.bySymbol.get(symbol);
     }
 
-    /** True only when this index was loaded from a payload that carries v3-2 (or newer) keys. */
+    /** True when this index was loaded from a payload that carries v3-2 or v3-3 keys. */
     supportsComparisonBridge(): boolean {
-        return this.version === 'v3-2';
+        return this.version === 'v3-2' || this.version === 'v3-3';
     }
 }
 
