@@ -826,6 +826,15 @@ export class Context {
         return raw === '1' || raw.toLowerCase() === 'true';
     }
 
+    // ---- rag-comparison-bridge-reranker-bypass: env getter -------------
+
+    private getComparisonBridgeBypassSlots(): number {
+        const raw = (envManager.get('COMPARISON_BRIDGE_RERANKER_BYPASS_SLOTS') || '0').trim();
+        const n = parseInt(raw, 10);
+        if (!Number.isFinite(n) || n < 0) return 0;
+        return Math.min(n, 10);
+    }
+
     /**
      * Lazy-init the SerenaLspClient on first activation. Reused across
      * subsequent queries; the client itself caches the daemon URL for 30s
@@ -1478,10 +1487,32 @@ export class Context {
             // boosted by the symbol-routing pool) is more reliable on these.
             const rerankerBypassed = this.shouldBypassReranker(query, intent);
 
-            // Phase 2: cross-encoder rerank over the merged-and-deduped pool.
-            const finalResults = this.hasReranker() && !rerankerBypassed
-                ? await this.applyReranker(query, dedupedResults, topK)
-                : dedupedResults.slice(0, topK);
+            // rag-comparison-bridge-reranker-bypass: when bypass slots > 0 and
+            // the candidate pool contains chunks marker'd `pool:
+            // 'comparisonBridge'`, reserve N slots in the final top-K for the
+            // highest-RRF-ranked bridge chunks and send only the rest to the
+            // reranker. Mirrors the `RERANKER_BYPASS_FOR_QUALIFIED_NAME`
+            // precedent at the same call site but partitions by pool marker
+            // instead of query shape. When `bypassSlots = 0`, there are no
+            // bridge chunks, or the qualified-name bypass already short-
+            // circuited the reranker, the path collapses identically to the
+            // pre-change behavior.
+            const bypassSlots = (this.hasReranker() && !rerankerBypassed)
+                ? this.getComparisonBridgeBypassSlots()
+                : 0;
+            const { reserved: reservedBridge, rerankInput } = this.partitionForBridgeBypass(
+                dedupedResults,
+                topK,
+                bypassSlots,
+            );
+            if (reservedBridge.length > 0 && this.getComparisonBridgeDebug()) {
+                console.log(`[comparison-bridge-bypass] reserved=${reservedBridge.length} rerank_input=${rerankInput.length} final=${topK}`);
+            }
+            const rerankerSlots = Math.max(topK - reservedBridge.length, 0);
+            const rerankedRest = this.hasReranker() && !rerankerBypassed
+                ? await this.applyReranker(query, rerankInput, rerankerSlots)
+                : rerankInput.slice(0, rerankerSlots);
+            const finalResults = [...reservedBridge, ...rerankedRest].slice(0, topK);
             if (rerankerBypassed) {
                 console.log(`[Context] ⏭️  reranker bypassed for qualified-name code query "${query}"`);
             }
@@ -1705,6 +1736,34 @@ export class Context {
      * On reranker error we fall back to RRF order — search must not fail
      * because the sidecar hiccupped.
      */
+    /**
+     * rag-comparison-bridge-reranker-bypass: split the post-dedup candidate
+     * list into `reserved` (bridge chunks that bypass the reranker) and
+     * `rerankInput` (everything else, including leftover bridge chunks past
+     * `bypassSlots` — they still see the reranker so they can compete on
+     * cross-encoder score). Pure function; no env reads — callers compute
+     * `bypassSlots` upstream and gate qualified-name-bypass / no-reranker
+     * cases by passing `0`.
+     */
+    private partitionForBridgeBypass(
+        candidates: SemanticSearchResult[],
+        topK: number,
+        bypassSlots: number,
+    ): { reserved: SemanticSearchResult[]; rerankInput: SemanticSearchResult[] } {
+        if (bypassSlots <= 0) {
+            return { reserved: [], rerankInput: candidates };
+        }
+        const bridgeChunks = candidates.filter((r) => r.pool === 'comparisonBridge');
+        if (bridgeChunks.length === 0) {
+            return { reserved: [], rerankInput: candidates };
+        }
+        const reservationCount = Math.min(bypassSlots, bridgeChunks.length, topK);
+        const reserved = bridgeChunks.slice(0, reservationCount);
+        const reservedSet = new Set<SemanticSearchResult>(reserved);
+        const rerankInput = candidates.filter((r) => !reservedSet.has(r));
+        return { reserved, rerankInput };
+    }
+
     private async applyReranker(
         query: string,
         candidates: SemanticSearchResult[],
