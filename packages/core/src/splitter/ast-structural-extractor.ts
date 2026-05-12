@@ -53,21 +53,6 @@ function findFirstChild(node: Parser.SyntaxNode, types: string[]): Parser.Syntax
     return null;
 }
 
-function findAllDescendantsByType(
-    root: Parser.SyntaxNode,
-    types: string[],
-    cap: number = 256,
-): Parser.SyntaxNode[] {
-    const out: Parser.SyntaxNode[] = [];
-    const stack: Parser.SyntaxNode[] = [root];
-    while (stack.length > 0 && out.length < cap) {
-        const n = stack.pop()!;
-        if (types.includes(n.type)) out.push(n);
-        for (const c of n.children) stack.push(c);
-    }
-    return out;
-}
-
 // ----------------------- imports (file-level) -----------------------
 
 function extractImportsTypeScriptOrJavaScript(root: Parser.SyntaxNode): string[] {
@@ -272,42 +257,159 @@ function extractClassJava(node: Parser.SyntaxNode): ClassStructural {
     return packClass(extendsName, implementsList);
 }
 
-function extractClassHaxe(node: Parser.SyntaxNode): ClassStructural {
-    // tree-sitter-haxe exposes ClassType with descendants like
-    // `ExtendsClause`/`Extends` and `ImplementsClause`/`Implements`. Names of
-    // these nodes vary between grammar revisions, so we tolerate several.
+// rag-graph-supertype-extraction-fix: tree-sitter-haxe@0.4.6 emits `extends` /
+// `implements` as bare keyword tokens (no wrapper nodes) directly under
+// ClassType, with the type expression (`TypePath`) as the immediately-following
+// sibling. The wrapper-node search the previous implementation relied on never
+// matched the deployed grammar, silently dropping every Haxe heritage edge.
+const HAXE_TYPEPATH_NODE_TYPES = new Set<string>([
+    'TypePath', 'type_path',
+    'IdentifierTypePath', 'identifier_type_path',
+    'TypeName', 'type_name',
+    'IDENTIFIER', 'identifier',
+]);
+
+// Normalize a Haxe type expression to its bare class identifier:
+//   `haxe.ds.BalancedTree<K, V>` → `BalancedTree`
+//   `haxe.Constraints.IMap<K, V>` → `IMap`
+//   `Array<Map<Int, String>>` → `Array` (depth-balanced strip)
+//   `K:EnumValue & Constructible` → null (not identifier-shaped)
+//   `foo bar baz` → null (top-level whitespace separates tokens)
+// Returns null when the result cannot key into the `by_symbol` index.
+export function normalizeTypeName(raw: string): string | null {
+    if (!raw) return null;
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    // Reject top-level whitespace (allow whitespace inside generic brackets).
+    let depthWs = 0;
+    for (let i = 0; i < trimmed.length; i++) {
+        const c = trimmed[i];
+        if (c === '<') depthWs++;
+        else if (c === '>') depthWs--;
+        else if (depthWs === 0 && /\s/.test(c)) return null;
+    }
+    // Strip generic suffix via depth-balanced parsing.
+    let depth = 0;
+    let cutAt = -1;
+    for (let i = 0; i < trimmed.length; i++) {
+        const c = trimmed[i];
+        if (c === '<') {
+            if (depth === 0 && cutAt < 0) cutAt = i;
+            depth++;
+        } else if (c === '>') {
+            depth--;
+        }
+    }
+    const noGenerics = depth === 0 && cutAt >= 0 ? trimmed.slice(0, cutAt) : trimmed;
+    const lastDot = noGenerics.lastIndexOf('.');
+    const out = lastDot >= 0 ? noGenerics.slice(lastDot + 1) : noGenerics;
+    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(out) ? out : null;
+}
+
+function extractHaxeHeritageFromAst(node: Parser.SyntaxNode): ClassStructural {
     let extendsName: string | undefined;
     const implementsList: string[] = [];
-    const heritageNodes = findAllDescendantsByType(node, [
-        'ExtendsClause', 'Extends', 'extends_clause',
-        'ImplementsClause', 'Implements', 'implements_clause',
-    ]);
-    for (const part of heritageNodes) {
-        const isExtends = part.type === 'ExtendsClause' || part.type === 'Extends' || part.type === 'extends_clause';
-        // Pick the first identifier-shaped child as the type name.
-        let typeName: string | undefined;
-        for (const sub of part.children) {
-            if (
-                sub.type === 'IDENTIFIER' || sub.type === 'identifier' ||
-                sub.type === 'TypePath' || sub.type === 'type_path' ||
-                sub.type === 'TypeName' || sub.type === 'type_name'
-            ) {
-                typeName = sub.text.replace(/\s+/g, '');
-                break;
+    let expectingExtends = false;
+    let expectingImplements = false;
+    for (const child of node.children) {
+        if (!child) continue;
+        const t = child.type;
+        if (t === 'extends') {
+            expectingExtends = true;
+            expectingImplements = false;
+            continue;
+        }
+        if (t === 'implements') {
+            expectingImplements = true;
+            expectingExtends = false;
+            continue;
+        }
+        if (HAXE_TYPEPATH_NODE_TYPES.has(t)) {
+            const norm = normalizeTypeName(child.text);
+            if (expectingExtends) {
+                if (norm) extendsName = norm;
+                expectingExtends = false;
+                continue;
             }
+            if (expectingImplements) {
+                if (norm) implementsList.push(norm);
+                continue; // stay in implements mode for comma-separated list
+            }
+            continue;
         }
-        if (!typeName && typeof part.text === 'string') {
-            // Fallback: strip the leading keyword.
-            typeName = part.text.replace(/^(extends|implements)\s+/i, '').trim() || undefined;
+        if (t === ',' || t === 'comma') {
+            // Comma between TypePaths keeps us in implements mode.
+            continue;
         }
-        if (!typeName) continue;
-        if (isExtends) {
-            extendsName = typeName;
+        // Anything else (e.g. `{`, another keyword) terminates the heritage list.
+        expectingExtends = false;
+        expectingImplements = false;
+    }
+    return packClass(extendsName, implementsList);
+}
+
+// Recover heritage from raw source for files the AST cannot dissect — typically
+// the ~36% of Haxe stdlib that parses with `hasError=true` due to `#if` /
+// `#elseif` conditional compilation, complex docstrings, or `~/regex/` literals.
+// Anchored at start-of-line so `class Foo extends Bar` inside a block comment
+// (which has leading `* ` or `// `) does not match.
+function extractClassHaxeViaRegex(source: string, className: string | undefined): ClassStructural {
+    if (!source) return {};
+    const namePat = className
+        ? className.replace(/[\\^$.|?*+(){}\[\]]/g, '\\$&')
+        : '\\w+';
+    const headerRe = new RegExp(
+        `^\\s*(?:@:?\\w+(?:\\([^)]*\\))?\\s+)*(?:extern\\s+|abstract\\s+|final\\s+|private\\s+|public\\s+)*class\\s+${namePat}\\b([^{]{0,500})`,
+        'm',
+    );
+    const headerMatch = source.match(headerRe);
+    if (!headerMatch) return {};
+    const tail = headerMatch[1] || '';
+    let extendsName: string | undefined;
+    const implementsList: string[] = [];
+    // Walk left-to-right, alternating between `extends` / `implements` keyword
+    // and a following type expression (with optional up-to-2-level generics).
+    const heritageRe = /\b(extends|implements)\s+([\w.]+(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?)/g;
+    let m: RegExpExecArray | null;
+    while ((m = heritageRe.exec(tail)) !== null) {
+        const keyword = m[1];
+        const norm = normalizeTypeName(m[2]);
+        if (!norm) continue;
+        if (keyword === 'extends') {
+            if (!extendsName) extendsName = norm;
         } else {
-            implementsList.push(typeName);
+            implementsList.push(norm);
         }
     }
     return packClass(extendsName, implementsList);
+}
+
+function extractHaxeClassName(node: Parser.SyntaxNode): string | undefined {
+    for (const child of node.children) {
+        if (!child) continue;
+        if (
+            child.type === 'type_name' || child.type === 'TypeName' ||
+            child.type === 'identifier' || child.type === 'IDENTIFIER'
+        ) {
+            const txt = (child.text || '').replace(/\s+/g, '');
+            if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(txt)) return txt;
+        }
+    }
+    return undefined;
+}
+
+export function extractClassHaxe(node: Parser.SyntaxNode): ClassStructural {
+    const astResult = extractHaxeHeritageFromAst(node);
+    if (astResult.extends || (astResult.implements && astResult.implements.length > 0)) {
+        return astResult;
+    }
+    // Cheap pre-check before invoking the regex fallback.
+    const src = node.text || '';
+    if (!/class\s+\w+[\s\S]{0,500}?\b(extends|implements)\b/.test(src)) {
+        return astResult;
+    }
+    const className = extractHaxeClassName(node);
+    return extractClassHaxeViaRegex(src, className);
 }
 
 function packClass(extendsName: string | undefined, implementsList: string[]): ClassStructural {

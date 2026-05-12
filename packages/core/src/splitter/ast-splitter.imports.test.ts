@@ -20,8 +20,15 @@ function parseAs(grammar: any, code: string): Parser.SyntaxNode {
 }
 
 function findFirst(node: Parser.SyntaxNode, types: string[]): Parser.SyntaxNode | null {
+    // Defensive walk via numbered indices: tree-sitter's `node.children`
+    // accessor can transiently return holes when multiple grammars share a
+    // process (jest --runInBand across test files).
+    if (!node) return null;
     if (types.includes(node.type)) return node;
-    for (const child of node.children) {
+    const count = node.childCount;
+    for (let i = 0; i < count; i++) {
+        const child = node.child(i);
+        if (!child) continue;
         const out = findFirst(child, types);
         if (out) return out;
     }

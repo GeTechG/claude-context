@@ -2267,6 +2267,15 @@ export class Context {
         const byPackage = finalizeBucketMap(byPackageSets);
         const bySupertype = finalizeBucketMap(bySupertypeSets);
 
+        // rag-graph-supertype-extraction-fix: one-shot diagnostic so a
+        // post-reindex run surfaces extraction quality without manual JSON
+        // inspection. Quiet unless DEBUG_COMPARISON_BRIDGE=1.
+        if (this.getComparisonBridgeDebug()) {
+            const supKeys = Object.keys(bySupertype);
+            const sample = supKeys.slice(0, 5).map((k) => `${k} → ${bySupertype[k].length} impls`);
+            console.log(`[graph-side-index] supertype edges: ${supKeys.length} keys, sample: [${sample.join(', ')}]`);
+        }
+
         const sidePath = path.join(codebasePath, '.symbols-graph.json');
         const payload = {
             version: 'v3-2',
