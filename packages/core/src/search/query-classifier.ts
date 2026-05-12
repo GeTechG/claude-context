@@ -19,6 +19,24 @@ export interface QueryIntent {
     docSignal: boolean;
 }
 
+// rag-graph-comparison-bridge: cheap heuristic for comparison-shape queries.
+// Activates whenever the query contains one of the natural-language
+// comparison connectors. Designed to match the gold-set's `query_shape ==
+// "comparison"` queries (which all use " vs " or "compared to") while
+// staying ignorant of language/domain — no special tokens, no LLM.
+const COMPARISON_PATTERNS: RegExp[] = [
+    /\bvs\.?\b/i,
+    /\bversus\b/i,
+    /\bcompared to\b/i,
+    /\bdifference between\b/i,
+    /\bcompare\s+\w+\s+(?:and|to)\b/i,
+];
+
+export function isComparisonShape(query: string | undefined | null): boolean {
+    if (!query) return false;
+    return COMPARISON_PATTERNS.some((p) => p.test(query));
+}
+
 const CAMEL_CASE = /\b[a-z]+[A-Z][a-zA-Z0-9]*\b/;
 const PASCAL_CASE = /\b[A-Z][a-z]+[A-Z][a-zA-Z0-9]*\b/;
 const SNAKE_CASE = /\b[a-z][a-z0-9]*_[a-z0-9_]+\b/;

@@ -1,9 +1,10 @@
 // rag-graph-layer Phase 3.3: tests for GraphIndex + expandGraphPool.
+// rag-graph-comparison-bridge: tests for v3-2 schema + derivePackageFromPath.
 
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { GraphIndex, expandGraphPool } from './graph-expansion';
+import { GraphIndex, expandGraphPool, derivePackageFromPath } from './graph-expansion';
 import { SemanticSearchResult } from '../types';
 
 function tmpFile(content: string): string {
@@ -218,5 +219,100 @@ describe('expandGraphPool', () => {
         };
         const fetched = await expandGraphPool([seed], idx, fetcher);
         expect(fetched.map((c) => c.chunk_id)).toEqual(['ok']);
+    });
+});
+
+describe('derivePackageFromPath (rag-graph-comparison-bridge)', () => {
+    it('joins the file directory chain with dots', () => {
+        expect(derivePackageFromPath('haxe/io/Bytes.hx')).toBe('haxe.io');
+        expect(derivePackageFromPath('python/lib/foo.py')).toBe('python.lib');
+        expect(derivePackageFromPath('src/main/java/com/example/Foo.java'))
+            .toBe('src.main.java.com.example');
+    });
+
+    it('returns undefined for files with no enclosing directory', () => {
+        expect(derivePackageFromPath('Map.hx')).toBeUndefined();
+        expect(derivePackageFromPath('foo.py')).toBeUndefined();
+    });
+
+    it('returns undefined for empty or undefined input', () => {
+        expect(derivePackageFromPath(undefined)).toBeUndefined();
+        expect(derivePackageFromPath('')).toBeUndefined();
+    });
+
+    it('handles windows-style separators', () => {
+        expect(derivePackageFromPath('haxe\\io\\Bytes.hx')).toBe('haxe.io');
+    });
+});
+
+describe('GraphIndex v3-2 — by_package / by_supertype', () => {
+    it('loads by_package and by_supertype top-level keys', () => {
+        const file = tmpFile(JSON.stringify({
+            version: 'v3-2',
+            by_symbol: {
+                Bytes: { canonical_chunk_ids: ['c_bytes'], mentioned_by_chunk_ids: [] },
+                BytesBuffer: { canonical_chunk_ids: ['c_bb'], mentioned_by_chunk_ids: [] },
+                IntMap: { canonical_chunk_ids: ['c_im'], mentioned_by_chunk_ids: [] },
+                StringMap: { canonical_chunk_ids: ['c_sm'], mentioned_by_chunk_ids: [] },
+            },
+            by_package: {
+                'haxe.io': ['Bytes', 'BytesBuffer', 'Input', 'Output'],
+                'haxe.ds': ['IntMap', 'ObjectMap', 'StringMap'],
+            },
+            by_supertype: {
+                IMap: ['IntMap', 'ObjectMap', 'StringMap'],
+            },
+        }));
+        const idx = GraphIndex.load(file);
+        expect(idx).not.toBeNull();
+        expect(idx!.version).toBe('v3-2');
+        expect(idx!.packageCount).toBe(2);
+        expect(idx!.supertypeCount).toBe(1);
+        expect(idx!.lookupPackage('haxe.io')).toEqual(['Bytes', 'BytesBuffer', 'Input', 'Output']);
+        expect(idx!.lookupSupertype('IMap')).toEqual(['IntMap', 'ObjectMap', 'StringMap']);
+        expect(idx!.lookupPackage('absent')).toEqual([]);
+        expect(idx!.lookupSupertype('absent')).toEqual([]);
+        expect(idx!.supportsComparisonBridge()).toBe(true);
+        expect(idx!.lookupSymbol('Bytes')?.canonical_chunk_ids).toEqual(['c_bytes']);
+        expect(idx!.lookupSymbol('absent')).toBeUndefined();
+    });
+
+    it('v3-1 payload exposes empty package/supertype lookups', () => {
+        const file = tmpFile(JSON.stringify({
+            version: 'v3-1',
+            by_symbol: { Bytes: { canonical_chunk_ids: ['c'], mentioned_by_chunk_ids: [] } },
+        }));
+        const idx = GraphIndex.load(file);
+        expect(idx).not.toBeNull();
+        expect(idx!.version).toBe('v3-1');
+        expect(idx!.packageCount).toBe(0);
+        expect(idx!.supertypeCount).toBe(0);
+        expect(idx!.lookupPackage('haxe.io')).toEqual([]);
+        expect(idx!.supportsComparisonBridge()).toBe(false);
+    });
+
+    it('rejects unrecognized schema versions', () => {
+        const file = tmpFile(JSON.stringify({
+            version: 'v9-99-future',
+            by_symbol: { X: { canonical_chunk_ids: ['c'] } },
+        }));
+        expect(GraphIndex.load(file)).toBeNull();
+    });
+
+    it('ignores non-string entries in by_package / by_supertype', () => {
+        const file = tmpFile(JSON.stringify({
+            version: 'v3-2',
+            by_symbol: { Foo: { canonical_chunk_ids: ['c'], mentioned_by_chunk_ids: [] } },
+            by_package: {
+                'pkg.a': ['Foo', 42, null, 'Bar'],
+                'pkg.empty': [],
+            },
+            by_supertype: { Iface: ['Foo', null] },
+        }));
+        const idx = GraphIndex.load(file);
+        expect(idx).not.toBeNull();
+        expect(idx!.lookupPackage('pkg.a')).toEqual(['Foo', 'Bar']);
+        expect(idx!.lookupPackage('pkg.empty')).toEqual([]);
+        expect(idx!.lookupSupertype('Iface')).toEqual(['Foo']);
     });
 });

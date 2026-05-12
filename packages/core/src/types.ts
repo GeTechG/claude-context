@@ -33,4 +33,8 @@ export interface SemanticSearchResult {
     extends?: string;
     implements?: string[];
     mentioned_symbols?: string[];
+    // rag-graph-comparison-bridge: which retrieval pool injected the chunk.
+    // Set only by pools that need downstream identification (currently the
+    // comparison bridge sets `comparisonBridge`). Older clients ignore it.
+    pool?: string;
 }

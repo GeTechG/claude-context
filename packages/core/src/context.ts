@@ -19,9 +19,10 @@ import {
 } from './vectordb';
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
-import { classifyQuery, weightsForIntent, DomainWeights, parseQualifiedName, parseSingleSymbol } from './search/query-classifier';
+import { classifyQuery, weightsForIntent, DomainWeights, parseQualifiedName, parseSingleSymbol, isComparisonShape } from './search/query-classifier';
 import { buildSymbolFilter } from './search/symbol-routing';
-import { GraphIndex, collectGraphCandidateIds } from './search/graph-expansion';
+import { GraphIndex, collectGraphCandidateIds, derivePackageFromPath } from './search/graph-expansion';
+import { buildComparisonBridgePool } from './search/comparison-bridge';
 import { SerenaLspClient } from './search/serena-lsp-client';
 import { runSymbolRefsPool, SymbolRefsParsed } from './search/symbol-refs-pool';
 import { applyRewriting, RewriteFlags, RewriteResult } from './search/query-rewrite';
@@ -43,6 +44,12 @@ interface GraphAccumulatorChunk {
     contentType: string | undefined;
     symbolName: string | undefined;
     mentionedSymbols: string[] | undefined;
+    // rag-graph-comparison-bridge v3-2: additional fields captured per chunk
+    // so the side-builder can derive qualified_name + supertype edges without
+    // re-querying Milvus.
+    parentSymbol?: string;
+    extendsName?: string;
+    implementsList?: string[];
 }
 
 class GraphAccumulator {
@@ -56,6 +63,11 @@ class GraphAccumulator {
         return this.chunks;
     }
 }
+
+// rag-graph-comparison-bridge: helper moved to ./search/graph-expansion.ts as
+// `derivePackageFromPath` so the bridge module can import it without a
+// circular dep on context.ts. Re-exported here for completeness.
+export { derivePackageFromPath } from './search/graph-expansion';
 
 function parseHeadingPath(raw: string | undefined): string[] | undefined {
     if (!raw) return undefined;
@@ -784,6 +796,36 @@ export class Context {
         return Math.min(Math.max(n, 1), 10);
     }
 
+    // ---- rag-graph-comparison-bridge: env getters -----------------------
+
+    private getComparisonBridgeEnabled(): boolean {
+        const raw = (envManager.get('COMPARISON_BRIDGE_ENABLED') || '0').trim();
+        return raw === '1' || raw.toLowerCase() === 'true';
+    }
+
+    private getComparisonBridgePoolWeight(): number {
+        return this.getNonNegativeFloatFromEnv('COMPARISON_BRIDGE_POOL_WEIGHT', 0.6);
+    }
+
+    private getComparisonBridgeMaxPartners(): number {
+        const n = this.getPositiveIntFromEnv('COMPARISON_BRIDGE_MAX_PARTNERS', 8);
+        return Math.min(n, 50);
+    }
+
+    private getComparisonBridgeMaxPackageFanout(): number {
+        // Default 30 matches the file-level bucket cap, so every bucket
+        // passes the fanout filter by default and the cap-30 already keeps
+        // the data bounded. Lower values intentionally disable bridging on
+        // larger packages (useful for noisy meta-packages).
+        const n = this.getPositiveIntFromEnv('COMPARISON_BRIDGE_MAX_PACKAGE_FANOUT', 30);
+        return Math.min(n, 100);
+    }
+
+    private getComparisonBridgeDebug(): boolean {
+        const raw = (envManager.get('DEBUG_COMPARISON_BRIDGE') || '0').trim();
+        return raw === '1' || raw.toLowerCase() === 'true';
+    }
+
     /**
      * Lazy-init the SerenaLspClient on first activation. Reused across
      * subsequent queries; the client itself caches the daemon URL for 30s
@@ -1328,6 +1370,55 @@ export class Context {
                             } else if (Date.now() - this.staleGraphChunkWarnedAt > 60_000) {
                                 this.staleGraphChunkWarnedAt = Date.now();
                                 console.warn(`[Context] ⚠️ graph index points to ${neighbourIds.length} chunk_id(s) not present in '${collectionName}'; consider reindex`);
+                            }
+                        }
+                    }
+                }
+
+                // rag-graph-comparison-bridge: 5th pool. Activated when the
+                // env-flag is on, the query is comparison-shaped, the graph
+                // is v3-2, and v3 collections are in use. Failure modes are
+                // silent (empty pool); the comparison-bridge module never
+                // throws and degrades to a no-op on missing data.
+                if (this.getComparisonBridgeEnabled() && v3Compatible && isComparisonShape(query)) {
+                    const graphIndex = this.loadGraphIndex(codebasePath);
+                    if (graphIndex && graphIndex.supportsComparisonBridge()) {
+                        const seeds = semanticMerged.slice(0, this.getGraphSeedK());
+                        const bridge = buildComparisonBridgePool(seeds, graphIndex, {
+                            maxPartners: this.getComparisonBridgeMaxPartners(),
+                            maxPackageFanout: this.getComparisonBridgeMaxPackageFanout(),
+                            debug: this.getComparisonBridgeDebug(),
+                            queryId: query,
+                        });
+                        if (bridge.chunkIds.length > 0) {
+                            const fetched = await this.fetchChunksByIds(collectionName, bridge.chunkIds);
+                            if (fetched.length > 0) {
+                                const bridgePoolMerge = [
+                                    ...mergePools,
+                                    { results: fetched, weight: this.getComparisonBridgePoolWeight() },
+                                ];
+                                const reMerged = this.weightedRrfMerge(
+                                    bridgePoolMerge,
+                                    mergeLimit,
+                                    this.getRrfK(),
+                                );
+                                // Build a set of bridge chunk_ids so the
+                                // marker is only applied to chunks the bridge
+                                // actually injected (not original RRF hits
+                                // that happen to share a chunk_id, although
+                                // the bridge filter guarantees disjointness).
+                                const bridgeIds = new Set(fetched.map((c) => c.document.id));
+                                semanticMerged = reMerged.map((r) => {
+                                    const s = this.toSemanticResult(r);
+                                    if (s.chunk_id && bridgeIds.has(s.chunk_id)) {
+                                        s.pool = 'comparisonBridge';
+                                    }
+                                    return s;
+                                });
+                                console.log(`[Context] 🌉 comparison-bridge: seeds=${bridge.seedsCount} pkg_hits=${bridge.packageHits} sup_hits=${bridge.supertypeHits} fetched=${fetched.length} weight=${this.getComparisonBridgePoolWeight()}`);
+                            } else if (Date.now() - this.staleGraphChunkWarnedAt > 60_000) {
+                                this.staleGraphChunkWarnedAt = Date.now();
+                                console.warn(`[Context] ⚠️ comparison-bridge points to ${bridge.chunkIds.length} chunk_id(s) not present in '${collectionName}'; consider reindex`);
                             }
                         }
                     }
@@ -1957,24 +2048,32 @@ export class Context {
     }
 
     /**
-     * rag-graph-layer Phase 2: build `.symbols-graph.json` from the
-     * per-run accumulator and write it next to `.symbols-vocab.json`.
+     * rag-graph-layer Phase 2 + rag-graph-comparison-bridge: build
+     * `.symbols-graph.json` from the per-run accumulator and write it next
+     * to `.symbols-vocab.json`.
      *
-     * Schema (`v3-1`):
+     * Schema (`v3-2`, additive over v3-1):
      * ```
      * {
-     *   "version": "v3-1",
-     *   "by_symbol": {
-     *     "<qualified_name>": {
-     *       "canonical_chunk_ids": [...],     // code chunks (after demote-marker
-     *                                         // dedup) whose symbol_name matches
-     *       "mentioned_by_chunk_ids": [...]  // doc/code_example chunks whose
-     *                                         // mentioned_symbols[] contains the key
-     *                                         // (capped at 20 per spec D5)
+     *   "version": "v3-2",
+     *   "by_symbol": {                       // unchanged from v3-1
+     *     "<symbol_name>": {
+     *       "canonical_chunk_ids": [...],
+     *       "mentioned_by_chunk_ids": [...]
      *     }
+     *   },
+     *   "by_package": {                      // v3-2: cross-subject siblings
+     *     "<pkg>": ["<symbol_name>", ...]    // dedup, alphabetical, cap 30
+     *   },
+     *   "by_supertype": {                    // v3-2: interface/abstract polymorphism
+     *     "<supertype>": ["<symbol_name>", ...]
      *   }
      * }
      * ```
+     *
+     * Package derivation per chunk: parent_symbol (if set) ∥ file-path-based
+     * directory (Haxe-aware: strips `_std/` target prefix and `haxe/code/haxe/std/`
+     * source root). Empty package → symbol skipped from by_package.
      */
     private async persistGraphSideIndex(codebasePath: string): Promise<void> {
         const accumulator = this.graphAccumulator;
@@ -2036,6 +2135,31 @@ export class Context {
 
         const bySymbol: Record<string, { canonical_chunk_ids: string[]; mentioned_by_chunk_ids: string[] }> = {};
 
+        // rag-graph-comparison-bridge: v3-2 inverted indexes. Built from
+        // every canonical chunk (post-demote-marker filter), not just the
+        // first one — so symbols with multi-target overrides (Haxe stdlib
+        // or any monorepo with per-platform copies) appear in every bucket
+        // their canonicals span. At runtime the bridge derives the seed's
+        // pkg from the seed's own relativePath, so it naturally lands in
+        // the bucket containing its same-directory peers.
+        const BUCKET_CAP = 30;
+        const byPackageSets = new Map<string, Set<string>>();
+        const bySupertypeSets = new Map<string, Set<string>>();
+
+        const addToBucket = (
+            bucketMap: Map<string, Set<string>>,
+            key: string,
+            value: string,
+        ): void => {
+            if (!key || !value) return;
+            let bucket = bucketMap.get(key);
+            if (!bucket) {
+                bucket = new Set<string>();
+                bucketMap.set(key, bucket);
+            }
+            bucket.add(value);
+        };
+
         for (const [sym, bucket] of codeBySymbol.entries()) {
             const canonicals = bucket.filter((b) => !hasDemoteMarker(b.relativePath));
             const chosen = canonicals.length > 0 ? canonicals : bucket;
@@ -2050,6 +2174,19 @@ export class Context {
             const entry = bySymbol[sym] || { canonical_chunk_ids: [], mentioned_by_chunk_ids: [] };
             entry.canonical_chunk_ids = ids;
             bySymbol[sym] = entry;
+            // Feed every canonical chunk into the inverted indexes (each
+            // contributes the symbol to its own derived package + any
+            // supertypes declared on that chunk).
+            for (const c of chosen) {
+                const pkg = c.parentSymbol || derivePackageFromPath(c.relativePath);
+                if (pkg) addToBucket(byPackageSets, pkg, sym);
+                if (c.extendsName) addToBucket(bySupertypeSets, c.extendsName, sym);
+                if (c.implementsList) {
+                    for (const s of c.implementsList) {
+                        if (s) addToBucket(bySupertypeSets, s, sym);
+                    }
+                }
+            }
         }
 
         for (const [sym, ids] of mentionedBySymbol.entries()) {
@@ -2058,17 +2195,34 @@ export class Context {
             bySymbol[sym] = entry;
         }
 
+        const finalizeBucketMap = (m: Map<string, Set<string>>): Record<string, string[]> => {
+            const out: Record<string, string[]> = {};
+            const keys = Array.from(m.keys()).sort();
+            for (const k of keys) {
+                const arr = Array.from(m.get(k)!).sort();
+                out[k] = arr.length > BUCKET_CAP ? arr.slice(0, BUCKET_CAP) : arr;
+            }
+            return out;
+        };
+
+        const byPackage = finalizeBucketMap(byPackageSets);
+        const bySupertype = finalizeBucketMap(bySupertypeSets);
+
         const sidePath = path.join(codebasePath, '.symbols-graph.json');
         const payload = {
-            version: 'v3-1',
+            version: 'v3-2',
             generatedAt: new Date().toISOString(),
             by_symbol: bySymbol,
+            by_package: byPackage,
+            by_supertype: bySupertype,
         };
 
         try {
             await fs.promises.writeFile(sidePath, JSON.stringify(payload, null, 2), 'utf-8');
             const symbolCount = Object.keys(bySymbol).length;
-            console.log(`[Context] 🕸️  Wrote graph side-index (${symbolCount} symbols) → ${sidePath}`);
+            const pkgCount = Object.keys(byPackage).length;
+            const supCount = Object.keys(bySupertype).length;
+            console.log(`[Context] 🕸️  Wrote graph side-index v3-2 (${symbolCount} symbols, ${pkgCount} packages, ${supCount} supertypes) → ${sidePath}`);
         } catch (err) {
             console.warn(`[Context] ⚠️ Failed to persist graph side-index: ${err}`);
         }
@@ -2437,6 +2591,18 @@ export class Context {
                 symbolName: meta.symbol_name,
                 mentionedSymbols: Array.isArray(meta.mentioned_symbols)
                     ? meta.mentioned_symbols.slice()
+                    : undefined,
+                // rag-graph-comparison-bridge v3-2: capture parent/extends/implements
+                // so `by_package` (via qualified_name) and `by_supertype` can be
+                // built deterministically in persistGraphSideIndex.
+                parentSymbol: typeof meta.parent_symbol === 'string' && meta.parent_symbol.length > 0
+                    ? meta.parent_symbol
+                    : undefined,
+                extendsName: typeof meta.extends === 'string' && meta.extends.length > 0
+                    ? meta.extends
+                    : undefined,
+                implementsList: Array.isArray(meta.implements) && meta.implements.length > 0
+                    ? meta.implements.slice()
                     : undefined,
             });
         };

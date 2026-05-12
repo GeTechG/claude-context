@@ -10,7 +10,27 @@
 import * as fs from 'fs';
 import { SemanticSearchResult } from '../types';
 
-interface GraphSymbolEntry {
+// rag-graph-comparison-bridge: derive a package label from a repo-relative
+// file path. Universal/language-agnostic: package = directory chain of the
+// file, joined with `.`. Files at the repo root (no enclosing directory)
+// return undefined. This works for any source layout that uses the
+// filesystem to group related symbols (Haxe stdlib, Python modules, Java
+// packages, npm modules, …). For multi-target stdlibs that store the same
+// symbol under several directories (Haxe `eval/_std/...`), the indexer
+// picks a single canonical chunk per symbol via shortest-path dedup and
+// only that canonical's package is bucketed — so target overrides don't
+// fragment the bucket map.
+export function derivePackageFromPath(relativePath: string | undefined): string | undefined {
+    if (!relativePath) return undefined;
+    const p = relativePath.replace(/\\/g, '/');
+    const lastSlash = p.lastIndexOf('/');
+    if (lastSlash <= 0) return undefined;
+    const dir = p.slice(0, lastSlash);
+    if (!dir) return undefined;
+    return dir.replace(/\//g, '.');
+}
+
+export interface GraphSymbolEntry {
     canonical_chunk_ids?: string[];
     mentioned_by_chunk_ids?: string[];
 }
@@ -18,17 +38,38 @@ interface GraphSymbolEntry {
 interface GraphPayload {
     version?: string;
     by_symbol?: Record<string, GraphSymbolEntry>;
+    // rag-graph-comparison-bridge v3-2: optional cross-subject indexes.
+    by_package?: Record<string, string[]>;
+    by_supertype?: Record<string, string[]>;
 }
+
+// rag-graph-comparison-bridge: schema versions for which advanced graph
+// pools (graph-expansion + comparison-bridge) are permitted to activate.
+// Anything outside this set triggers graceful degradation per spec.
+export const RECOGNIZED_GRAPH_VERSIONS: ReadonlySet<string> = new Set(['v3-1', 'v3-2']);
 
 export class GraphIndex {
     private readonly bySymbol: Map<string, GraphSymbolEntry>;
+    private readonly byPackage: Map<string, string[]>;
+    private readonly bySupertype: Map<string, string[]>;
     public readonly version: string;
     public readonly symbolCount: number;
+    public readonly packageCount: number;
+    public readonly supertypeCount: number;
 
-    private constructor(bySymbol: Map<string, GraphSymbolEntry>, version: string) {
+    private constructor(
+        bySymbol: Map<string, GraphSymbolEntry>,
+        byPackage: Map<string, string[]>,
+        bySupertype: Map<string, string[]>,
+        version: string,
+    ) {
         this.bySymbol = bySymbol;
+        this.byPackage = byPackage;
+        this.bySupertype = bySupertype;
         this.version = version;
         this.symbolCount = bySymbol.size;
+        this.packageCount = byPackage.size;
+        this.supertypeCount = bySupertype.size;
     }
 
     static load(filePath: string): GraphIndex | null {
@@ -37,6 +78,11 @@ export class GraphIndex {
             const parsed = JSON.parse(raw) as GraphPayload;
             if (!parsed || typeof parsed !== 'object') {
                 console.warn(`[GraphIndex] ⚠️ ${filePath}: payload is not an object`);
+                return null;
+            }
+            const version = typeof parsed.version === 'string' ? parsed.version : 'unknown';
+            if (!RECOGNIZED_GRAPH_VERSIONS.has(version)) {
+                console.warn(`[GraphIndex] ⚠️ graph schema version ${version} not recognized; expected one of [${Array.from(RECOGNIZED_GRAPH_VERSIONS).join(', ')}]; advanced pools disabled`);
                 return null;
             }
             const map = new Map<string, GraphSymbolEntry>();
@@ -52,8 +98,19 @@ export class GraphIndex {
                 if (canon.length === 0 && mentioned.length === 0) continue;
                 map.set(sym, { canonical_chunk_ids: canon, mentioned_by_chunk_ids: mentioned });
             }
-            const version = typeof parsed.version === 'string' ? parsed.version : 'unknown';
-            return new GraphIndex(map, version);
+            const byPackage = new Map<string, string[]>();
+            for (const [pkg, names] of Object.entries(parsed.by_package || {})) {
+                if (!Array.isArray(names)) continue;
+                const clean = names.filter((s): s is string => typeof s === 'string' && s.length > 0);
+                if (clean.length > 0) byPackage.set(pkg, clean);
+            }
+            const bySupertype = new Map<string, string[]>();
+            for (const [sup, names] of Object.entries(parsed.by_supertype || {})) {
+                if (!Array.isArray(names)) continue;
+                const clean = names.filter((s): s is string => typeof s === 'string' && s.length > 0);
+                if (clean.length > 0) bySupertype.set(sup, clean);
+            }
+            return new GraphIndex(map, byPackage, bySupertype, version);
         } catch (err) {
             console.warn(`[GraphIndex] ⚠️ failed to load ${filePath}: ${err}`);
             return null;
@@ -70,6 +127,29 @@ export class GraphIndex {
     lookupReverse(symbol: string): string[] {
         if (!symbol) return [];
         return this.bySymbol.get(symbol)?.mentioned_by_chunk_ids || [];
+    }
+
+    /** rag-graph-comparison-bridge: symbol_names in the same package bucket. */
+    lookupPackage(pkg: string): string[] {
+        if (!pkg) return [];
+        return this.byPackage.get(pkg) || [];
+    }
+
+    /** rag-graph-comparison-bridge: symbol_names that share a supertype. */
+    lookupSupertype(sup: string): string[] {
+        if (!sup) return [];
+        return this.bySupertype.get(sup) || [];
+    }
+
+    /** rag-graph-comparison-bridge: per-symbol metadata (package, supertypes). */
+    lookupSymbol(symbol: string): GraphSymbolEntry | undefined {
+        if (!symbol) return undefined;
+        return this.bySymbol.get(symbol);
+    }
+
+    /** True only when this index was loaded from a payload that carries v3-2 (or newer) keys. */
+    supportsComparisonBridge(): boolean {
+        return this.version === 'v3-2';
     }
 }
 
