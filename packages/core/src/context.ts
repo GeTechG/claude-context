@@ -19,9 +19,11 @@ import {
 } from './vectordb';
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
-import { classifyQuery, weightsForIntent, DomainWeights, parseQualifiedName } from './search/query-classifier';
+import { classifyQuery, weightsForIntent, DomainWeights, parseQualifiedName, parseSingleSymbol } from './search/query-classifier';
 import { buildSymbolFilter } from './search/symbol-routing';
 import { GraphIndex, collectGraphCandidateIds } from './search/graph-expansion';
+import { SerenaLspClient } from './search/serena-lsp-client';
+import { runSymbolRefsPool, SymbolRefsParsed } from './search/symbol-refs-pool';
 import { applyRewriting, RewriteFlags, RewriteResult } from './search/query-rewrite';
 import { Reranker } from './reranker';
 import { extractCandidateSymbols } from './enrichment';
@@ -228,6 +230,10 @@ export class Context {
     // rag-graph-layer Phase 3.7: print the wiring banner exactly once per
     // collection so the MCP log is grep-able for the runtime mode.
     private graphStartupBannerLogged = new Set<string>();
+    // rag-symbol-refs-lsp-pool: lazy-init Serena LSP client (one per
+    // Context instance, reused across queries). Created on the first
+    // pool activation and reused to amortise the SSE handshake.
+    private symbolRefsLspClient: SerenaLspClient | null = null;
 
     constructor(config: ContextConfig = {}) {
         // Initialize services
@@ -506,7 +512,12 @@ export class Context {
             })
             : Promise.resolve([] as HybridSearchResult[]);
 
-        const [codePool, docPool, symbolPool] = await Promise.all([
+        // rag-symbol-refs-lsp-pool: 4th retrieval channel via Serena LSP.
+        // Gated independently of symbol-routing — this pool finds references
+        // and implementations rather than co-located metadata matches.
+        const symbolRefsPoolPromise = this.runSymbolRefsPoolForSubject(subject, intent, codebasePath, collectionName);
+
+        const [codePool, docPool, symbolPool, symbolRefsPool] = await Promise.all([
             this.vectorDatabase.hybridSearch(
                 collectionName,
                 this.buildHybridRequests(queryEmbedding, subject, sparseExtra, perPoolK),
@@ -524,9 +535,10 @@ export class Context {
                 return [] as HybridSearchResult[];
             }),
             symbolPoolPromise,
+            symbolRefsPoolPromise,
         ]);
 
-        console.log(`[Context] 🔍 Pool sizes for "${subject}": code=${codePool.length} doc=${docPool.length} symbol=${symbolPool.length}`);
+        console.log(`[Context] 🔍 Pool sizes for "${subject}": code=${codePool.length} doc=${docPool.length} symbol=${symbolPool.length} symbolRefs=${symbolRefsPool.length}`);
 
         const SYMBOL_POOL_WEIGHT = 2.0;
         const mergePools: { results: HybridSearchResult[]; weight: number }[] = [
@@ -536,8 +548,66 @@ export class Context {
         if (symbolPool.length > 0) {
             mergePools.push({ results: symbolPool, weight: SYMBOL_POOL_WEIGHT });
         }
+        // Pool participates in the merge even when weight is 0, so callers
+        // can A/B "compute but ignore" via SYMBOL_REFS_POOL_WEIGHT=0.
+        if (symbolRefsPool.length > 0 && this.getSymbolRefsPool()) {
+            mergePools.push({ results: symbolRefsPool, weight: this.getSymbolRefsPoolWeight() });
+        }
         const mergedPreGraph = this.weightedRrfMerge(mergePools, mergeLimit, this.getRrfK());
         return { mergedPreGraph, mergePools, codePool, docPool, symbolPool };
+    }
+
+    /**
+     * rag-symbol-refs-lsp-pool: build the 4th pool by walking LSP
+     * declaration → references + implementations from the Serena daemon.
+     * Returns [] when any activation gate fails (env off, no parse, vocab
+     * miss, daemon unreachable). Never throws — pool degrades to no-op so
+     * the other 3 pools continue to serve.
+     */
+    private async runSymbolRefsPoolForSubject(
+        subject: string,
+        intent: { codeSignal: boolean; docSignal: boolean },
+        codebasePath: string,
+        collectionName: string,
+    ): Promise<HybridSearchResult[]> {
+        if (!this.getSymbolRefsPool()) return [];
+        if (!intent.codeSignal) return [];
+        const qualified = parseQualifiedName(subject);
+        let parsed: SymbolRefsParsed | null = qualified;
+        let vocab: ReadonlySet<string> | null = null;
+        try {
+            vocab = await this.loadSymbolVocabulary(codebasePath);
+        } catch (err) {
+            console.warn(`[Context] ⚠️ symbol-refs vocab load failed: ${err}`);
+            return [];
+        }
+        if (qualified) {
+            // Same vocab gate as the symbol-routing pool — at minimum the
+            // class component must be a known project symbol.
+            if (vocab && !vocab.has(qualified.className)) return [];
+        } else {
+            const single = parseSingleSymbol(subject, vocab);
+            if (!single) return [];
+            parsed = single;
+        }
+        if (!parsed) return [];
+        const lspClient = this.getOrCreateSymbolRefsLspClient(codebasePath);
+        try {
+            return await runSymbolRefsPool({
+                query: subject,
+                parsed,
+                lspClient,
+                vectorDatabase: this.vectorDatabase,
+                collection: collectionName,
+                codebasePath,
+                maxRefs: this.getSymbolRefsMaxReferences(),
+                maxImpls: this.getSymbolRefsMaxImplementations(),
+                rrfK: this.getRrfK(),
+            });
+        } catch (err) {
+            console.warn(`[Context] ⚠️ symbol-refs pool failed: ${err}`);
+            return [];
+        }
     }
 
     /**
@@ -642,6 +712,49 @@ export class Context {
 
     private getGraphSeedK(): number {
         return this.getPositiveIntFromEnv('GRAPH_SEED_K', DEFAULT_GRAPH_SEED_K);
+    }
+
+    // ---- rag-symbol-refs-lsp-pool: env getters --------------------------
+
+    private getSymbolRefsPool(): boolean {
+        return (envManager.get('SYMBOL_REFS_POOL') || 'false').toLowerCase() === 'true';
+    }
+
+    private getSymbolRefsPoolWeight(): number {
+        const raw = this.getNonNegativeFloatFromEnv('SYMBOL_REFS_POOL_WEIGHT', 1.0);
+        return Math.min(raw, 3.0);
+    }
+
+    private getSymbolRefsLspBaseUrl(): string | undefined {
+        const raw = (envManager.get('SYMBOL_REFS_LSP_BASE_URL') || '').trim();
+        return raw.length > 0 ? raw : undefined;
+    }
+
+    private getSymbolRefsLspTimeoutMs(): number {
+        return this.getPositiveIntFromEnv('SYMBOL_REFS_LSP_TIMEOUT_MS', 1500);
+    }
+
+    private getSymbolRefsMaxReferences(): number {
+        return this.getPositiveIntFromEnv('SYMBOL_REFS_MAX_REFERENCES', 20);
+    }
+
+    private getSymbolRefsMaxImplementations(): number {
+        return this.getPositiveIntFromEnv('SYMBOL_REFS_MAX_IMPLEMENTATIONS', 10);
+    }
+
+    /**
+     * Lazy-init the SerenaLspClient on first activation. Reused across
+     * subsequent queries; the client itself caches the daemon URL for 30s
+     * and the SSE connection for the process lifetime.
+     */
+    private getOrCreateSymbolRefsLspClient(codebasePath: string): SerenaLspClient {
+        if (!this.symbolRefsLspClient) {
+            this.symbolRefsLspClient = new SerenaLspClient(codebasePath, {
+                baseUrlOverride: this.getSymbolRefsLspBaseUrl(),
+                timeoutMs: this.getSymbolRefsLspTimeoutMs(),
+            });
+        }
+        return this.symbolRefsLspClient;
     }
 
     /**

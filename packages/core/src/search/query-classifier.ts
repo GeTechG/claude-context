@@ -132,6 +132,53 @@ const QNAME_DOT = new RegExp(`^${COMPONENT.source}(?:\\.${COMPONENT.source})+$`)
 const QNAME_COLON = new RegExp(`^${COMPONENT.source}(?:::${COMPONENT.source})+$`);
 const QNAME_SLASH = new RegExp(`^${COMPONENT.source}(?:/${COMPONENT.source})+$`);
 
+// rag-symbol-refs-lsp-pool D5: single-identifier symbol parser used as a
+// fallback gate when `parseQualifiedName` returns null but the query still
+// contains a recognisable symbol token (e.g. "BytesBuffer", "Hmac").
+//
+// Behaviour:
+//   1. Extract candidate tokens via `extractCodeTokens` (Unicode word regex).
+//   2. Keep only tokens present in the per-codebase symbol vocabulary.
+//   3. Drop matches shorter than 4 characters (stop-word guard — `data`
+//      and `result` are vocab-listed but not distinctive).
+//   4. Pick the most distinctive remaining token: longest first, with
+//      PascalCase as tiebreak (these are most often the class subjects
+//      the LSP pool can fan out from).
+//
+// Caller convention: only invoke this when `parseQualifiedName` already
+// returned null — otherwise the structured form is preferred.
+
+const MIN_SINGLE_SYMBOL_LEN = 4;
+const CODE_TOKEN = /[\p{L}_][\p{L}\p{N}_]*/gu;
+
+export interface SingleSymbol {
+    symbolName: string;
+}
+
+export function extractCodeTokens(query: string): string[] {
+    if (!query) return [];
+    const matches = query.match(CODE_TOKEN);
+    return matches ? Array.from(matches) : [];
+}
+
+export function parseSingleSymbol(
+    query: string,
+    vocab: ReadonlySet<string> | null | undefined,
+): SingleSymbol | null {
+    if (!query || !vocab || vocab.size === 0) return null;
+    const tokens = extractCodeTokens(query);
+    if (tokens.length === 0) return null;
+    const matched = tokens.filter((t) => t.length >= MIN_SINGLE_SYMBOL_LEN && vocab.has(t));
+    if (matched.length === 0) return null;
+    matched.sort((a, b) => {
+        if (a.length !== b.length) return b.length - a.length;
+        const aPascal = /^[A-Z]/.test(a) ? 0 : 1;
+        const bPascal = /^[A-Z]/.test(b) ? 0 : 1;
+        return aPascal - bPascal;
+    });
+    return { symbolName: matched[0] };
+}
+
 export function parseQualifiedName(query: string): ParsedQName | null {
     if (!query) return null;
     const trimmed = query.trim();

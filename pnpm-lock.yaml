@@ -145,6 +145,9 @@ importers:
       '@google/genai':
         specifier: ^1.9.0
         version: 1.9.0(@modelcontextprotocol/sdk@1.12.1)
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.12.1
+        version: 1.12.1
       '@zilliz/milvus2-sdk-node':
         specifier: ^2.5.10
         version: 2.5.10
