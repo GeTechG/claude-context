@@ -57,12 +57,33 @@ export interface SymbolRefsPoolOptions {
     maxImpls: number;
     /** RRF k-smoothing constant for the per-pool score (mirrors weightedRrfMerge). */
     rrfK?: number;
+    /**
+     * rag-symbol-refs-multi-hop: maximum LSP expansion depth.
+     *  - `1` (default): only declaration + direct refs/impls (hop-1 baseline).
+     *  - `2`: after hop-1, run `findReferencingSymbols` on top hop-1 chunks
+     *         (refs-of-refs) with fan-out caps `maxHop1Seeds` × `maxHop2Refs`.
+     * Values outside `{1, 2}` are clamped by the caller.
+     */
+    maxHops?: number;
+    /**
+     * rag-symbol-refs-multi-hop: cap on hop-1 chunks used as seeds for hop-2.
+     * Applies only when `maxHops >= 2`. Default 3.
+     */
+    maxHop1Seeds?: number;
+    /**
+     * rag-symbol-refs-multi-hop: cap on references per hop-1 seed on hop-2.
+     * Applies only when `maxHops >= 2`. Default 3.
+     */
+    maxHop2Refs?: number;
 }
 
 const DEFAULT_RRF_K = 60;
 const TOTAL_CHUNK_CAP = 30;
 const MAX_DECL_FOR_FANOUT = 1;
 const PER_LOCATION_CHUNK_LIMIT = 5;
+// rag-symbol-refs-multi-hop: stop-word guard, mirrored from parseSingleSymbol.
+// hop-1 chunks whose `symbol_name` is shorter are not promoted to hop-2 seeds.
+const HOP2_SEED_MIN_SYMBOL_LEN = 4;
 
 const HYBRID_OUTPUT_FIELDS = [
     'id', 'content', 'relativePath', 'startLine', 'endLine', 'fileExtension', 'metadata',
@@ -97,11 +118,6 @@ function toRelative(codebasePath: string, filePath: string): string {
     return filePath;
 }
 
-interface RankedLocation {
-    location: Location;
-    rank: number;
-}
-
 interface OrderedDocument {
     rank: number;
     document: VectorDocument;
@@ -109,6 +125,9 @@ interface OrderedDocument {
 
 export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<HybridSearchResult[]> {
     const rrfK = opts.rrfK && opts.rrfK > 0 ? opts.rrfK : DEFAULT_RRF_K;
+    const maxHops = opts.maxHops && opts.maxHops >= 2 ? 2 : 1;
+    const maxHop1Seeds = opts.maxHop1Seeds && opts.maxHop1Seeds > 0 ? opts.maxHop1Seeds : 3;
+    const maxHop2Refs = opts.maxHop2Refs && opts.maxHop2Refs > 0 ? opts.maxHop2Refs : 3;
 
     const lspName = topLevelSymbolName(opts.parsed);
     const callPath = namePathFor(opts.parsed);
@@ -136,14 +155,16 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
     }
 
     if (declChunks.length === 0 && refs.length === 0 && impls.length === 0) {
-        console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=0, refs=0, impls=0 → 0 chunks`);
+        console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=0, refs=0, impls=0, hop2=0 → 0 chunks`);
         return [];
     }
 
     // Rank: decl-chunks first (already deduped + canonical), then ref
-    // locations, then impl locations. dedupe by chunk_id across all.
+    // locations, then impl locations, then hop-2 refs-of-refs. Dedupe by
+    // chunk_id across all hops via `seenIds`.
     const orderedChunkIds: string[] = [];
     const seenIds = new Set<string>();
+    const declIdCount = declChunks.length;
     for (const d of declChunks) {
         if (!seenIds.has(d.id)) {
             seenIds.add(d.id);
@@ -151,15 +172,12 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
         }
     }
 
-    const refLocations: RankedLocation[] = [];
-    let nextRank = orderedChunkIds.length + 1;
-    for (const loc of refs) refLocations.push({ location: loc, rank: nextRank++ });
-    for (const loc of impls) refLocations.push({ location: loc, rank: nextRank++ });
-
-    for (const r of refLocations) {
+    const hop1Locations: Location[] = [...refs, ...impls];
+    const hop1NewIds: string[] = [];
+    for (const loc of hop1Locations) {
         if (orderedChunkIds.length >= TOTAL_CHUNK_CAP) break;
         const chunkIds = await locationToChunkIds(
-            r.location,
+            loc,
             opts.vectorDatabase,
             opts.collection,
             opts.codebasePath,
@@ -168,13 +186,64 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
             if (!seenIds.has(id)) {
                 seenIds.add(id);
                 orderedChunkIds.push(id);
+                hop1NewIds.push(id);
                 if (orderedChunkIds.length >= TOTAL_CHUNK_CAP) break;
             }
         }
     }
 
+    // rag-symbol-refs-multi-hop: hop-2 expansion. Seeds are top hop-1 chunks
+    // (in pool-rank order) whose `symbol_name` passes the stop-word guard.
+    // Hop-2 fail/timeout degrades gracefully — pool still returns hop-0 + hop-1.
+    let hop2CountAdded = 0;
+    if (maxHops >= 2 && hop1NewIds.length > 0 && orderedChunkIds.length < TOTAL_CHUNK_CAP) {
+        // Hydrate hop-1 docs (id + symbol_name + relativePath) to pick eligible seeds.
+        // We hydrate the full ordered list once at the end anyway; here we issue a
+        // cheap projection query just for the hop-1 ids we just added.
+        const seedDocs = await fetchSeedMetadata(opts.vectorDatabase, opts.collection, hop1NewIds);
+        const eligibleSeeds = seedDocs
+            .filter((d) => typeof d.symbolName === 'string' && d.symbolName.length >= HOP2_SEED_MIN_SYMBOL_LEN
+                && typeof d.relativePath === 'string' && d.relativePath.length > 0)
+            .slice(0, maxHop1Seeds);
+
+        if (eligibleSeeds.length > 0) {
+            const hop2Results = await Promise.allSettled(
+                eligibleSeeds.map((seed) =>
+                    opts.lspClient.findReferencingSymbols(seed.symbolName, seed.relativePath, maxHop2Refs),
+                ),
+            );
+            const hop2Locations: Location[] = [];
+            for (let i = 0; i < hop2Results.length; i++) {
+                const r = hop2Results[i];
+                if (r.status === 'fulfilled') {
+                    hop2Locations.push(...r.value);
+                } else {
+                    console.warn(`[Context] ⚠️ symbol-refs hop-2 failed for ${eligibleSeeds[i].symbolName}: ${r.reason}`);
+                }
+            }
+
+            for (const loc of hop2Locations) {
+                if (orderedChunkIds.length >= TOTAL_CHUNK_CAP) break;
+                const chunkIds = await locationToChunkIds(
+                    loc,
+                    opts.vectorDatabase,
+                    opts.collection,
+                    opts.codebasePath,
+                );
+                for (const id of chunkIds) {
+                    if (!seenIds.has(id)) {
+                        seenIds.add(id);
+                        orderedChunkIds.push(id);
+                        hop2CountAdded++;
+                        if (orderedChunkIds.length >= TOTAL_CHUNK_CAP) break;
+                    }
+                }
+            }
+        }
+    }
+
     if (orderedChunkIds.length === 0) {
-        console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declChunks.length}, refs=${refs.length}, impls=${impls.length} → 0 chunks (no Milvus matches)`);
+        console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, refs=${refs.length}, impls=${impls.length}, hop2=0 → 0 chunks (no Milvus matches)`);
         return [];
     }
 
@@ -184,8 +253,55 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
         score: 1 / (rrfK + d.rank),
     }));
 
-    console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declChunks.length}, refs=${refs.length}, impls=${impls.length} → ${results.length} chunks`);
+    const hop2LogPart = maxHops >= 2 ? `, hop2=${hop2CountAdded}` : '';
+    console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, refs=${refs.length}, impls=${impls.length}${hop2LogPart} → ${results.length} chunks`);
     return results;
+}
+
+interface SeedMetadata {
+    id: string;
+    symbolName: string;
+    relativePath: string;
+}
+
+/**
+ * rag-symbol-refs-multi-hop: project-only Milvus query to pull
+ * (id, symbol_name, relativePath) for hop-1 chunks so the caller can
+ * pick eligible hop-2 seeds without paying the full hydration cost yet.
+ * Falls back to empty on Milvus errors so hop-2 simply no-ops.
+ */
+async function fetchSeedMetadata(
+    vectorDatabase: VectorDatabase,
+    collection: string,
+    ids: string[],
+): Promise<SeedMetadata[]> {
+    const safe = ids.filter((id) => /^[A-Za-z0-9_-]+$/.test(id));
+    if (safe.length === 0) return [];
+    const filter = `id in [${safe.map((id) => `"${id}"`).join(',')}]`;
+    let rows: Record<string, any>[];
+    try {
+        rows = await vectorDatabase.query(collection, filter, ['id', 'symbol_name', 'relativePath'], safe.length);
+    } catch (err) {
+        console.warn(`[Context] ⚠️ symbol-refs hop-2 seed-metadata query failed: ${err}`);
+        return [];
+    }
+    // Preserve caller-side ordering so hop-2 seeds the highest-ranked hop-1 chunks first.
+    const byId = new Map<string, SeedMetadata>();
+    for (const row of rows) {
+        const id = row?.id;
+        if (typeof id !== 'string') continue;
+        byId.set(id, {
+            id,
+            symbolName: typeof row.symbol_name === 'string' ? row.symbol_name : '',
+            relativePath: typeof row.relativePath === 'string' ? row.relativePath : '',
+        });
+    }
+    const ordered: SeedMetadata[] = [];
+    for (const id of ids) {
+        const m = byId.get(id);
+        if (m) ordered.push(m);
+    }
+    return ordered;
 }
 
 interface DeclarationChunk {

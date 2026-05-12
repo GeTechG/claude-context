@@ -234,6 +234,9 @@ export class Context {
     // Context instance, reused across queries). Created on the first
     // pool activation and reused to amortise the SSE handshake.
     private symbolRefsLspClient: SerenaLspClient | null = null;
+    // rag-symbol-refs-multi-hop: print the symbol-refs pool wiring banner
+    // exactly once per process so the MCP log is grep-able for hop mode.
+    private symbolRefsStartupBannerLogged = false;
 
     constructor(config: ContextConfig = {}) {
         // Initialize services
@@ -572,6 +575,15 @@ export class Context {
     ): Promise<HybridSearchResult[]> {
         if (!this.getSymbolRefsPool()) return [];
         if (!intent.codeSignal) return [];
+        if (!this.symbolRefsStartupBannerLogged) {
+            const hops = this.getSymbolRefsMaxHops();
+            if (hops >= 2) {
+                console.log(`[Context] symbol-refs pool: maxHops=${hops} (hop2 seeds=${this.getSymbolRefsMaxHop1Seeds()}, refs=${this.getSymbolRefsMaxHop2Refs()})`);
+            } else {
+                console.log(`[Context] symbol-refs pool: single-hop only`);
+            }
+            this.symbolRefsStartupBannerLogged = true;
+        }
         const qualified = parseQualifiedName(subject);
         let parsed: SymbolRefsParsed | null = qualified;
         let vocab: ReadonlySet<string> | null = null;
@@ -603,6 +615,9 @@ export class Context {
                 maxRefs: this.getSymbolRefsMaxReferences(),
                 maxImpls: this.getSymbolRefsMaxImplementations(),
                 rrfK: this.getRrfK(),
+                maxHops: this.getSymbolRefsMaxHops(),
+                maxHop1Seeds: this.getSymbolRefsMaxHop1Seeds(),
+                maxHop2Refs: this.getSymbolRefsMaxHop2Refs(),
             });
         } catch (err) {
             console.warn(`[Context] ⚠️ symbol-refs pool failed: ${err}`);
@@ -740,6 +755,33 @@ export class Context {
 
     private getSymbolRefsMaxImplementations(): number {
         return this.getPositiveIntFromEnv('SYMBOL_REFS_MAX_IMPLEMENTATIONS', 10);
+    }
+
+    // ---- rag-symbol-refs-multi-hop: env getters -------------------------
+
+    private getSymbolRefsMaxHops(): number {
+        const raw = envManager.get('SYMBOL_REFS_MAX_HOPS');
+        if (!raw) return 1;
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 1) {
+            console.warn(`[Context] ⚠️ Ignoring invalid SYMBOL_REFS_MAX_HOPS=${raw}; expected integer >= 1, falling back to 1`);
+            return 1;
+        }
+        if (n > 2) {
+            console.warn(`[Context] ⚠️ SYMBOL_REFS_MAX_HOPS=${n} clamped to 2 (3+ hops not implemented)`);
+            return 2;
+        }
+        return n;
+    }
+
+    private getSymbolRefsMaxHop1Seeds(): number {
+        const n = this.getPositiveIntFromEnv('SYMBOL_REFS_MAX_HOP1_SEEDS', 3);
+        return Math.min(Math.max(n, 1), 10);
+    }
+
+    private getSymbolRefsMaxHop2Refs(): number {
+        const n = this.getPositiveIntFromEnv('SYMBOL_REFS_MAX_HOP2_REFS', 3);
+        return Math.min(Math.max(n, 1), 10);
     }
 
     /**
