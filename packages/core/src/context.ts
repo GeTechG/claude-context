@@ -20,6 +20,7 @@ import {
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
 import { classifyQuery, weightsForIntent, DomainWeights, parseQualifiedName, parseSingleSymbol, isComparisonShape } from './search/query-classifier';
+import { routeQuery, ChannelWeights, QueryShape } from './search/query-router';
 import { buildSymbolFilter } from './search/symbol-routing';
 import { GraphIndex, collectGraphCandidateIds, derivePackageFromPath } from './search/graph-expansion';
 import { buildComparisonBridgePool } from './search/comparison-bridge';
@@ -484,6 +485,7 @@ export class Context {
         filterExpr: string | undefined,
         perPoolK: number,
         mergeLimit: number,
+        channelWeights?: ChannelWeights,
     ): Promise<{
         mergedPreGraph: HybridSearchResult[];
         mergePools: { results: HybridSearchResult[]; weight: number }[];
@@ -512,7 +514,8 @@ export class Context {
             : DOC_DOMAIN_FILTER;
 
         const innerRerank = this.buildInnerRerankStrategy(
-            !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0)
+            !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0),
+            channelWeights,
         );
 
         const symbolPoolLimit = 10;
@@ -923,6 +926,23 @@ export class Context {
     }
 
     /**
+     * knowledge-router: QUERY_ROUTER_CHANNEL_WEIGHTS — when true, the inner
+     * per-channel ranker weights become a function of the query's
+     * lexical_form. Default false → static Phase-4 channel defaults.
+     */
+    private getQueryRouterChannelWeights(): boolean {
+        return (envManager.get('QUERY_ROUTER_CHANNEL_WEIGHTS') || 'false').toLowerCase() === 'true';
+    }
+
+    /**
+     * knowledge-router: CONCEPT_SPAN_QUOTA — when true, concept-shaped
+     * queries get a post-reranker content-type quota. Default false.
+     */
+    private getConceptSpanQuota(): boolean {
+        return (envManager.get('CONCEPT_SPAN_QUOTA') || 'false').toLowerCase() === 'true';
+    }
+
+    /**
      * Build the Milvus inner-rerank strategy for the per-pool 3-channel
      * hybrid_search. If any CHANNEL_WEIGHT_* env var is set, switches to
      * Milvus 'weighted' ranker with weights aligned to buildRequests order:
@@ -931,8 +951,23 @@ export class Context {
      *
      * `hasLearnedSparse` reflects whether the third channel is included in
      * this particular request (some queries have no learned-sparse vector).
+     *
+     * knowledge-router: when `channelWeights` is supplied (router active via
+     * QUERY_ROUTER_CHANNEL_WEIGHTS), it overrides the env-static
+     * CHANNEL_WEIGHT_* path with a per-query lexical-form triplet.
      */
-    private buildInnerRerankStrategy(hasLearnedSparse: boolean): RerankStrategy {
+    private buildInnerRerankStrategy(
+        hasLearnedSparse: boolean,
+        channelWeights?: ChannelWeights,
+    ): RerankStrategy {
+        if (channelWeights) {
+            // Weights aligned to buildRequests channel order:
+            // [dense, sparse_bm25, sparse_learned].
+            const weights = hasLearnedSparse
+                ? [channelWeights.dense, channelWeights.sparse_bm25, channelWeights.sparse_learned]
+                : [channelWeights.dense, channelWeights.sparse_bm25];
+            return { strategy: 'weighted', params: { weights } };
+        }
         const dense = envManager.get('CHANNEL_WEIGHT_DENSE');
         const bm25 = envManager.get('CHANNEL_WEIGHT_SPARSE_BM25');
         const learned = envManager.get('CHANNEL_WEIGHT_SPARSE_LEARNED');
@@ -1236,7 +1271,13 @@ export class Context {
      * @param topK Number of results to return
      * @param threshold Similarity threshold
      */
-    async semanticSearch(codebasePath: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string): Promise<SemanticSearchResult[]> {
+    /**
+     * @param queryShape knowledge-router: optional ground-truth query_shape
+     *   hint (the eval harness passes the gold-set label). Production callers
+     *   omit it; the concept-span quota then stays a no-op since routeQuery
+     *   cannot infer `concept` from the deterministic classifiers.
+     */
+    async semanticSearch(codebasePath: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string, queryShape?: string): Promise<SemanticSearchResult[]> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath}`);
@@ -1272,6 +1313,27 @@ export class Context {
             // The helper recomputes intent per-subject for split fan-out — the
             // outer intent reflects the original (unsplit) query.
             const intent = classifyQuery(query);
+
+            // knowledge-router: aggregate every per-query routing decision in
+            // one place so it is visible in diagnostics and the eval dump.
+            const channelWeightsEnabled = this.getQueryRouterChannelWeights();
+            const conceptQuotaEnabled = this.getConceptSpanQuota();
+            const route = routeQuery(query, {
+                shapeHint: queryShape as QueryShape | undefined,
+                channelWeightsEnabled,
+                conceptQuotaEnabled,
+            });
+            // Only thread channel weights into the pipeline when the flag is
+            // on; otherwise `undefined` keeps buildInnerRerankStrategy on the
+            // env-static path (byte-identical pre-change behaviour).
+            const routedChannelWeights = channelWeightsEnabled ? route.channelWeights : undefined;
+            const cw = route.channelWeights;
+            console.log(
+                `[query-router] lexical_form=${route.lexical_form} query_shape=${route.query_shape} ` +
+                `channelWeights=${channelWeightsEnabled ? `${cw.dense}/${cw.sparse_learned}/${cw.sparse_bm25}` : 'static-default'} ` +
+                `conceptQuota=${route.conceptQuota}`,
+            );
+
             const multiQuery = this.getMultiQuery();
             const rerankerInputK = this.hasReranker() ? this.getRerankerInputK() : 0;
             const PER_POOL_K = Math.max(topK * 5, 25, rerankerInputK);
@@ -1306,6 +1368,7 @@ export class Context {
                             filterExpr,
                             PER_POOL_K,
                             mergeLimit,
+                            routedChannelWeights,
                         ),
                         this.runSubjectHybridPipeline(
                             rewrite.right,
@@ -1315,6 +1378,7 @@ export class Context {
                             filterExpr,
                             PER_POOL_K,
                             mergeLimit,
+                            routedChannelWeights,
                         ),
                     ]);
                     mergedPreGraph = this.weightedRrfMerge(
@@ -1341,6 +1405,7 @@ export class Context {
                         filterExpr,
                         PER_POOL_K,
                         mergeLimit,
+                        routedChannelWeights,
                     );
                     mergedPreGraph = single.mergedPreGraph;
                     mergePools = single.mergePools;
@@ -1464,7 +1529,8 @@ export class Context {
                 const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
                 console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
                 const innerRerank = this.buildInnerRerankStrategy(
-                    !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0)
+                    !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0),
+                    routedChannelWeights,
                 );
                 const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
                     collectionName,
@@ -1522,11 +1588,19 @@ export class Context {
                 console.log(`[Context] ⏭️  reranker bypassed for qualified-name code query "${query}"`);
             }
 
-            if (finalResults.length > 0) {
-                console.log(`[Context] 🔍 Top result score: ${finalResults[0].score}, path: ${finalResults[0].relativePath}`);
+            // knowledge-router: concept-span content-type quota. Runs AFTER
+            // the reranker (unlike applyGuaranteeSlots, which is off when a
+            // reranker is active) and only for query_shape=concept. No-op
+            // when the quota is disabled or the route is not concept-shaped.
+            const quotaResults = route.conceptQuota
+                ? this.applyConceptSpanQuota(finalResults, dedupedResults, topK)
+                : finalResults;
+
+            if (quotaResults.length > 0) {
+                console.log(`[Context] 🔍 Top result score: ${quotaResults[0].score}, path: ${quotaResults[0].relativePath}`);
             }
-            await this.attachCandidateSymbols(finalResults, codebasePath);
-            return finalResults;
+            await this.attachCandidateSymbols(quotaResults, codebasePath);
+            return quotaResults;
         } else {
             // Regular semantic search
             // 1. Generate query vector
@@ -1881,6 +1955,77 @@ export class Context {
         // the call-site will trim it down).
         const remainder = window.slice(topK);
         return top.concat(remainder).concat(tail);
+    }
+
+    /**
+     * knowledge-router: concept-span content-type quota. For
+     * query_shape=concept, guarantee the post-reranker top-N spans >=2
+     * distinct content_types from {doc, code, code_example}.
+     *
+     * Unlike applyGuaranteeSlots (disabled when a reranker is active), this
+     * runs AFTER the reranker and perturbs its order minimally: it promotes
+     * exactly ONE chunk of a missing content_type — the highest-RRF-ranked
+     * such candidate — evicting the lowest-ranked chunk of the
+     * over-represented type. No-op when the top-N already spans >=2 types or
+     * no candidate of a missing type exists anywhere in the pool.
+     *
+     * `candidatePool` is the pre-rerank merged+deduped pool, in weighted-RRF
+     * order — the best available rank for candidates that did not survive
+     * into the reranked top-N.
+     */
+    private applyConceptSpanQuota(
+        finalResults: SemanticSearchResult[],
+        candidatePool: SemanticSearchResult[],
+        topK: number,
+    ): SemanticSearchResult[] {
+        const SPAN_TYPES = new Set(['doc', 'code', 'code_example']);
+        const top = finalResults.slice(0, topK);
+
+        const present = new Set<string>();
+        for (const r of top) {
+            const ct = r.content_type || '';
+            if (SPAN_TYPES.has(ct)) present.add(ct);
+        }
+        if (present.size >= 2) {
+            return finalResults;
+        }
+
+        const dedupKey = (r: SemanticSearchResult) => `${r.relativePath}#${r.startLine}-${r.endLine}`;
+        const inTop = new Set(top.map(dedupKey));
+
+        // Highest-RRF-ranked candidate of a span-type not yet represented.
+        const promote = candidatePool.find((r) => {
+            const ct = r.content_type || '';
+            return SPAN_TYPES.has(ct) && !present.has(ct) && !inTop.has(dedupKey(r));
+        });
+        if (!promote) {
+            console.log('[concept-quota] no candidate of a missing content_type — top-N unchanged');
+            return finalResults;
+        }
+
+        // Evict the lowest-ranked chunk of the over-represented span-type;
+        // fall back to the last slot when the top-N has no span-type chunk
+        // (e.g. all `docstring`) so the promoted type still enters top-N.
+        let evictIdx = -1;
+        for (let i = top.length - 1; i >= 0; i--) {
+            const ct = top[i].content_type || '';
+            if (SPAN_TYPES.has(ct) && present.has(ct)) { evictIdx = i; break; }
+        }
+        if (evictIdx === -1) {
+            evictIdx = top.length - 1;
+        }
+        if (evictIdx < 0) {
+            return finalResults;
+        }
+
+        const result = [...top];
+        const evicted = result[evictIdx];
+        result[evictIdx] = promote;
+        console.log(
+            `[concept-quota] promoted ${promote.content_type} chunk ${dedupKey(promote)} ` +
+            `→ slot ${evictIdx + 1}, evicted ${evicted.content_type} ${dedupKey(evicted)}`,
+        );
+        return result;
     }
 
     /**

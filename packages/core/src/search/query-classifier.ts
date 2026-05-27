@@ -69,6 +69,26 @@ const MIN_WORDS_FOR_DOC = 3;
 
 const NL_WORD = /\b[A-Za-z]{3,}\b/g;
 
+// Count natural-language words of length >= MIN_WORD_LEN. PascalCase /
+// camelCase tokens still match \b[A-Za-z]{3,}\b so we subtract anything
+// that looks code-shaped. Shared by docSignal (classifyQuery) and the
+// lexical-form axis (classifyLexicalForm) so the two stay calibrated to
+// the same notion of "natural-language word".
+function countPlainWords(trimmed: string): number {
+    const nlWords = trimmed.match(NL_WORD) || [];
+    const plainWords = nlWords.filter((w) => {
+        if (CAMEL_CASE.test(w)) return false;
+        if (PASCAL_CASE.test(w)) return false;
+        if (SNAKE_CASE.test(w)) return false;
+        // PascalCase single tokens like "Reflect" without inner caps look
+        // like a real symbol if they're capitalized AND the query is short
+        // (single-symbol lookup).
+        if (/^[A-Z]/.test(w) && nlWords.length <= 2) return false;
+        return true;
+    });
+    return plainWords.length;
+}
+
 export function classifyQuery(query: string): QueryIntent {
     if (!query || query.trim().length === 0) {
         return { codeSignal: false, docSignal: false };
@@ -83,23 +103,71 @@ export function classifyQuery(query: string): QueryIntent {
         }
     }
 
-    // Count natural-language words of length >= MIN_WORD_LEN. PascalCase /
-    // camelCase tokens still match \b[A-Za-z]{3,}\b so we need to subtract
-    // anything that looks code-shaped.
-    const nlWords = trimmed.match(NL_WORD) || [];
-    const plainWords = nlWords.filter((w) => {
-        if (CAMEL_CASE.test(w)) return false;
-        if (PASCAL_CASE.test(w)) return false;
-        if (SNAKE_CASE.test(w)) return false;
-        // PascalCase single tokens like "Reflect" without inner caps look
-        // like a real symbol if they're capitalized AND the query is short
-        // (single-symbol lookup).
-        if (/^[A-Z]/.test(w) && nlWords.length <= 2) return false;
-        return true;
-    });
-    const docSignal = plainWords.length >= MIN_WORDS_FOR_DOC;
+    const docSignal = countPlainWords(trimmed) >= MIN_WORDS_FOR_DOC;
 
     return { codeSignal, docSignal };
+}
+
+// knowledge-router: lexical-form axis — orthogonal to {codeSignal, docSignal}.
+//
+// {codeSignal, docSignal} answers "which DOMAIN to hit" (code-pool vs
+// doc-pool). `lexical_form` answers "which CHANNEL carries the query"
+// (sparse/BM25 vs dense). The two axes are independent: a descriptive query
+// about code wants the code-pool but the dense channel; an identifier query
+// about code wants the code-pool and the sparse channel. Folding them into
+// one signal would lose exactly the identifier-vs-descriptive combination on
+// which the bipolar dense effect is observed (diagnostic 2026-05-23).
+//
+//   identifier  — dominated by a code token (qualified name, camelCase,
+//                 snake_case, PascalCase) with fewer than MIN_WORDS_FOR_DOC
+//                 natural-language words.
+//   descriptive — MIN_WORDS_FOR_DOC+ natural-language words and no
+//                 dominating code token.
+//   mixed       — both signals present (a descriptive query with an embedded
+//                 qualified name), or neither clearly present — the neutral
+//                 bucket that keeps the Phase-4 channel defaults.
+export type LexicalForm = 'identifier' | 'descriptive' | 'mixed';
+
+// Identifier-shaped tokens — the four "code token" regexes reused from the
+// codeSignal heuristics. CALL_PARENS / CODE_PUNCT / decorators / sigils are
+// deliberately excluded: those mark code *shape* but are not the literal
+// symbol token the BM25 channel keys off.
+const IDENTIFIER_TOKEN_REGEXES: RegExp[] = [
+    CAMEL_CASE,
+    PASCAL_CASE,
+    SNAKE_CASE,
+    QUALIFIED_NAME,
+];
+
+// Global variant of QUALIFIED_NAME for stripping. A dotted qualified name
+// (`haxe.Json.parse`) splits into components that each match NL_WORD —
+// `haxe`, `parse` look like lowercase prose words. Counting them would tip
+// a pure-symbol query into the descriptive/mixed buckets, so they are
+// removed before the natural-language word count (calibrated on the
+// gold-set, task 2.2).
+const QUALIFIED_NAME_GLOBAL = new RegExp(QUALIFIED_NAME.source, 'g');
+
+export function classifyLexicalForm(query: string): LexicalForm {
+    if (!query || query.trim().length === 0) {
+        return 'mixed';
+    }
+    const trimmed = query.trim();
+
+    const hasCodeToken = IDENTIFIER_TOKEN_REGEXES.some((rx) => rx.test(trimmed));
+    // Strip qualified-name tokens before counting NL words so their dotted
+    // components do not inflate the count (see QUALIFIED_NAME_GLOBAL above).
+    const nlWordCount = countPlainWords(trimmed.replace(QUALIFIED_NAME_GLOBAL, ' '));
+
+    if (hasCodeToken && nlWordCount < MIN_WORDS_FOR_DOC) {
+        return 'identifier';
+    }
+    if (!hasCodeToken && nlWordCount >= MIN_WORDS_FOR_DOC) {
+        return 'descriptive';
+    }
+    // Both signals (qualified name embedded in NL prose) or neither clearly
+    // present (short pure-NL query) — neutral bucket, Phase-4 channel
+    // defaults let weighted RRF arbitrate.
+    return 'mixed';
 }
 
 // Weight presets for weighted RRF merge:
