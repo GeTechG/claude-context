@@ -822,19 +822,45 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 implements: doc.implements ?? null,
                 mentioned_symbols: doc.mentioned_symbols ?? null,
             };
-            // Phase 4: only attach sparse_learned when present. Milvus expects
-            // dict form `{ "<index>": value }` for SPARSE_FLOAT_VECTOR fields
-            // when no function generates them.
-            if (doc.sparse_learned && doc.sparse_learned.indices.length > 0) {
+            // Phase 4 / code-collection-split: when the embedding provider
+            // exposes learned-sparse, the collection schema declares the
+            // non-nullable `sparse_learned` SPARSE_FLOAT_VECTOR field, so we
+            // MUST include it on every row — even when BGE-M3 emits zero
+            // indices for the chunk's text (typical for short identifier-
+            // only code chunks). Sending an empty dict `{}` satisfies
+            // Milvus's "got nil" check; pre-split builds happened to use a
+            // v3 schema that omitted the field entirely, so the previous
+            // "skip when empty" guard never surfaced as an insert failure.
+            if (doc.sparse_learned) {
                 row.sparse_learned = sparseToDict(doc.sparse_learned);
             }
             return row;
         });
 
-        await this.client.insert({
+        const resp: any = await this.client.insert({
             collection_name: collectionName,
             data: data,
         });
+
+        // code-collection-split: surface silent insert failures (the SDK
+        // returns a status object on schema/field validation errors instead
+        // of throwing). Before this guard, a chunk batch with a missing or
+        // malformed `sparse_learned` field would log nothing and quietly
+        // drop the entire batch on the floor.
+        const status = resp?.status;
+        if (status && status.code !== 0 && status.error_code !== 'Success') {
+            throw new Error(
+                `[MilvusDB] insertHybrid into '${collectionName}' failed: ` +
+                `${status.error_code || 'UnknownError'} (${status.code}): ${status.reason || 'no reason given'}`,
+            );
+        }
+        const errIndex = Array.isArray(resp?.err_index) ? resp.err_index : [];
+        if (errIndex.length > 0) {
+            throw new Error(
+                `[MilvusDB] insertHybrid into '${collectionName}' partially failed: ` +
+                `${errIndex.length}/${data.length} rows rejected (status=${status?.reason || 'unknown'})`,
+            );
+        }
     }
 
     async hybridSearch(collectionName: string, searchRequests: HybridSearchRequest[], options?: HybridSearchOptions): Promise<HybridSearchResult[]> {

@@ -416,6 +416,20 @@ export class Context {
     }
 
     /**
+     * code-collection-split: SPLIT_COLLECTIONS gate. When `true` the index
+     * is physically split into two typed Milvus collections:
+     *   - `hybrid_v6_prose_<hash>` for content_type IN ('doc', 'code_example')
+     *   - `hybrid_v6_code_<hash>`  for content_type IN ('code', 'docstring')
+     * Default `false` → legacy single-collection path (byte-identical to
+     * pre-change behavior), preserving warm rollback.
+     */
+    private getSplitCollections(): boolean {
+        const env = envManager.get('SPLIT_COLLECTIONS');
+        if (env === undefined || env === null) return false;
+        return env.toLowerCase() === 'true';
+    }
+
+    /**
      * rag-query-static-rewrite: per-feature env flags for the deterministic
      * query rewriters. All default to `false` until the per-feature bake-off
      * gates pass. Flags read lazily per call so .mcp.json edits propagate on
@@ -501,17 +515,33 @@ export class Context {
         const weights = weightsForIntent(intent);
         console.log(`[Context] 🔍 Subject intent: codeSignal=${intent.codeSignal} docSignal=${intent.docSignal} → weights code=${weights.code} doc=${weights.doc}`);
 
+        // code-collection-split: address resolution. In split mode each pool
+        // queries a different physically-typed collection — content_type
+        // filter becomes unnecessary on those pools (the collection IS the
+        // filter). In legacy mode addr.prose === addr.code === collectionName
+        // and the content_type filter still does its job.
+        const addr = this.getCollectionAddress(codebasePath);
         const combinedFilter = (extra: string | undefined): string => {
             if (!extra || extra.trim().length === 0) return '';
             return `(${extra})`;
         };
         const userFilter = filterExpr && filterExpr.trim().length > 0 ? filterExpr : undefined;
-        const codeExpr = userFilter
-            ? `${combinedFilter(userFilter)} and ${CODE_DOMAIN_FILTER}`
-            : CODE_DOMAIN_FILTER;
-        const docExpr = userFilter
-            ? `${combinedFilter(userFilter)} and ${DOC_DOMAIN_FILTER}`
-            : DOC_DOMAIN_FILTER;
+        const codeExpr = addr.isSplit
+            ? (userFilter ? combinedFilter(userFilter) : '')
+            : (userFilter
+                ? `${combinedFilter(userFilter)} and ${CODE_DOMAIN_FILTER}`
+                : CODE_DOMAIN_FILTER);
+        const docExpr = addr.isSplit
+            ? (userFilter ? combinedFilter(userFilter) : '')
+            : (userFilter
+                ? `${combinedFilter(userFilter)} and ${DOC_DOMAIN_FILTER}`
+                : DOC_DOMAIN_FILTER);
+        const codeCollection = addr.isSplit ? addr.code : collectionName;
+        const docCollection = addr.isSplit ? addr.prose : collectionName;
+        // Symbol-routing pool stays code-side: its filter targets
+        // code/docstring chunks by symbol_name. In split mode that lives
+        // entirely in the code-collection.
+        const symbolCollection = addr.isSplit ? addr.code : collectionName;
 
         const innerRerank = this.buildInnerRerankStrategy(
             !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0),
@@ -522,7 +552,7 @@ export class Context {
         const symbolFilterExpr = await this.buildSymbolPoolFilter(subject, intent, codebasePath);
         const symbolPoolPromise: Promise<HybridSearchResult[]> = symbolFilterExpr
             ? this.vectorDatabase.hybridSearch(
-                collectionName,
+                symbolCollection,
                 this.buildHybridRequests(queryEmbedding, subject, sparseExtra, symbolPoolLimit),
                 {
                     rerank: innerRerank,
@@ -538,21 +568,23 @@ export class Context {
         // rag-symbol-refs-lsp-pool: 4th retrieval channel via Serena LSP.
         // Gated independently of symbol-routing — this pool finds references
         // and implementations rather than co-located metadata matches.
-        const symbolRefsPoolPromise = this.runSymbolRefsPoolForSubject(subject, intent, codebasePath, collectionName);
+        // Pool reads chunks by symbol_name + filter `content_type in
+        // ['code','docstring']` → code-collection in split mode.
+        const symbolRefsPoolPromise = this.runSymbolRefsPoolForSubject(subject, intent, codebasePath, symbolCollection);
 
         const [codePool, docPool, symbolPool, symbolRefsPool] = await Promise.all([
             this.vectorDatabase.hybridSearch(
-                collectionName,
+                codeCollection,
                 this.buildHybridRequests(queryEmbedding, subject, sparseExtra, perPoolK),
-                { rerank: innerRerank, limit: perPoolK, filterExpr: codeExpr },
+                { rerank: innerRerank, limit: perPoolK, filterExpr: codeExpr || undefined },
             ).catch((err) => {
                 console.warn(`[Context] ⚠️ code-domain hybrid search failed: ${err}`);
                 return [] as HybridSearchResult[];
             }),
             this.vectorDatabase.hybridSearch(
-                collectionName,
+                docCollection,
                 this.buildHybridRequests(queryEmbedding, subject, sparseExtra, perPoolK),
-                { rerank: innerRerank, limit: perPoolK, filterExpr: docExpr },
+                { rerank: innerRerank, limit: perPoolK, filterExpr: docExpr || undefined },
             ).catch((err) => {
                 console.warn(`[Context] ⚠️ doc-domain hybrid search failed: ${err}`);
                 return [] as HybridSearchResult[];
@@ -896,9 +928,11 @@ export class Context {
             console.log('[Context] 🕸️  graph-expansion: disabled (GRAPH_EXPAND=0)');
             return;
         }
-        if (collectionVersion && collectionVersion !== 'v3') {
+        // code-collection-split: v6 carries the same graph schema (v3-3) as
+        // v3 — reindex regenerates side-files unchanged. Accept both.
+        if (collectionVersion && collectionVersion !== 'v3' && collectionVersion !== 'v6') {
             console.warn(
-                `[Context] ⚠️  GRAPH_EXPAND=${expand} requires COLLECTION_VERSION=v3; ` +
+                `[Context] ⚠️  GRAPH_EXPAND=${expand} requires COLLECTION_VERSION=v3 or v6; ` +
                 `current is "${collectionVersion}" — graph-expansion disabled`,
             );
             return;
@@ -998,30 +1032,107 @@ export class Context {
     }
 
     /**
-     * Generate collection name based on codebase path and hybrid mode
+     * Generate collection name based on codebase path and hybrid mode.
+     *
+     * In SPLIT_COLLECTIONS=false mode (legacy) → returns the single
+     * `hybrid_v3_code_chunks_<hash>`-style name used by all callers.
+     *
+     * In SPLIT_COLLECTIONS=true mode (v6+) → returns the **code-side**
+     * collection name (`hybrid_v6_code_<hash>`). Callers that need
+     * collection-aware routing MUST use `getCollectionAddress` to also
+     * obtain the prose-side collection name.
+     *
+     * The "legacy returns single, split returns code" convention keeps
+     * existing internal call-sites (synchronizer key, deleteFileChunks
+     * primary, log banners) byte-stable while enabling split-aware paths
+     * to use `getCollectionAddress`.
      */
     public getCollectionName(codebasePath: string): string {
+        const addr = this.getCollectionAddress(codebasePath);
+        return addr.isSplit ? addr.code : addr.legacy;
+    }
+
+    /**
+     * code-collection-split: returns the full collection-name set for the
+     * given codebase under the active SPLIT_COLLECTIONS / COLLECTION_VERSION
+     * env state.
+     *
+     *   - `isSplit=false`: prose === code === legacy (same name everywhere).
+     *   - `isSplit=true`:  prose / code are the two v6 collections.
+     *
+     * `legacy` is always the single-collection name (used by callers that
+     * have not been collection-split-ified — symbol-refs-pool, eval queries).
+     */
+    public getCollectionAddress(codebasePath: string): {
+        isSplit: boolean;
+        prose: string;
+        code: string;
+        legacy: string;
+    } {
         const isHybrid = this.getIsHybrid();
         const versionSegment = this.getCollectionVersionSegment();
-        const prefix = isHybrid === true ? `hybrid${versionSegment}_code_chunks` : `code_chunks${versionSegment}`;
         const normalizedPath = path.resolve(codebasePath);
         const pathHash = crypto.createHash('md5').update(normalizedPath).digest('hex').substring(0, 8);
 
-        // Overrides always keep the per-codebase `_<pathHash>` suffix so that multiple
-        // codebases indexed by the same MCP server can't collapse into one collection.
+        const legacyPrefix = isHybrid === true
+            ? `hybrid${versionSegment}_code_chunks`
+            : `code_chunks${versionSegment}`;
+
+        // Resolve override suffix once; it disambiguates by `<custom>_<pathHash>`
+        // appended to the prefix.
         const configOverride = this.getValidOverrideValue(this.collectionNameOverride);
-        if (configOverride) {
-            const suffix = this.sanitizeCollectionNameSuffix(configOverride, prefix, pathHash, 'Context config');
-            return `${prefix}_${suffix}`;
-        }
-
         const envOverride = this.getValidOverrideValue(envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE'));
-        if (envOverride) {
-            const suffix = this.sanitizeCollectionNameSuffix(envOverride, prefix, pathHash, 'CODE_CHUNKS_COLLECTION_NAME_OVERRIDE');
-            return `${prefix}_${suffix}`;
+        const overrideSource = configOverride
+            ? { value: configOverride, label: 'Context config' }
+            : envOverride
+                ? { value: envOverride, label: 'CODE_CHUNKS_COLLECTION_NAME_OVERRIDE' }
+                : null;
+
+        const buildName = (prefix: string): string => {
+            if (overrideSource) {
+                const suffix = this.sanitizeCollectionNameSuffix(overrideSource.value, prefix, pathHash, overrideSource.label);
+                return `${prefix}_${suffix}`;
+            }
+            return `${prefix}_${pathHash}`;
+        };
+
+        const legacy = buildName(legacyPrefix);
+
+        const isSplit = this.getSplitCollections() && isHybrid === true;
+        if (!isSplit) {
+            return { isSplit: false, prose: legacy, code: legacy, legacy };
         }
 
-        return `${prefix}_${pathHash}`;
+        // v6 split-mode prefixes (no `_code_chunks` segment).
+        const prosePrefix = `hybrid${versionSegment}_prose`;
+        const codePrefix = `hybrid${versionSegment}_code`;
+        return {
+            isSplit: true,
+            prose: buildName(prosePrefix),
+            code: buildName(codePrefix),
+            legacy,
+        };
+    }
+
+    /**
+     * code-collection-split: route a single chunk to its target collection
+     * by content_type. In legacy (non-split) mode every chunk lands in the
+     * same name → returns `addr.legacy`.
+     *
+     * The mapping mirrors the per-domain pool definitions:
+     *   - 'code', 'docstring'      → code-collection
+     *   - 'doc',  'code_example'   → prose-collection
+     *   - anything else            → code-collection (defensive default;
+     *     unknown content_types are extremely rare and we'd rather keep
+     *     them addressable as "code-side stuff" than lose them).
+     */
+    public resolveChunkCollection(
+        contentType: string | undefined,
+        addr: { isSplit: boolean; prose: string; code: string; legacy: string },
+    ): string {
+        if (!addr.isSplit) return addr.legacy;
+        if (contentType === 'doc' || contentType === 'code_example') return addr.prose;
+        return addr.code; // 'code', 'docstring', and any unknown fall here.
     }
 
     private getValidOverrideValue(value?: string): string | undefined {
@@ -1178,6 +1289,12 @@ export class Context {
         requestSplitter?: Splitter
     ): Promise<{ added: number, removed: number, modified: number }> {
         const collectionName = this.getCollectionName(codebasePath);
+        // code-collection-split: deletion set spans both v6 collections in
+        // split mode. The synchronizer key stays single (`collectionName`,
+        // which is the code-collection in split mode and the legacy name
+        // otherwise) so file-modification detection is path-stable.
+        const addr = this.getCollectionAddress(codebasePath);
+        const deletionTargets = addr.isSplit ? [addr.prose, addr.code] : [collectionName];
         const synchronizer = this.synchronizers.get(collectionName);
         const splitter = requestSplitter || this.codeSplitter;
 
@@ -1216,13 +1333,13 @@ export class Context {
 
         // Handle removed files
         for (const file of removed) {
-            await this.deleteFileChunks(collectionName, file);
+            await this.deleteFileChunks(deletionTargets, file);
             updateProgress(`Removed ${file}`);
         }
 
         // Handle modified files
         for (const file of modified) {
-            await this.deleteFileChunks(collectionName, file);
+            await this.deleteFileChunks(deletionTargets, file);
             updateProgress(`Deleted old chunks for ${file}`);
         }
 
@@ -1246,20 +1363,32 @@ export class Context {
         return { added: added.length, removed: removed.length, modified: modified.length };
     }
 
-    private async deleteFileChunks(collectionName: string, relativePath: string): Promise<void> {
-        // Escape backslashes for Milvus query expression (Windows path compatibility)
+    /**
+     * Delete chunks for a single file across the active collection set.
+     *
+     * code-collection-split: in split mode a file's chunks may straddle
+     * both collections (an .md file emits doc → prose AND code_example
+     * → prose; an .hx file with docstrings emits code + docstring → code
+     * — same file might also have an inline doc fragment, etc.). We probe
+     * each provided target, so callers that already resolved the full
+     * split set pass both; the legacy path passes a single name.
+     */
+    private async deleteFileChunks(collectionNames: string | string[], relativePath: string): Promise<void> {
+        const targets = Array.isArray(collectionNames) ? collectionNames : [collectionNames];
         const escapedPath = relativePath.replace(/\\/g, '\\\\');
-        const results = await this.vectorDatabase.query(
-            collectionName,
-            `relativePath == "${escapedPath}"`,
-            ['id']
-        );
+        for (const target of targets) {
+            const results = await this.vectorDatabase.query(
+                target,
+                `relativePath == "${escapedPath}"`,
+                ['id']
+            );
 
-        if (results.length > 0) {
-            const ids = results.map(r => r.id as string).filter(id => id);
-            if (ids.length > 0) {
-                await this.vectorDatabase.delete(collectionName, ids);
-                console.log(`[Context] Deleted ${ids.length} chunks for file ${relativePath}`);
+            if (results.length > 0) {
+                const ids = results.map(r => r.id as string).filter(id => id);
+                if (ids.length > 0) {
+                    await this.vectorDatabase.delete(target, ids);
+                    console.log(`[Context] Deleted ${ids.length} chunks for file ${relativePath} (${target})`);
+                }
             }
         }
     }
@@ -1424,14 +1553,23 @@ export class Context {
                 this.logGraphStartupBanner(collectionName, codebasePath);
                 const graphExpand = this.getGraphExpand();
                 const collectionVersion = (envManager.get('COLLECTION_VERSION') || '').trim().toLowerCase();
-                const v3Compatible = !collectionVersion || collectionVersion === 'v3';
+                // code-collection-split: v6 retains the v3 graph-schema
+                // (v3-3) so all downstream graph paths (expansion +
+                // comparison-bridge) accept both versions.
+                const v3Compatible = !collectionVersion || collectionVersion === 'v3' || collectionVersion === 'v6';
                 if (graphExpand >= 1 && v3Compatible) {
                     const graphIndex = this.loadGraphIndex(codebasePath);
                     if (graphIndex) {
                         const seeds = semanticMerged.slice(0, this.getGraphSeedK());
                         const neighbourIds = collectGraphCandidateIds(seeds, graphIndex);
                         if (neighbourIds.length > 0) {
-                            const fetched = await this.fetchChunksByIds(collectionName, neighbourIds);
+                            // code-collection-split: graph candidates include
+                            // canonical_chunk_ids (code/docstring → code) and
+                            // mentioned_by_chunk_ids (mostly code, but
+                            // code_example chunks may show up via reverse
+                            // mentions). 'either' tries code first then prose;
+                            // legacy mode hits the single collection.
+                            const fetched = await this.fetchChunksByIds(codebasePath, neighbourIds, 'either');
                             if (fetched.length > 0) {
                                 // Convert raw HybridSearchResult to seeds and
                                 // re-run the weighted RRF with a 3rd pool.
@@ -1470,7 +1608,11 @@ export class Context {
                             queryId: query,
                         });
                         if (bridge.chunkIds.length > 0) {
-                            const fetched = await this.fetchChunksByIds(collectionName, bridge.chunkIds);
+                            // code-collection-split: comparison-bridge seeds
+                            // only from content_type='code' chunks; partners
+                            // come from canonical_chunk_ids of symbols (code
+                            // or docstring) → always code-collection.
+                            const fetched = await this.fetchChunksByIds(codebasePath, bridge.chunkIds, 'code');
                             if (fetched.length > 0) {
                                 const bridgePoolMerge = [
                                     ...mergePools,
@@ -1666,9 +1808,27 @@ export class Context {
      * pool is already a curated 1-hop expansion). Missing ids are
      * silently dropped per spec scenario "Side-файл stale".
      */
+    /**
+     * Batch-fetch chunks by Milvus primary key.
+     *
+     * code-collection-split: in split mode the resolver needs to know
+     * which collection holds each chunk_id. Behavior is driven by `mode`:
+     *   - 'code'   → query code-collection only (comparison-bridge,
+     *                graph canonical_chunk_ids, symbol-refs).
+     *   - 'prose'  → query prose-collection only (reserved; no caller
+     *                currently uses it).
+     *   - 'either' → query code-collection first; whatever id's are not
+     *                found there are looked up in the prose-collection
+     *                (graph mentioned_by_chunk_ids may include
+     *                code_example chunks).
+     *
+     * In legacy (non-split) mode `addr.legacy` is hit directly and
+     * `mode` is ignored — behavior is byte-stable.
+     */
     private async fetchChunksByIds(
-        collectionName: string,
+        codebasePath: string,
         ids: string[],
+        mode: 'code' | 'prose' | 'either' = 'either',
     ): Promise<HybridSearchResult[]> {
         if (ids.length === 0) return [];
         // Sanitize ids to a Milvus filter expression. id is VarChar PK;
@@ -1684,20 +1844,34 @@ export class Context {
             'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path',
             'imports', 'extends', 'implements', 'mentioned_symbols',
         ];
-        let rows: Record<string, any>[];
-        try {
-            rows = await this.vectorDatabase.query(collectionName, filter, outputFields, ids.length);
-        } catch (err) {
-            console.warn(`[Context] ⚠️ graph fetchChunksByIds query failed: ${err}`);
-            return [];
+
+        // code-collection-split: pick targets and per-target fetch loop.
+        const addr = this.getCollectionAddress(codebasePath);
+        const targets: string[] = !addr.isSplit
+            ? [addr.legacy]
+            : mode === 'code'
+                ? [addr.code]
+                : mode === 'prose'
+                    ? [addr.prose]
+                    : [addr.code, addr.prose]; // 'either' — code first, then prose
+
+        const byId = new Map<string, Record<string, any>>();
+        for (const target of targets) {
+            if (byId.size >= ids.length) break; // every id resolved already
+            let rows: Record<string, any>[] = [];
+            try {
+                rows = await this.vectorDatabase.query(target, filter, outputFields, ids.length);
+            } catch (err) {
+                console.warn(`[Context] ⚠️ fetchChunksByIds query failed on ${target}: ${err}`);
+                continue;
+            }
+            for (const row of rows) {
+                const id = row?.id;
+                if (typeof id === 'string' && !byId.has(id)) byId.set(id, row);
+            }
         }
         // Preserve the input ordering so the weighted RRF reflects the
         // graph traversal order rather than Milvus's storage order.
-        const byId = new Map<string, Record<string, any>>();
-        for (const row of rows) {
-            const id = row?.id;
-            if (typeof id === 'string') byId.set(id, row);
-        }
         const out: HybridSearchResult[] = [];
         for (const id of ids) {
             const row = byId.get(id);
@@ -2635,40 +2809,55 @@ export class Context {
         const isHybrid = this.getIsHybrid();
         const collectionType = isHybrid === true ? 'hybrid vector' : 'vector';
         console.log(`[Context] 🔧 Preparing ${collectionType} collection for codebase: ${codebasePath}${forceReindex ? ' (FORCE REINDEX)' : ''}`);
-        const collectionName = this.getCollectionName(codebasePath);
-
-        // Check if collection already exists
-        const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
-
-        if (collectionExists && !forceReindex) {
-            console.log(`📋 Collection ${collectionName} already exists, skipping creation`);
-            return;
+        const addr = this.getCollectionAddress(codebasePath);
+        // code-collection-split: in split mode we materialize both prose and
+        // code collections with identical schema. In legacy mode the loop
+        // runs exactly once over `addr.legacy` — byte-stable behavior.
+        const targets = addr.isSplit
+            ? [{ name: addr.prose, label: 'prose' }, { name: addr.code, label: 'code' }]
+            : [{ name: addr.legacy, label: 'legacy' }];
+        if (addr.isSplit) {
+            console.log(`[Context] 🪓 SPLIT_COLLECTIONS=true → preparing two collections: ${addr.prose} (prose) + ${addr.code} (code)`);
         }
 
-        if (collectionExists && forceReindex) {
-            console.log(`[Context] 🗑️  Dropping existing collection ${collectionName} for force reindex...`);
-            await this.vectorDatabase.dropCollection(collectionName);
-            console.log(`[Context] ✅ Collection ${collectionName} dropped successfully`);
+        let dimensionDetected = false;
+        let dimension = 0;
+
+        for (const { name: collectionName, label } of targets) {
+            const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
+
+            if (collectionExists && !forceReindex) {
+                console.log(`📋 Collection ${collectionName} (${label}) already exists, skipping creation`);
+                continue;
+            }
+
+            if (collectionExists && forceReindex) {
+                console.log(`[Context] 🗑️  Dropping existing collection ${collectionName} (${label}) for force reindex...`);
+                await this.vectorDatabase.dropCollection(collectionName);
+                console.log(`[Context] ✅ Collection ${collectionName} dropped successfully`);
+            }
+
+            if (!dimensionDetected) {
+                console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
+                dimension = await this.embedding.detectDimension();
+                console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
+                dimensionDetected = true;
+            }
+
+            if (isHybrid === true) {
+                const enableLearnedSparse = this.embedding.hasSparse();
+                await this.vectorDatabase.createHybridCollection(
+                    collectionName,
+                    dimension,
+                    `codebasePath:${codebasePath}`,
+                    { enableLearnedSparse },
+                );
+            } else {
+                await this.vectorDatabase.createCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
+            }
+
+            console.log(`[Context] ✅ Collection ${collectionName} (${label}) created successfully (dimension: ${dimension})`);
         }
-
-        console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
-        const dimension = await this.embedding.detectDimension();
-        console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
-        const dirName = path.basename(codebasePath);
-
-        if (isHybrid === true) {
-            const enableLearnedSparse = this.embedding.hasSparse();
-            await this.vectorDatabase.createHybridCollection(
-                collectionName,
-                dimension,
-                `codebasePath:${codebasePath}`,
-                { enableLearnedSparse },
-            );
-        } else {
-            await this.vectorDatabase.createCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
-        }
-
-        console.log(`[Context] ✅ Collection ${collectionName} created successfully (dimension: ${dimension})`);
     }
 
     /**
@@ -2888,6 +3077,11 @@ export class Context {
             });
         };
 
+        // code-collection-split: resolve once per batch so we can route each
+        // chunk to its target collection by content_type. In legacy mode
+        // addr.isSplit=false and the loop collapses to a single name.
+        const addr = this.getCollectionAddress(codebasePath);
+
         if (isHybrid === true) {
             // Create hybrid vector documents
             const documents: VectorDocument[] = chunks.map((chunk, index) => {
@@ -2943,8 +3137,25 @@ export class Context {
                 recordToGraph(documents[i].id, chunks[i]);
             }
 
-            // Store to vector database
-            await this.vectorDatabase.insertHybrid(this.getCollectionName(codebasePath), documents);
+            // code-collection-split: partition by content_type and write to
+            // each target collection. Legacy path is a single bucket whose
+            // key equals addr.legacy (== addr.code == addr.prose).
+            if (addr.isSplit) {
+                const byCollection = new Map<string, VectorDocument[]>();
+                for (let i = 0; i < documents.length; i++) {
+                    const ct = (chunks[i].metadata as any).content_type as string | undefined;
+                    const target = this.resolveChunkCollection(ct, addr);
+                    const bucket = byCollection.get(target) ?? [];
+                    bucket.push(documents[i]);
+                    byCollection.set(target, bucket);
+                }
+                for (const [target, bucket] of byCollection.entries()) {
+                    if (bucket.length === 0) continue;
+                    await this.vectorDatabase.insertHybrid(target, bucket);
+                }
+            } else {
+                await this.vectorDatabase.insertHybrid(addr.legacy, documents);
+            }
         } else {
             // Create regular vector documents
             const documents: VectorDocument[] = chunks.map((chunk, index) => {
@@ -2991,8 +3202,24 @@ export class Context {
                 recordToGraph(documents[i].id, chunks[i]);
             }
 
-            // Store to vector database
-            await this.vectorDatabase.insert(this.getCollectionName(codebasePath), documents);
+            // code-collection-split: same partitioning as the hybrid path.
+            // Non-hybrid mode is rare in production but kept consistent.
+            if (addr.isSplit) {
+                const byCollection = new Map<string, VectorDocument[]>();
+                for (let i = 0; i < documents.length; i++) {
+                    const ct = (chunks[i].metadata as any).content_type as string | undefined;
+                    const target = this.resolveChunkCollection(ct, addr);
+                    const bucket = byCollection.get(target) ?? [];
+                    bucket.push(documents[i]);
+                    byCollection.set(target, bucket);
+                }
+                for (const [target, bucket] of byCollection.entries()) {
+                    if (bucket.length === 0) continue;
+                    await this.vectorDatabase.insert(target, bucket);
+                }
+            } else {
+                await this.vectorDatabase.insert(addr.legacy, documents);
+            }
         }
     }
 
