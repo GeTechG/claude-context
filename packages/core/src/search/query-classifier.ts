@@ -1,3 +1,5 @@
+import { envManager } from '../utils/env-manager';
+
 // Phase 0+: regex-based query intent classifier.
 //
 // Returns a coarse signal pair {codeSignal, docSignal} used by per-domain
@@ -179,14 +181,28 @@ export interface DomainWeights {
     doc: number;
 }
 
+// code-collection-split: cross-pool RRF weights are env-overridable so the
+// split-regime BM25 balance can be re-tuned without a rebuild. Defaults are
+// the original single-collection values, so an unset env reproduces the
+// pre-split behaviour bit-for-bit. Branch keys:
+//   code-intent  → WEIGHT_CODE_INTENT_{CODE,DOC}   (default 1.5 / 1.0)
+//   doc-intent   → WEIGHT_DOC_INTENT_{CODE,DOC}    (default 1.0 / 1.3)
+//   mixed/ambig  → WEIGHT_MIXED_{CODE,DOC}         (default 1.0 / 1.0)
+function envWeight(name: string, fallback: number): number {
+    const raw = envManager.get(name);
+    if (raw === undefined || raw === null || raw === '') return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 export function weightsForIntent(intent: QueryIntent): DomainWeights {
     if (intent.codeSignal && !intent.docSignal) {
-        return { code: 1.5, doc: 1.0 };
+        return { code: envWeight('WEIGHT_CODE_INTENT_CODE', 1.5), doc: envWeight('WEIGHT_CODE_INTENT_DOC', 1.0) };
     }
     if (!intent.codeSignal && intent.docSignal) {
-        return { code: 1.0, doc: 1.3 };
+        return { code: envWeight('WEIGHT_DOC_INTENT_CODE', 1.0), doc: envWeight('WEIGHT_DOC_INTENT_DOC', 1.3) };
     }
-    return { code: 1.0, doc: 1.0 };
+    return { code: envWeight('WEIGHT_MIXED_CODE', 1.0), doc: envWeight('WEIGHT_MIXED_DOC', 1.0) };
 }
 
 // Phase C (rag-code-intent-recall): qualified-name parser for symbol routing.
