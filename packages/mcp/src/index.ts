@@ -26,7 +26,7 @@ import { MilvusVectorDatabase } from "@zilliz/claude-context-core";
 
 // Import our modular components
 import { createMcpConfig, logConfigurationSummary, showHelpMessage, ContextMcpConfig } from "./config.js";
-import { createEmbeddingInstance, logEmbeddingProviderInfo } from "./embedding.js";
+import { createEmbeddingInstance, createProseEmbeddingInstance, logEmbeddingProviderInfo } from "./embedding.js";
 import { createRerankerInstance } from "./reranker.js";
 import { SnapshotManager } from "./snapshot.js";
 import { SyncManager } from "./sync.js";
@@ -60,6 +60,10 @@ class ContextMcpServer {
         const embedding = createEmbeddingInstance(config);
         logEmbeddingProviderInfo(config, embedding);
 
+        // prose-embedding-swap: optional distinct prose-pool dense embedder.
+        // undefined → prose shares `embedding` (default bge-m3, byte-identical).
+        const proseEmbedding = createProseEmbeddingInstance(config);
+
         // Initialize vector database
         const vectorDatabase = new MilvusVectorDatabase({
             address: config.milvusAddress,
@@ -72,6 +76,7 @@ class ContextMcpServer {
         // Initialize Claude Context
         this.context = new Context({
             embedding,
+            ...(proseEmbedding && { proseEmbedding }),
             vectorDatabase,
             collectionNameOverride: config.collectionNameOverride,
             ...(reranker && { reranker })

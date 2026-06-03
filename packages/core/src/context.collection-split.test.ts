@@ -156,3 +156,42 @@ describe('code-collection-split: getCollectionAddress / resolveChunkCollection',
         expect(a).toBe(b);
     });
 });
+
+// prose-embedding-swap: per-pool dense embedder resolution. The default
+// invariant — when no distinct prose embedder is wired (or the same instance
+// is passed) every pool resolves to the code embedder — guarantees the
+// PROSE_DENSE_MODEL=bge-m3 path is byte-identical to v6.
+describe('prose-embedding-swap: embeddingForPool / hasDistinctProseEmbedding', () => {
+    function ctxWith(prose?: Embedding): { ctx: Context; code: Embedding; prose?: Embedding } {
+        const code = new TestEmbedding();
+        const ctx = new Context({
+            embedding: code,
+            ...(prose && { proseEmbedding: prose }),
+            vectorDatabase: makeVectorDb(),
+        });
+        return { ctx, code, prose };
+    }
+
+    it('no prose embedder → prose pool resolves to the code embedder', () => {
+        const { ctx, code } = ctxWith();
+        expect((ctx as any).hasDistinctProseEmbedding()).toBe(false);
+        expect((ctx as any).embeddingForPool('prose')).toBe(code);
+        expect((ctx as any).embeddingForPool('code')).toBe(code);
+    });
+
+    it('same instance passed as proseEmbedding collapses to no-distinct (default invariant)', () => {
+        const code = new TestEmbedding();
+        const ctx = new Context({ embedding: code, proseEmbedding: code, vectorDatabase: makeVectorDb() });
+        expect((ctx as any).hasDistinctProseEmbedding()).toBe(false);
+        expect((ctx as any).embeddingForPool('prose')).toBe(code);
+    });
+
+    it('distinct prose embedder → prose pool uses it, code pool stays on bge-m3 embedder', () => {
+        const prose = new TestEmbedding();
+        const { ctx, code } = ctxWith(prose);
+        expect((ctx as any).hasDistinctProseEmbedding()).toBe(true);
+        expect((ctx as any).embeddingForPool('prose')).toBe(prose);
+        expect((ctx as any).embeddingForPool('code')).toBe(code);
+        expect((ctx as any).embeddingForPool('code')).not.toBe(prose);
+    });
+});

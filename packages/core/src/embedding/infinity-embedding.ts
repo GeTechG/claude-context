@@ -217,6 +217,15 @@ export class InfinityEmbedding extends Embedding {
         return 'Infinity';
     }
 
+    /**
+     * prose-embedding-swap: expose the dense model id so callers can record
+     * per-collection dense-model metadata (which model built which Milvus
+     * collection) for query-side routing.
+     */
+    getModel(): string {
+        return this.config.model;
+    }
+
     hasSparse(): boolean {
         return Boolean(this.sparseURL);
     }

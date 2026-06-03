@@ -92,6 +92,35 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
     }
 }
 
+// prose-embedding-swap: build the optional second dense embedder for the
+// prose pool. Returns undefined (→ prose shares the code embedder) when the
+// provider is not Infinity, PROSE_DENSE_MODEL is unset/blank, or it equals
+// the code dense model. The prose embedder shares the same Infinity + sparse
+// sidecar URLs, so its /sparse call still returns bge-m3 lexical_weights.
+export function createProseEmbeddingInstance(config: ContextMcpConfig): InfinityEmbedding | undefined {
+    if (config.embeddingProvider !== 'Infinity') return undefined;
+    const proseModel = (config.proseDenseModel || '').trim();
+    if (!proseModel) return undefined;
+    if (proseModel === config.embeddingModel) {
+        console.log(`[EMBEDDING] PROSE_DENSE_MODEL === code model (${proseModel}) → prose shares the code embedder`);
+        return undefined;
+    }
+    // Dense goes to the prose sidecar (if PROSE_INFINITY_URL set), else the
+    // shared Infinity URL. Sparse always comes from the main bge-m3 sidecar.
+    const denseUrl = config.proseInfinityUrl || config.infinityUrl || 'http://localhost:7997';
+    const sparseUrl = config.infinitySparseUrl;
+    console.log(`[EMBEDDING] 🧬 Configuring distinct PROSE embedder: model=${proseModel}, denseURL=${denseUrl}, dim=${config.proseEmbeddingDim || 'auto'}, variant=${config.proseEmbeddingModelVariant || '(none)'}`);
+    return new InfinityEmbedding({
+        model: proseModel,
+        baseURL: denseUrl,
+        ...(config.proseEmbeddingDim && { dimension: config.proseEmbeddingDim }),
+        ...(sparseUrl && { sparseURL: sparseUrl }),
+        // Sparse stays bge-m3 — /sparse ignores model, but pass the explicit
+        // sparse model so logs/config are unambiguous.
+        ...(config.infinitySparseModel && { sparseModel: config.infinitySparseModel }),
+    });
+}
+
 export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: OpenAIEmbedding | VoyageAIEmbedding | GeminiEmbedding | OllamaEmbedding | InfinityEmbedding): void {
     console.log(`[EMBEDDING] ✅ Successfully initialized ${config.embeddingProvider} embedding provider`);
     console.log(`[EMBEDDING] Provider details - Model: ${config.embeddingModel}, Dimension: ${embedding.getDimension()}`);

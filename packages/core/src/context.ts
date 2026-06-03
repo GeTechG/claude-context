@@ -203,6 +203,14 @@ const DEFAULT_IGNORE_PATTERNS = [
 
 export interface ContextConfig {
     embedding?: Embedding;
+    // prose-embedding-swap: optional second dense embedder for the prose
+    // pool (`hybrid_v6_prose_<hash>`) under SPLIT_COLLECTIONS=true. When
+    // omitted (or === `embedding`), prose chunks/queries use the same
+    // embedder as code → behavior is byte-identical to pre-change v6.
+    // The prose embedder MUST share the bge-m3 sparse sidecar (its /sparse
+    // call ignores `model`), so its EmbeddingVector still carries bge-m3
+    // lexical_weights for the prose pool's sparse channel.
+    proseEmbedding?: Embedding;
     vectorDatabase?: VectorDatabase;
     codeSplitter?: Splitter;
     supportedExtensions?: string[];
@@ -217,6 +225,9 @@ export class Context {
     private static readonly MAX_COLLECTION_NAME_LENGTH = 255;
 
     private embedding: Embedding;
+    // prose-embedding-swap: distinct prose-pool dense embedder, or undefined
+    // when the prose pool shares the code embedder (default bge-m3).
+    private proseEmbedding?: Embedding;
     private vectorDatabase: VectorDatabase;
     private codeSplitter: Splitter;
     private supportedExtensions: string[];
@@ -263,6 +274,16 @@ export class Context {
             model: 'text-embedding-3-small',
             ...(envManager.get('OPENAI_BASE_URL') && { baseURL: envManager.get('OPENAI_BASE_URL') })
         });
+
+        // prose-embedding-swap: only retain a distinct prose embedder when it
+        // is actually a different instance from the code embedder. Callers
+        // that pass the same instance (or none) collapse to the legacy path.
+        this.proseEmbedding = (config.proseEmbedding && config.proseEmbedding !== this.embedding)
+            ? config.proseEmbedding
+            : undefined;
+        if (this.proseEmbedding) {
+            console.log(`[Context] 🧬 Prose pool uses a distinct dense embedder: ${this.proseEmbedding.getProvider()}`);
+        }
 
         if (!config.vectorDatabase) {
             throw new Error('VectorDatabase is required. Please provide a vectorDatabase instance in the config.');
@@ -316,6 +337,41 @@ export class Context {
      */
     getEmbedding(): Embedding {
         return this.embedding;
+    }
+
+    /**
+     * prose-embedding-swap: single resolution point for "which dense embedder
+     * serves this pool". Code/symbol pools always use `this.embedding`
+     * (bge-m3). The prose pool uses `this.proseEmbedding` when one is wired
+     * AND split mode is active; otherwise it falls back to `this.embedding`
+     * so the default (PROSE_DENSE_MODEL=bge-m3) path is byte-identical.
+     */
+    private hasDistinctProseEmbedding(): boolean {
+        return this.proseEmbedding !== undefined;
+    }
+
+    private embeddingForPool(pool: 'code' | 'prose'): Embedding {
+        if (pool === 'prose' && this.proseEmbedding) return this.proseEmbedding;
+        return this.embedding;
+    }
+
+    /**
+     * prose-embedding-swap: optional indexing-scope filter (env REINDEX_POOLS).
+     * When set to `prose` or `code` (split mode only), indexCodebase touches
+     * ONLY that pool's collection — the other collection is never created,
+     * dropped, embedded, or upserted. This enables a prose-only re-index that
+     * provably leaves the code pool untouched. Unset/empty (default) → both
+     * pools, byte-identical to pre-change behavior.
+     */
+    private reindexPoolFilter(): Set<'prose' | 'code'> | null {
+        const raw = (envManager.get('REINDEX_POOLS') || '').trim().toLowerCase();
+        if (!raw) return null;
+        const parts = raw.split(/[,\s]+/).filter(Boolean);
+        const allowed = new Set<'prose' | 'code'>();
+        for (const p of parts) {
+            if (p === 'prose' || p === 'code') allowed.add(p);
+        }
+        return allowed.size > 0 ? allowed : null;
     }
 
     /**
@@ -538,6 +594,19 @@ export class Context {
                 : DOC_DOMAIN_FILTER);
         const codeCollection = addr.isSplit ? addr.code : collectionName;
         const docCollection = addr.isSplit ? addr.prose : collectionName;
+
+        // prose-embedding-swap: when the prose pool has a distinct dense model
+        // (split mode only), embed the query a second time through it. The
+        // prose embedder shares the bge-m3 sparse sidecar, so its
+        // EmbeddingVector carries the prose dense vector + bge-m3 lexical
+        // sparse — exactly what the prose pool needs (dense swapped, sparse
+        // pinned to bge-m3 per spec). Default path: docQueryEmbedding ===
+        // queryEmbedding (no extra call, byte-identical).
+        let docQueryEmbedding: EmbeddingVector = queryEmbedding;
+        if (addr.isSplit && this.hasDistinctProseEmbedding()) {
+            docQueryEmbedding = await this.embeddingForPool('prose').embed(subject);
+            console.log(`[Context] 🧬 Prose-pool query embedding dim: ${docQueryEmbedding.vector.length}`);
+        }
         // Symbol-routing pool stays code-side: its filter targets
         // code/docstring chunks by symbol_name. In split mode that lives
         // entirely in the code-collection.
@@ -583,7 +652,7 @@ export class Context {
             }),
             this.vectorDatabase.hybridSearch(
                 docCollection,
-                this.buildHybridRequests(queryEmbedding, subject, sparseExtra, perPoolK),
+                this.buildHybridRequests(docQueryEmbedding, subject, sparseExtra, perPoolK),
                 { rerank: innerRerank, limit: perPoolK, filterExpr: docExpr || undefined },
             ).catch((err) => {
                 console.warn(`[Context] ⚠️ doc-domain hybrid search failed: ${err}`);
@@ -1257,15 +1326,26 @@ export class Context {
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
 
-        // Phase 3: persist the collected symbol vocabulary so search-time
-        // candidate extraction can filter out false positives.
-        await this.persistSymbolVocabulary(codebasePath);
+        // prose-embedding-swap: a prose-only reindex (REINDEX_POOLS=prose)
+        // must NOT overwrite the code-derived side-indexes — the symbol vocab
+        // and graph are built from code/docstring chunks which were skipped
+        // this run. Preserve the existing files so code-pool features stay on
+        // the v6 baseline artifacts.
+        const poolFilter = this.reindexPoolFilter();
+        const skipCodeSideArtifacts = poolFilter !== null && !poolFilter.has('code');
+        if (skipCodeSideArtifacts) {
+            console.log('[Context] 🎯 REINDEX_POOLS excludes code → preserving existing .symbols-vocab.json + .symbols-graph.json (not rewritten)');
+        } else {
+            // Phase 3: persist the collected symbol vocabulary so search-time
+            // candidate extraction can filter out false positives.
+            await this.persistSymbolVocabulary(codebasePath);
 
-        // rag-graph-layer Phase 2: build & persist `.symbols-graph.json`
-        // from accumulator. Best-effort: a failure logs but doesn't abort
-        // the whole indexing run (search-side gracefully degrades when the
-        // file is missing or malformed).
-        await this.persistGraphSideIndex(codebasePath);
+            // rag-graph-layer Phase 2: build & persist `.symbols-graph.json`
+            // from accumulator. Best-effort: a failure logs but doesn't abort
+            // the whole indexing run (search-side gracefully degrades when the
+            // file is missing or malformed).
+            await this.persistGraphSideIndex(codebasePath);
+        }
 
         progressCallback?.({
             phase: 'Indexing complete!',
@@ -2813,15 +2893,33 @@ export class Context {
         // code-collection-split: in split mode we materialize both prose and
         // code collections with identical schema. In legacy mode the loop
         // runs exactly once over `addr.legacy` — byte-stable behavior.
-        const targets = addr.isSplit
+        let targets: Array<{ name: string; label: 'prose' | 'code' | 'legacy' }> = addr.isSplit
             ? [{ name: addr.prose, label: 'prose' }, { name: addr.code, label: 'code' }]
             : [{ name: addr.legacy, label: 'legacy' }];
+        // prose-embedding-swap: restrict to the requested pool(s) so a
+        // prose-only reindex never creates/drops the code collection.
+        const poolFilter = this.reindexPoolFilter();
+        if (addr.isSplit && poolFilter) {
+            targets = targets.filter((t) => (t.label === 'prose' || t.label === 'code') ? poolFilter.has(t.label) : true);
+            console.log(`[Context] 🎯 REINDEX_POOLS filter active → preparing only: ${targets.map((t) => t.label).join(', ')}`);
+        }
         if (addr.isSplit) {
-            console.log(`[Context] 🪓 SPLIT_COLLECTIONS=true → preparing two collections: ${addr.prose} (prose) + ${addr.code} (code)`);
+            console.log(`[Context] 🪓 SPLIT_COLLECTIONS=true → preparing collections: ${targets.map((t) => `${t.name} (${t.label})`).join(' + ')}`);
         }
 
-        let dimensionDetected = false;
-        let dimension = 0;
+        // prose-embedding-swap: detect dimension per embedder, not once
+        // globally — the prose collection MAY have a different dense dim than
+        // the code collection. Cache per provider so we don't re-probe.
+        const dimCache = new Map<Embedding, number>();
+        const detectDimFor = async (emb: Embedding): Promise<number> => {
+            const cached = dimCache.get(emb);
+            if (cached !== undefined) return cached;
+            console.log(`[Context] 🔍 Detecting embedding dimension for ${emb.getProvider()} provider...`);
+            const d = await emb.detectDimension();
+            console.log(`[Context] 📏 Detected dimension: ${d} for ${emb.getProvider()}`);
+            dimCache.set(emb, d);
+            return d;
+        };
 
         for (const { name: collectionName, label } of targets) {
             const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
@@ -2837,23 +2935,31 @@ export class Context {
                 console.log(`[Context] ✅ Collection ${collectionName} dropped successfully`);
             }
 
-            if (!dimensionDetected) {
-                console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
-                dimension = await this.embedding.detectDimension();
-                console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
-                dimensionDetected = true;
-            }
+            // The prose collection uses the prose embedder (when distinct);
+            // code/legacy collections use the code embedder.
+            const collectionEmbedding = (addr.isSplit && label === 'prose')
+                ? this.embeddingForPool('prose')
+                : this.embedding;
+            const dimension = await detectDimFor(collectionEmbedding);
+
+            // Per-collection dense-model/dim metadata for query-side routing
+            // (prose-embedding-swap task 2.4). Only added in split mode so the
+            // legacy single-collection description stays byte-stable.
+            const denseModelLabel = (collectionEmbedding as any).getModel?.() ?? collectionEmbedding.getProvider();
+            const description = addr.isSplit
+                ? `codebasePath:${codebasePath};dense_model:${denseModelLabel};dense_dim:${dimension}`
+                : `codebasePath:${codebasePath}`;
 
             if (isHybrid === true) {
                 const enableLearnedSparse = this.embedding.hasSparse();
                 await this.vectorDatabase.createHybridCollection(
                     collectionName,
                     dimension,
-                    `codebasePath:${codebasePath}`,
+                    description,
                     { enableLearnedSparse },
                 );
             } else {
-                await this.vectorDatabase.createCollection(collectionName, dimension, `codebasePath:${codebasePath}`);
+                await this.vectorDatabase.createCollection(collectionName, dimension, description);
             }
 
             console.log(`[Context] ✅ Collection ${collectionName} (${label}) created successfully (dimension: ${dimension})`);
@@ -3020,6 +3126,23 @@ export class Context {
     private async processChunkBatch(chunks: CodeChunk[], codebasePath: string): Promise<void> {
         const isHybrid = this.getIsHybrid();
 
+        // prose-embedding-swap: REINDEX_POOLS filter — drop chunks whose target
+        // pool is excluded so a prose-only reindex never embeds or upserts
+        // code-side chunks (the code collection stays exactly as the baseline
+        // left it). No-op when the filter is unset.
+        const poolFilter = this.reindexPoolFilter();
+        if (poolFilter) {
+            const addrF = this.getCollectionAddress(codebasePath);
+            if (addrF.isSplit) {
+                chunks = chunks.filter((c) => {
+                    const target = this.resolveChunkCollection((c.metadata as any).content_type, addrF);
+                    const label: 'prose' | 'code' = target === addrF.prose ? 'prose' : 'code';
+                    return poolFilter.has(label);
+                });
+                if (chunks.length === 0) return;
+            }
+        }
+
         // Phase 3: harvest symbol names into the vocabulary collector.
         if (this.indexedSymbols) {
             for (const chunk of chunks) {
@@ -3030,9 +3153,39 @@ export class Context {
             }
         }
 
-        // Generate embedding vectors
+        // Generate embedding vectors.
+        // prose-embedding-swap: in split mode with a distinct prose embedder,
+        // embed prose chunks (doc/code_example) through the prose model and
+        // code chunks (code/docstring) through bge-m3. Both embedders share
+        // the bge-m3 sparse sidecar, so every chunk still carries bge-m3
+        // lexical_weights for the sparse channel. Default path (no distinct
+        // prose embedder) runs a single embedBatch — byte-identical to v6.
         const chunkContents = chunks.map(chunk => chunk.content);
-        const embeddings = await this.embedding.embedBatch(chunkContents);
+        const batchAddr = this.getCollectionAddress(codebasePath);
+        let embeddings: EmbeddingVector[];
+        if (batchAddr.isSplit && this.hasDistinctProseEmbedding()) {
+            const proseIdx: number[] = [];
+            const codeIdx: number[] = [];
+            for (let i = 0; i < chunks.length; i++) {
+                const ct = (chunks[i].metadata as any).content_type as string | undefined;
+                if (this.resolveChunkCollection(ct, batchAddr) === batchAddr.prose) proseIdx.push(i);
+                else codeIdx.push(i);
+            }
+            embeddings = new Array<EmbeddingVector>(chunks.length);
+            const [proseEmb, codeEmb] = await Promise.all([
+                proseIdx.length > 0
+                    ? this.embeddingForPool('prose').embedBatch(proseIdx.map(i => chunkContents[i]))
+                    : Promise.resolve([] as EmbeddingVector[]),
+                codeIdx.length > 0
+                    ? this.embedding.embedBatch(codeIdx.map(i => chunkContents[i]))
+                    : Promise.resolve([] as EmbeddingVector[]),
+            ]);
+            proseIdx.forEach((origIdx, k) => { embeddings[origIdx] = proseEmb[k]; });
+            codeIdx.forEach((origIdx, k) => { embeddings[origIdx] = codeEmb[k]; });
+            console.log(`[Context] 🧬 Split-embed batch: ${proseIdx.length} prose (${this.embeddingForPool('prose').getProvider()}) + ${codeIdx.length} code (bge-m3)`);
+        } else {
+            embeddings = await this.embedding.embedBatch(chunkContents);
+        }
 
         // rag-graph-layer Phase 2: accumulator entries are recorded inside
         // the per-chunk map below — each chunk_id gets paired with the

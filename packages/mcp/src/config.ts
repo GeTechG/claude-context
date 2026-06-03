@@ -24,6 +24,17 @@ export interface ContextMcpConfig {
     // Phase 4: optional URL of the BGE-M3 learned-sparse sidecar (m3serve).
     infinitySparseUrl?: string;
     infinitySparseModel?: string;
+    // prose-embedding-swap: optional distinct dense model for the prose pool
+    // (hybrid_v6_prose_<hash>) under SPLIT_COLLECTIONS=true. Default
+    // BAAI/bge-m3 → prose shares the code embedder (byte-identical v6).
+    proseDenseModel?: string;
+    proseEmbeddingDim?: number;
+    proseEmbeddingModelVariant?: string;
+    // Dense /embeddings URL for the prose pool. Defaults to infinityUrl when
+    // unset; set to the isolated prose-embed sidecar (e.g. :7998) when the
+    // prose model needs a different toolchain. Sparse still comes from
+    // infinitySparseUrl (main bge-m3 sidecar).
+    proseInfinityUrl?: string;
     // Reranker configuration (Phase 2)
     rerankerProvider?: 'Infinity';
     rerankerModel?: string;
@@ -186,6 +197,11 @@ export function createMcpConfig(): ContextMcpConfig {
         // Phase 4: BGE-M3 learned-sparse sidecar (m3serve).
         infinitySparseUrl: envManager.get('INFINITY_SPARSE_URL'),
         infinitySparseModel: envManager.get('INFINITY_SPARSE_MODEL'),
+        // prose-embedding-swap: prose-pool dense model / dim / variant label.
+        proseDenseModel: envManager.get('PROSE_DENSE_MODEL'),
+        proseEmbeddingDim: getPositiveIntegerFromEnv('PROSE_EMBEDDING_DIM'),
+        proseEmbeddingModelVariant: envManager.get('PROSE_EMBEDDING_MODEL_VARIANT'),
+        proseInfinityUrl: envManager.get('PROSE_INFINITY_URL'),
         // Reranker configuration (Phase 2). Reranker shares the Infinity
         // sidecar by default — RERANKER_URL only needs to be set if the
         // reranker lives on a different host.
