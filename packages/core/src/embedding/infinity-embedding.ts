@@ -110,15 +110,24 @@ export class InfinityEmbedding extends Embedding {
         return json;
     }
 
-    private async postSparse(input: string | string[]): Promise<SparseSidecarResponse> {
+    private async postSparse(
+        input: string | string[],
+        inputType: 'query' | 'passage',
+    ): Promise<SparseSidecarResponse> {
         if (!this.sparseURL) {
             throw new Error('[InfinityEmbedding] sparseURL not configured');
         }
         const url = `${this.sparseURL}/sparse`;
+        // learned-sparse-swap: forward input_type to /sparse. bge-m3 sparse is
+        // symmetric and ignores it (extra field), but doc-only learned-sparse
+        // models (opensearch-neural-sparse-encoding-doc-v3) are ASYMMETRIC —
+        // documents run the neural encoder while queries use a cheap
+        // tokenizer + IDF weight-lookup. Without this hint the sparse sidecar
+        // cannot tell a query from a passage on the wire.
         const response = await this.fetchImpl(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: this.sparseModel, input }),
+            body: JSON.stringify({ model: this.sparseModel, input, input_type: inputType }),
         });
 
         if (!response.ok) {
@@ -153,7 +162,7 @@ export class InfinityEmbedding extends Embedding {
         if (this.sparseURL) {
             const [denseResp, sparseResp] = await Promise.all([
                 this.postEmbeddings(processed, 'query'),
-                this.postSparse(processed),
+                this.postSparse(processed, 'query'),
             ]);
             const vector = denseResp.data[0].embedding;
             if (!Array.isArray(vector)) {
@@ -188,7 +197,7 @@ export class InfinityEmbedding extends Embedding {
         if (this.sparseURL) {
             const [denseResp, sparseResp] = await Promise.all([
                 this.postEmbeddings(processed, 'passage'),
-                this.postSparse(processed),
+                this.postSparse(processed, 'passage'),
             ]);
             denseResp.data.sort((a, b) => a.index - b.index);
             sparseResp.data.sort((a, b) => a.index - b.index);
