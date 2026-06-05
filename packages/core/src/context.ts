@@ -23,6 +23,7 @@ import { classifyQuery, weightsForIntent, DomainWeights, parseQualifiedName, par
 import { routeQuery, ChannelWeights, QueryShape } from './search/query-router';
 import { buildSymbolFilter } from './search/symbol-routing';
 import { GraphIndex, collectGraphCandidateIds, derivePackageFromPath } from './search/graph-expansion';
+import { ProseGraphIndex, collectProseGraphCandidateIds } from './search/prose-graph-expansion';
 import { buildComparisonBridgePool } from './search/comparison-bridge';
 import { SerenaLspClient } from './search/serena-lsp-client';
 import { runSymbolRefsPool, SymbolRefsParsed } from './search/symbol-refs-pool';
@@ -136,6 +137,12 @@ const DEFAULT_GRAPH_POOL_WEIGHT = 0.6;
 // becomes seed material for the graph-expansion module. Aligned with
 // RERANKER_INPUT_K so we never expand beyond the reranker's working set.
 const DEFAULT_GRAPH_SEED_K = 50;
+
+// prose-graph-deterministic §4.3: prose-graph-pool weight + seed-K in the
+// outer weighted RRF (mirror the GRAPH_* defaults). Active only when
+// PROSE_GRAPH_EXPAND=true.
+const DEFAULT_PROSE_GRAPH_POOL_WEIGHT = 0.6;
+const DEFAULT_PROSE_GRAPH_SEED_K = 50;
 
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
@@ -259,6 +266,13 @@ export class Context {
     // rag-graph-layer Phase 3.7: print the wiring banner exactly once per
     // collection so the MCP log is grep-able for the runtime mode.
     private graphStartupBannerLogged = new Set<string>();
+    // prose-graph-deterministic §4: lazy cached load of `.prose-graph.json`
+    // (one per codebase), its stale-chunk warning throttle, and a one-shot
+    // startup banner set. Populated only when PROSE_GRAPH_EXPAND=true → at the
+    // default-OFF state none of these are ever touched.
+    private proseGraphIndexCache = new Map<string, ProseGraphIndex | null>();
+    private staleProseGraphChunkWarnedAt = 0;
+    private proseGraphStartupBannerLogged = new Set<string>();
     // rag-symbol-refs-lsp-pool: lazy-init Serena LSP client (one per
     // Context instance, reused across queries). Created on the first
     // pool activation and reused to amortise the SSE handshake.
@@ -850,6 +864,26 @@ export class Context {
         return this.getPositiveIntFromEnv('GRAPH_SEED_K', DEFAULT_GRAPH_SEED_K);
     }
 
+    // ---- prose-graph-deterministic §4.3: env getters --------------------
+
+    /**
+     * prose-graph-deterministic §4: master flag for prose-graph expansion.
+     * default `false` → the prose-graph module is never loaded and the
+     * pipeline is identical pre-change. Flip requires the deep-reference-eval
+     * gate (see spec «Prose-graph acceptance gate за deep-reference-eval»).
+     */
+    private getProseGraphExpand(): boolean {
+        return (envManager.get('PROSE_GRAPH_EXPAND') || 'false').trim().toLowerCase() === 'true';
+    }
+
+    private getProseGraphPoolWeight(): number {
+        return this.getNonNegativeFloatFromEnv('PROSE_GRAPH_POOL_WEIGHT', DEFAULT_PROSE_GRAPH_POOL_WEIGHT);
+    }
+
+    private getProseGraphSeedK(): number {
+        return this.getPositiveIntFromEnv('PROSE_GRAPH_SEED_K', DEFAULT_PROSE_GRAPH_SEED_K);
+    }
+
     // ---- rag-symbol-refs-lsp-pool: env getters --------------------------
 
     private getSymbolRefsPool(): boolean {
@@ -977,6 +1011,39 @@ export class Context {
         this.graphIndexCache.set(codebasePath, idx);
         if (idx) {
             console.log(`[Context] 🕸️  Loaded graph index (${idx.symbolCount} symbols, version ${idx.version}) from ${sidePath}`);
+        }
+        return idx;
+    }
+
+    /**
+     * prose-graph-deterministic §4.1 / §4.4: lazy cached load of the
+     * per-codebase `.prose-graph.json`. Returns null sentinel on
+     * missing/parse-error/version-mismatch so prose-graph expansion is
+     * gracefully disabled regardless of PROSE_GRAPH_EXPAND; subsequent calls
+     * hit the cache without re-reading disk. A one-shot banner records the
+     * reason so operators can grep the MCP log.
+     */
+    private loadProseGraphIndex(codebasePath: string): ProseGraphIndex | null {
+        if (this.proseGraphIndexCache.has(codebasePath)) {
+            return this.proseGraphIndexCache.get(codebasePath) ?? null;
+        }
+        const sidePath = path.join(codebasePath, '.prose-graph.json');
+        const bannerOnce = (msg: string, warn = false): void => {
+            if (this.proseGraphStartupBannerLogged.has(sidePath)) return;
+            this.proseGraphStartupBannerLogged.add(sidePath);
+            if (warn) console.warn(msg); else console.log(msg);
+        };
+        if (!fs.existsSync(sidePath)) {
+            this.proseGraphIndexCache.set(codebasePath, null);
+            bannerOnce('[Context] 🪢 prose-graph index not loaded: side-file missing; PROSE_GRAPH_EXPAND ignored', true);
+            return null;
+        }
+        const idx = ProseGraphIndex.load(sidePath);
+        this.proseGraphIndexCache.set(codebasePath, idx);
+        if (idx) {
+            bannerOnce(`[Context] 🪢 prose-graph expansion: enabled, ${idx.nodeCount} nodes / ${idx.edgeCount} edges (version ${idx.version}) from ${sidePath}`);
+        } else {
+            bannerOnce('[Context] 🪢 prose-graph index not loaded: malformed or version-mismatch; PROSE_GRAPH_EXPAND ignored', true);
         }
         return idx;
     }
@@ -1667,6 +1734,55 @@ export class Context {
                             } else if (Date.now() - this.staleGraphChunkWarnedAt > 60_000) {
                                 this.staleGraphChunkWarnedAt = Date.now();
                                 console.warn(`[Context] ⚠️ graph index points to ${neighbourIds.length} chunk_id(s) not present in '${collectionName}'; consider reindex`);
+                            }
+                        }
+                    }
+                }
+
+                // prose-graph-deterministic §4: optional prose-graph
+                // expansion. Orthogonal to GRAPH_EXPAND (that hops code/symbol
+                // edges over the code collection; this hops deterministic
+                // narrative edges over the prose collection). Seeds come from
+                // the prose-pool top-K; their 1-hop neighbours form a separate
+                // `prose_graph_pool` merged into the outer weighted RRF with a
+                // reduced weight, before the reranker. Default-OFF → the index
+                // is never loaded and this block is a full no-op.
+                if (this.getProseGraphExpand()) {
+                    const proseGraphIndex = this.loadProseGraphIndex(codebasePath);
+                    if (proseGraphIndex) {
+                        // Prefer prose-pool (doc/code_example) hits as seeds;
+                        // fall back to the merged top-K when the doc pool is
+                        // empty. Non-prose seeds simply have no graph entries.
+                        const proseSeedK = this.getProseGraphSeedK();
+                        const proseSeeds = (docPool.length > 0
+                            ? docPool.map((r) => this.toSemanticResult(r))
+                            : semanticMerged).slice(0, proseSeedK);
+                        const cap = this.hasReranker() ? this.getRerankerInputK() : DEFAULT_RERANKER_INPUT_K;
+                        const neighbourIds = collectProseGraphCandidateIds(proseSeeds, proseGraphIndex, cap).slice(0, cap);
+                        if (neighbourIds.length > 0) {
+                            // Collection-aware: prose-graph chunk_ids live in
+                            // the prose collection under SPLIT_COLLECTIONS=true.
+                            const fetched = (await this.fetchChunksByIds(codebasePath, neighbourIds, 'prose')).slice(0, cap);
+                            if (fetched.length > 0) {
+                                const proseGraphMerge = [
+                                    ...mergePools,
+                                    { results: fetched, weight: this.getProseGraphPoolWeight() },
+                                ];
+                                const reMerged = this.weightedRrfMerge(
+                                    proseGraphMerge,
+                                    mergeLimit,
+                                    this.getRrfK(),
+                                );
+                                const proseGraphIds = new Set(fetched.map((c) => c.document.id));
+                                semanticMerged = reMerged.map((r) => {
+                                    const s = this.toSemanticResult(r);
+                                    if (s.chunk_id && proseGraphIds.has(s.chunk_id)) s.pool = 'proseGraph';
+                                    return s;
+                                });
+                                console.log(`[Context] 🪢 prose-graph expansion: ${neighbourIds.length} candidates, ${fetched.length} fetched, weight=${this.getProseGraphPoolWeight()}`);
+                            } else if (Date.now() - this.staleProseGraphChunkWarnedAt > 60_000) {
+                                this.staleProseGraphChunkWarnedAt = Date.now();
+                                console.warn(`[Context] ⚠️ prose-graph points to ${neighbourIds.length} chunk_id(s) not present in the prose collection; consider rebuild`);
                             }
                         }
                     }
