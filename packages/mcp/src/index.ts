@@ -199,6 +199,11 @@ This tool is versatile and can be used before completing various tasks to retrie
                                     },
                                     description: "Optional: List of file extensions to filter results. (e.g., ['.ts','.py']).",
                                     default: []
+                                },
+                                shapeHint: {
+                                    type: "string",
+                                    description: "Optional: query_shape hint forwarded to the retrieval router. Use 'concept' for broad reference/synthesis subqueries that need content-type diversity (activates the concept-span quota). Omit for ordinary identifier/descriptive lookups — behaviour then matches the pre-change one-shot path.",
+                                    enum: ["single", "multi-hop", "comparison", "concept"]
                                 }
                             },
                             required: ["path", "query"]

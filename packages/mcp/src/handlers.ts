@@ -608,8 +608,19 @@ export class ToolHandlers {
     }
 
     public async handleSearchCode(args: any) {
-        const { path: codebasePath, query, limit = 10, extensionFilter } = args;
+        const { path: codebasePath, query, limit = 10, extensionFilter, shapeHint } = args;
         const resultLimit = limit || 10;
+
+        // agentic-reference-context-assembler: optional query_shape hint.
+        // Validate against the router's QueryShape set; any other value
+        // (or absence) degrades to undefined → semanticSearch is called
+        // without a 6th arg, byte-identical to the pre-change one-shot path
+        // (concept-span quota stays a no-op). Never throws on bad input.
+        const VALID_SHAPE_HINTS = ['single', 'multi-hop', 'comparison', 'concept'];
+        const queryShape: string | undefined =
+            typeof shapeHint === 'string' && VALID_SHAPE_HINTS.includes(shapeHint)
+                ? shapeHint
+                : undefined;
 
         try {
             // Sync indexed codebases from cloud first
@@ -727,7 +738,8 @@ export class ToolHandlers {
                 query,
                 Math.min(resultLimit, 50),
                 0.3,
-                filterExpr
+                filterExpr,
+                queryShape
             );
 
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
