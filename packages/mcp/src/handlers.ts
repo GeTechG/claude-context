@@ -6,6 +6,12 @@ import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
 import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.js";
+import {
+    selectNeighbours,
+    normalizeEdgeTypes,
+    clampLimit,
+    formatExpansion,
+} from "./prose-graph-neighbours.js";
 
 export class ToolHandlers {
     private context: Context;
@@ -778,8 +784,15 @@ export class ToolHandlers {
                 const context = truncateContent(result.content, 5000);
                 const codebaseInfo = path.basename(searchCodebasePath);
 
+                // prose-graph-mcp-tool: surface the stable chunk_id as the
+                // agent's handle for `expand_context` graph navigation.
+                // Additive + backward-compatible: omitted for legacy chunks
+                // that predate chunk_id exposure; all other lines byte-stable.
+                const chunkIdLine = result.chunk_id ? `   Chunk-ID: ${result.chunk_id}\n` : '';
+
                 return `${index + 1}. Code snippet (${result.language}) [${codebaseInfo}]\n` +
                     `   Location: ${location}\n` +
+                    chunkIdLine +
                     `   Rank: ${index + 1}\n` +
                     `   Context: \n\`\`\`${result.language}\n${context}\n\`\`\`\n`;
             }).join('\n');
@@ -828,6 +841,114 @@ export class ToolHandlers {
                 content: [{
                     type: "text",
                     text: `Error searching code: ${errorMessage} Please check if the codebase has been indexed first.`
+                }],
+                isError: true
+            };
+        }
+    }
+
+    /**
+     * prose-graph-mcp-tool: agent-callable 1-hop traversal over the
+     * deterministic prose-graph side-index (`<root>/.prose-graph.json`).
+     * Given a `chunk_id` from a prior `search_code` result (its `Chunk-ID`
+     * line), return that chunk's neighbours with their relationship type,
+     * weight, and (collection-aware) content. Pure in-memory graph lookup +
+     * one Milvus fetch — no LLM, no GPU, no ranking change. Degrades
+     * gracefully when the side-index is absent.
+     */
+    public async handleExpandContext(args: any) {
+        const { path: codebasePath, chunk_id, edge_types, limit } = args ?? {};
+
+        if (typeof chunk_id !== "string" || chunk_id.trim().length === 0) {
+            return {
+                content: [{
+                    type: "text",
+                    text: "Error: expand_context requires a non-empty `chunk_id` (the `Chunk-ID` line from a search_code result)."
+                }],
+                isError: true
+            };
+        }
+
+        try {
+            // Sync indexed codebases from cloud first (mirrors handleSearchCode).
+            await this.syncIndexedCodebasesFromCloud();
+
+            const absolutePath = ensureAbsolutePath(codebasePath);
+            if (!fs.existsSync(absolutePath)) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error: Path '${absolutePath}' does not exist. Original input: '${codebasePath}'`
+                    }],
+                    isError: true
+                };
+            }
+
+            // Resolve to the indexed codebase root (mirrors handleSearchCode) so
+            // the prose-graph side-index path and the prose collection both match
+            // what search_code used.
+            const indexedCodebasePath = this.snapshotManager.findIndexedCodebasePath(absolutePath);
+            const indexingCodebasePath = this.snapshotManager.findIndexingCodebasePath(absolutePath);
+            const matchedCodebase = [indexedCodebasePath, indexingCodebasePath]
+                .filter((codebase): codebase is string => codebase !== undefined)
+                .sort((a, b) => b.length - a.length)[0];
+            const searchCodebasePath = matchedCodebase || absolutePath;
+
+            // Graceful-off: missing / unparseable / version-mismatch side-index.
+            const index = this.context.getProseGraphIndex(searchCodebasePath);
+            if (!index) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Prose-graph index not available for '${searchCodebasePath}' (missing, unparseable, or version-mismatched). Build it with infra/build-prose-graph.js. search_code and all other tools are unaffected.`
+                    }]
+                };
+            }
+
+            const seedId = chunk_id.trim();
+            const neighbours = index.neighbours(seedId);
+            if (!neighbours || neighbours.length === 0) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `No graph neighbours for \`${seedId}\` (chunk absent from the prose-graph, or it has no 1-hop edges).`
+                    }]
+                };
+            }
+
+            const edgeFilter = normalizeEdgeTypes(edge_types);
+            const cap = clampLimit(limit);
+            const selected = selectNeighbours(neighbours, edgeFilter, cap);
+
+            // Distinct neighbour count after the edge_types filter, for the header.
+            const totalAfterFilter = (() => {
+                const ids = new Set<string>();
+                for (const e of neighbours) {
+                    if (edgeFilter && !edgeFilter.has(e.type)) continue;
+                    if (e.to) ids.add(e.to);
+                }
+                return ids.size;
+            })();
+
+            // Batch-fetch neighbour content from the prose collection; stale ids
+            // (absent from Milvus) silently drop out and are noted by the formatter.
+            const neighbourIds = selected.map((e) => e.to);
+            const fetched = await this.context.fetchProseChunksByIds(searchCodebasePath, neighbourIds);
+            const contentById = new Map<string, any>();
+            for (const r of fetched) {
+                if (r.chunk_id) contentById.set(r.chunk_id, r);
+            }
+
+            const text = formatExpansion(seedId, selected, contentById, totalAfterFilter);
+            return { content: [{ type: "text", text }] };
+        } catch (error) {
+            const errorMessage = typeof error === "string"
+                ? error
+                : (error instanceof Error ? error.message : String(error));
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error expanding context: ${errorMessage}`
                 }],
                 isError: true
             };

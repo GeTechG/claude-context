@@ -237,6 +237,38 @@ This tool is versatile and can be used before completing various tasks to retrie
                             required: ["path"]
                         }
                     },
+                    {
+                        name: "expand_context",
+                        description: `Follow the deterministic prose-graph to pull in a chunk's explicit 1-hop neighbours when a search_code answer is incomplete. Call it after search_code when you need the connected structure around a result — the parent/child sections, the code example next to a passage, co-mentioned chunks, the next chunk in the file, or an internally-linked page. Pass the \`Chunk-ID\` line from the search_code result as \`chunk_id\`. Returns each neighbour's relationship type (heading / code_example / co_mention / sequence / link), edge weight, location, heading path, content_type, and content. Optionally narrow with \`edge_types\` (e.g. ['heading','code_example'] for "this section and its examples") and bound with \`limit\`. This does NOT change retrieval ranking; it is a read-only navigation supplement to search_code. If the prose-graph side-index is unavailable it says so without affecting search.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                path: {
+                                    type: "string",
+                                    description: `ABSOLUTE path to the indexed codebase the chunk belongs to (same path used for search_code).`
+                                },
+                                chunk_id: {
+                                    type: "string",
+                                    description: "The Chunk-ID of the result to expand from, copied from a search_code result's `Chunk-ID:` line."
+                                },
+                                edge_types: {
+                                    type: "array",
+                                    items: {
+                                        type: "string",
+                                        enum: ["heading", "code_example", "co_mention", "sequence", "link"]
+                                    },
+                                    description: "Optional: restrict neighbours to these relationship types. Omit to return all types."
+                                },
+                                limit: {
+                                    type: "integer",
+                                    description: "Optional: maximum number of neighbours to return (default 10, max 50).",
+                                    default: 10,
+                                    maximum: 50
+                                }
+                            },
+                            required: ["path", "chunk_id"]
+                        }
+                    },
                 ]
             };
         });
@@ -250,6 +282,8 @@ This tool is versatile and can be used before completing various tasks to retrie
                     return await this.toolHandlers.handleIndexCodebase(args);
                 case "search_code":
                     return await this.toolHandlers.handleSearchCode(args);
+                case "expand_context":
+                    return await this.toolHandlers.handleExpandContext(args);
                 case "clear_index":
                     return await this.toolHandlers.handleClearIndex(args);
                 case "get_indexing_status":

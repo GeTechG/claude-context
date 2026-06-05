@@ -2133,6 +2133,37 @@ export class Context {
     }
 
     /**
+     * prose-graph-mcp-tool: public accessor for the lazily-cached per-codebase
+     * prose-graph side-index, used by the agent-callable `expand_context` MCP
+     * tool. Reuses the same in-process cache as the (archived, default-off)
+     * silent-pool path, so repeat calls within one process do not re-read disk
+     * (spec «Index loaded once and cached»). Returns null on
+     * missing/unparseable/version-mismatch (spec «Side-index missing or
+     * unparseable» → graceful-off); the caller renders the unavailable message.
+     */
+    public getProseGraphIndex(codebasePath: string): ProseGraphIndex | null {
+        return this.loadProseGraphIndex(codebasePath);
+    }
+
+    /**
+     * prose-graph-mcp-tool: batch-fetch prose-collection chunks by chunk_id
+     * for `expand_context`, projected onto the external SemanticSearchResult
+     * shape. Collection-aware via the existing fetch path: the prose
+     * collection (`hybrid_v6_prose_<hash>`) under SPLIT_COLLECTIONS=true, the
+     * single legacy collection otherwise. Stale ids absent from Milvus are
+     * silently dropped (spec «Stale neighbour chunk_id skipped without
+     * error»), so the returned array may be shorter than `ids`; input order
+     * is preserved for the surviving ids.
+     */
+    public async fetchProseChunksByIds(
+        codebasePath: string,
+        ids: string[],
+    ): Promise<SemanticSearchResult[]> {
+        const fetched = await this.fetchChunksByIds(codebasePath, ids, 'prose');
+        return fetched.map((r) => this.toSemanticResult(r));
+    }
+
+    /**
      * Weighted Reciprocal Rank Fusion across pools that already came back
      * from per-domain hybrid_search calls.
      *
