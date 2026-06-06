@@ -269,6 +269,40 @@ This tool is versatile and can be used before completing various tasks to retrie
                             required: ["path", "chunk_id"]
                         }
                     },
+                    {
+                        name: "record_answer",
+                        description: `Record the final answer you synthesized for a reference/knowledge-base task, so real usage can be analyzed and mined for future training. Call this ONCE at the END of a reference-answer task, after you have written your answer to the user. Pass the final answer text, the \`request_ids\` you drew on (copy the \`Request-ID:\` line from each search_code / expand_context result whose context you actually used), and — when you can judge it — an in-session \`signal\` (\`helpful\` if the retrieved context was sufficient and the answer is solid, \`not_helpful\` if retrieval missed or the answer is weak, \`unknown\` otherwise) plus a short \`note\`. This is observation only: it does not change retrieval or your answer. Safe to skip if no Request-ID was surfaced (usage logging off).`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                answer: {
+                                    type: "string",
+                                    description: "The final synthesized answer text you delivered to the user."
+                                },
+                                request_ids: {
+                                    type: "array",
+                                    items: {
+                                        type: "string"
+                                    },
+                                    description: "The Request-ID(s) of the search_code / expand_context calls whose retrieved context fed this answer (from each result's `Request-ID:` line)."
+                                },
+                                signal: {
+                                    type: "string",
+                                    description: "Optional in-session quality signal: 'helpful' if retrieval was sufficient and the answer is solid, 'not_helpful' if retrieval missed or the answer is weak, 'unknown' if unsure.",
+                                    enum: ["helpful", "not_helpful", "unknown"]
+                                },
+                                note: {
+                                    type: "string",
+                                    description: "Optional short free-text note on what worked or what was missing (e.g. 'top result was off-topic, expand_context recovered it')."
+                                },
+                                query: {
+                                    type: "string",
+                                    description: "Optional: the user-facing question this answer addressed, when it differs from the raw search query."
+                                }
+                            },
+                            required: ["answer", "request_ids"]
+                        }
+                    },
                 ]
             };
         });
@@ -284,6 +318,8 @@ This tool is versatile and can be used before completing various tasks to retrie
                     return await this.toolHandlers.handleSearchCode(args);
                 case "expand_context":
                     return await this.toolHandlers.handleExpandContext(args);
+                case "record_answer":
+                    return await this.toolHandlers.handleRecordAnswer(args);
                 case "clear_index":
                     return await this.toolHandlers.handleClearIndex(args);
                 case "get_indexing_status":

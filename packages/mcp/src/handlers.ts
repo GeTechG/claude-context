@@ -12,6 +12,14 @@ import {
     clampLimit,
     formatExpansion,
 } from "./prose-graph-neighbours.js";
+import {
+    isUsageLogEnabled,
+    newRequestId,
+    newAnswerId,
+    logRetrieval,
+    logAnswer,
+    relativise,
+} from "./usage-logger.js";
 
 export class ToolHandlers {
     private context: Context;
@@ -815,6 +823,39 @@ export class ToolHandlers {
                 resultMessage += `\n\n💡 **Tip**: This codebase is still being indexed. More results may become available as indexing progresses.`;
             }
 
+            // usage-logging-dataset: capture this real retrieval call (query +
+            // full returned context) and surface a Request-ID so a later
+            // record_answer can correlate the answer back to it. Additive,
+            // best-effort, and fully guarded — when logging is disabled the
+            // response is byte-identical to the pre-change format and no work is
+            // done; a logging throw can never reach the tool result.
+            if (isUsageLogEnabled()) {
+                try {
+                    const requestId = newRequestId();
+                    resultMessage = `Request-ID: ${requestId}\n${resultMessage}`;
+                    logRetrieval({
+                        request_id: requestId,
+                        tool: "search_code",
+                        codebase: relativise(searchCodebasePath),
+                        query,
+                        ...(filterExpr ? { extensionFilter } : {}),
+                        ...(queryShape ? { shapeHint: queryShape } : {}),
+                        result_count: searchResults.length,
+                        results: searchResults.map((r: any, i: number) => ({
+                            rank: i + 1,
+                            score: r.score,
+                            chunk_id: r.chunk_id,
+                            relativePath: relativise(r.relativePath),
+                            startLine: r.startLine,
+                            endLine: r.endLine,
+                            content: truncateContent(r.content ?? "", 5000),
+                        })),
+                    });
+                } catch (logErr: any) {
+                    console.error(`[USAGE-LOG] search_code capture failed: ${logErr?.message ?? logErr}`);
+                }
+            }
+
             return {
                 content: [{
                     type: "text",
@@ -939,7 +980,41 @@ export class ToolHandlers {
                 if (r.chunk_id) contentById.set(r.chunk_id, r);
             }
 
-            const text = formatExpansion(seedId, selected, contentById, totalAfterFilter);
+            let text = formatExpansion(seedId, selected, contentById, totalAfterFilter);
+
+            // usage-logging-dataset: capture this real expand_context call (seed
+            // + returned neighbours) and surface a Request-ID, mirroring
+            // handleSearchCode. Additive, best-effort, fully guarded.
+            if (isUsageLogEnabled()) {
+                try {
+                    const requestId = newRequestId();
+                    text = `Request-ID: ${requestId}\n${text}`;
+                    logRetrieval({
+                        request_id: requestId,
+                        tool: "expand_context",
+                        codebase: relativise(searchCodebasePath),
+                        seed_chunk_id: seedId,
+                        ...(edgeFilter ? { edge_types: Array.from(edgeFilter) } : {}),
+                        ...(limit !== undefined ? { limit: cap } : {}),
+                        result_count: selected.length,
+                        neighbours: selected.map((e) => {
+                            const r = contentById.get(e.to);
+                            return {
+                                chunk_id: e.to,
+                                relationship: e.type,
+                                weight: e.weight,
+                                relativePath: r ? relativise(r.relativePath) : undefined,
+                                startLine: r?.startLine,
+                                endLine: r?.endLine,
+                                content: r ? truncateContent(r.content ?? "", 5000) : undefined,
+                            };
+                        }),
+                    });
+                } catch (logErr: any) {
+                    console.error(`[USAGE-LOG] expand_context capture failed: ${logErr?.message ?? logErr}`);
+                }
+            }
+
             return { content: [{ type: "text", text }] };
         } catch (error) {
             const errorMessage = typeof error === "string"
@@ -951,6 +1026,84 @@ export class ToolHandlers {
                     text: `Error expanding context: ${errorMessage}`
                 }],
                 isError: true
+            };
+        }
+    }
+
+    /**
+     * usage-logging-dataset: capture the final synthesized answer that the MCP
+     * server cannot observe (it is produced by the consuming agent out of the
+     * retrieved context). The agent calls this at the end of a reference-answer
+     * task with the `answer` text, the `request_ids` it drew on (from the
+     * `Request-ID` lines of its search_code / expand_context calls), and an
+     * optional in-session quality signal. Best-effort and default-safe: a
+     * logging failure never errors, and when capture is disabled it returns a
+     * benign notice instead.
+     */
+    public async handleRecordAnswer(args: any) {
+        const { answer, request_ids, signal, note, query } = args ?? {};
+
+        if (typeof answer !== "string" || answer.trim().length === 0) {
+            return {
+                content: [{
+                    type: "text",
+                    text: "Error: record_answer requires a non-empty `answer` string."
+                }],
+                isError: true
+            };
+        }
+
+        const requestIds = Array.isArray(request_ids)
+            ? request_ids.filter((id: any) => typeof id === "string" && id.trim().length > 0)
+            : [];
+        if (requestIds.length === 0) {
+            return {
+                content: [{
+                    type: "text",
+                    text: "Error: record_answer requires `request_ids` — a non-empty array of the Request-ID(s) returned by the search_code / expand_context calls this answer used."
+                }],
+                isError: true
+            };
+        }
+
+        if (!isUsageLogEnabled()) {
+            return {
+                content: [{
+                    type: "text",
+                    text: "Usage logging is disabled (RAG_USAGE_LOG); answer not recorded."
+                }]
+            };
+        }
+
+        const VALID_SIGNALS = ["helpful", "not_helpful", "unknown"];
+        const normalizedSignal = typeof signal === "string" && VALID_SIGNALS.includes(signal)
+            ? signal
+            : undefined;
+
+        try {
+            const recordId = newAnswerId();
+            logAnswer({
+                record_id: recordId,
+                answer,
+                request_ids: requestIds,
+                ...(normalizedSignal ? { signal: normalizedSignal } : {}),
+                ...(typeof note === "string" && note.length > 0 ? { note } : {}),
+                ...(typeof query === "string" && query.length > 0 ? { query } : {}),
+            });
+            return {
+                content: [{
+                    type: "text",
+                    text: `Recorded answer ${recordId} against ${requestIds.length} request id(s).`
+                }]
+            };
+        } catch (error: any) {
+            // Best-effort: a logging failure must not surface as a tool error.
+            console.error(`[USAGE-LOG] record_answer capture failed: ${error?.message ?? error}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: "Answer capture encountered an error and was skipped (logged to stderr)."
+                }]
             };
         }
     }
