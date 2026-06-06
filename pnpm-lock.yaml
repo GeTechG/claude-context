@@ -3990,7 +3990,7 @@ packages:
         optional: true
 
   tree-sitter-haxe@file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz:
-    resolution: {integrity: sha512-yzFklqUCo+XW15FnSfl4xZhS376aBk6V/UygqtFAcGXoQM3hbS2c623nx1QbijOLi4AUei98nSZBmbmeAkfriw==, tarball: file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz}
+    resolution: {integrity: sha512-Deze8RbgajlgtfTog+RJso5ylYsPxN9q5oezZa+4mDbejfL0UfWyduEyVvOSMeJItZNMbl6b3iYbv+2Zzyxo5w==, tarball: file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz}
     version: 0.4.6
     peerDependencies:
       tree-sitter: ^0.25.0

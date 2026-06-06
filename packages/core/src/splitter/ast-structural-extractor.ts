@@ -274,11 +274,18 @@ function extractClassJava(node: Parser.SyntaxNode): ClassStructural {
     return packClass(extendsName, implementsList);
 }
 
-// rag-graph-supertype-extraction-fix: tree-sitter-haxe@0.4.6 emits `extends` /
-// `implements` as bare keyword tokens (no wrapper nodes) directly under
-// ClassType, with the type expression (`TypePath`) as the immediately-following
-// sibling. The wrapper-node search the previous implementation relied on never
-// matched the deployed grammar, silently dropping every Haxe heritage edge.
+// tree-sitter-haxe ClassType exposes heritage two ways: as `extends` /
+// `implements` FIELDS (one `extends`, repeated `implements`) pointing at the
+// type expression, AND as bare keyword tokens followed by that expression as the
+// next sibling. We read the fields first (`extractHaxeHeritageFromFields`) —
+// field access is robust to anonymous-keyword-token visibility shifts across
+// grammar/ABI regenerations — and fall back to the keyword-token sibling walk
+// (`extractHaxeHeritageFromAst`) for older/variant grammars that lack the fields.
+// rag-graph-supertype-extraction-fix history: an earlier implementation searched
+// for wrapper nodes that the deployed grammar never emitted, silently dropping
+// every Haxe heritage edge; the sibling walk replaced it, the field read hardens
+// it. HAXE_TYPEPATH_NODE_TYPES enumerates the type-expression node names the
+// sibling-walk fallback accepts.
 const HAXE_TYPEPATH_NODE_TYPES = new Set<string>([
     'TypePath', 'type_path',
     'IdentifierTypePath', 'identifier_type_path',
@@ -323,7 +330,33 @@ export function normalizeTypeName(raw: string): string | null {
     return /^[A-Za-z_][A-Za-z0-9_]*$/.test(out) ? out : null;
 }
 
+// Preferred path: read the `extends` / `implements` fields the current grammar
+// emits on ClassType. Feature-detected so synthetic test nodes (and any binding
+// lacking `childrenForFieldName`) transparently fall through to the sibling walk.
+function extractHaxeHeritageFromFields(node: Parser.SyntaxNode): ClassStructural {
+    if (typeof (node as { childrenForFieldName?: unknown }).childrenForFieldName !== 'function') {
+        return {};
+    }
+    let extendsName: string | undefined;
+    const implementsList: string[] = [];
+    for (const c of node.childrenForFieldName('extends') ?? []) {
+        if (!c) continue;
+        const norm = normalizeTypeName(c.text);
+        if (norm) { extendsName = norm; break; }
+    }
+    for (const c of node.childrenForFieldName('implements') ?? []) {
+        if (!c) continue;
+        const norm = normalizeTypeName(c.text);
+        if (norm) implementsList.push(norm);
+    }
+    return packClass(extendsName, implementsList);
+}
+
 function extractHaxeHeritageFromAst(node: Parser.SyntaxNode): ClassStructural {
+    const byField = extractHaxeHeritageFromFields(node);
+    if (byField.extends || (byField.implements && byField.implements.length > 0)) {
+        return byField;
+    }
     let extendsName: string | undefined;
     const implementsList: string[] = [];
     let expectingExtends = false;

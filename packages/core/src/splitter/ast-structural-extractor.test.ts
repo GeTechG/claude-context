@@ -158,6 +158,14 @@ describe('extractClassStructural — Haxe regex fallback (rag-graph-supertype-ex
         const tree = haxeParser().parse(src);
         const root = tree.rootNode;
         expect(() => extractClassStructural(root, 'haxe')).not.toThrow();
+        // The real-grammar heritage CONTRACT (ClassType `extends:` field +
+        // repeated `implements:` fields, which `extractHaxeHeritageFromFields`
+        // reads) is locked by a tree-sitter corpus test in the grammar submodule
+        // — test/corpus/type_decl.txt «class declaration extends + multi-implements»,
+        // run via `tree-sitter test`. A hard-asserting correctness check cannot
+        // live here: under `jest --runInBand` a second real-grammar parse in this
+        // worker corrupts the shared native binding (`tree.rootNode` goes
+        // undefined), cascading failures into every other grammar-loading suite.
     });
 });
 
