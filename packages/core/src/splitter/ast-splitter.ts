@@ -3,77 +3,14 @@ import { Splitter, CodeChunk } from './index';
 import { MarkdownSplitter, MentionedVocabProvider } from './markdown-splitter';
 import { extractStructural, extractClassStructural, extractTypeRelations } from './ast-structural-extractor';
 
-// Language parsers
-const JavaScript = require('tree-sitter-javascript');
-const TypeScript = require('tree-sitter-typescript').typescript;
-const Python = require('tree-sitter-python');
-const Java = require('tree-sitter-java');
-const Cpp = require('tree-sitter-cpp');
-const Go = require('tree-sitter-go');
-const Rust = require('tree-sitter-rust');
-const CSharp = require('tree-sitter-c-sharp');
-const Scala = require('tree-sitter-scala');
-const Haxe = require('tree-sitter-haxe');
-const Hxml = require('tree-sitter-hxml');
-
-// Node types that represent logical code units
-const SPLITTABLE_NODE_TYPES = {
-    javascript: ['function_declaration', 'arrow_function', 'class_declaration', 'method_definition', 'export_statement'],
-    typescript: ['function_declaration', 'arrow_function', 'class_declaration', 'method_definition', 'export_statement', 'interface_declaration', 'type_alias_declaration'],
-    python: ['function_definition', 'class_definition', 'decorated_definition', 'async_function_definition'],
-    java: ['method_declaration', 'class_declaration', 'interface_declaration', 'constructor_declaration'],
-    cpp: ['function_definition', 'class_specifier', 'namespace_definition', 'declaration'],
-    go: ['function_declaration', 'method_declaration', 'type_declaration', 'var_declaration', 'const_declaration'],
-    rust: ['function_item', 'impl_item', 'struct_item', 'enum_item', 'trait_item', 'mod_item'],
-    csharp: ['method_declaration', 'class_declaration', 'interface_declaration', 'struct_declaration', 'enum_declaration'],
-    scala: ['method_declaration', 'class_declaration', 'interface_declaration', 'constructor_declaration'],
-    haxe: ['ClassType', 'EnumType', 'AbstractType', 'DefType', 'ClassMethod'],
-    hxml: ['section']
-};
-
-// Map a tree-sitter node type to a normalized symbol_kind tag.
-const NODE_TYPE_TO_SYMBOL_KIND: Record<string, string> = {
-    function_declaration: 'function',
-    function_definition: 'function',
-    function_item: 'function',
-    arrow_function: 'function',
-    async_function_definition: 'function',
-    method_declaration: 'method',
-    method_definition: 'method',
-    class_declaration: 'class',
-    class_definition: 'class',
-    class_specifier: 'class',
-    struct_item: 'class',
-    struct_declaration: 'class',
-    impl_item: 'class',
-    interface_declaration: 'interface',
-    trait_item: 'interface',
-    enum_declaration: 'enum',
-    enum_item: 'enum',
-    type_alias_declaration: 'typedef',
-    type_declaration: 'typedef',
-    constructor_declaration: 'method',
-    namespace_definition: 'class',
-    mod_item: 'class',
-    decorated_definition: 'function',
-    export_statement: 'function',
-    var_declaration: 'typedef',
-    const_declaration: 'typedef',
-    declaration: 'function',
-    ClassType: 'class',
-    EnumType: 'enum',
-    AbstractType: 'abstract',
-    DefType: 'typedef',
-    ClassMethod: 'method',
-};
-
-// Tree-sitter node types that introduce a symbol scope worth recording as a parent.
-const PARENT_SCOPE_NODE_TYPES = new Set<string>([
-    'class_declaration', 'class_definition', 'class_specifier', 'struct_item', 'struct_declaration',
-    'interface_declaration', 'trait_item', 'impl_item', 'enum_declaration', 'enum_item',
-    'namespace_definition', 'mod_item',
-    'ClassType', 'EnumType', 'AbstractType', 'DefType',
-]);
+// Language grammars, splittable node types, symbol-kind mapping and parent-scope
+// set all come from the data-driven registry. Adding a language = one entry there.
+import {
+    getSplittableTypes,
+    loadLanguage,
+    NODE_TYPE_TO_SYMBOL_KIND,
+    PARENT_SCOPE_NODE_TYPES,
+} from './grammar-registry';
 
 export class AstCodeSplitter implements Splitter {
     private chunkSize: number = 2500;
@@ -102,7 +39,7 @@ export class AstCodeSplitter implements Splitter {
         }
 
         // Check if language is supported by AST splitter
-        const langConfig = this.getLanguageConfig(language);
+        const langConfig = await this.getLanguageConfig(language);
         if (!langConfig) {
             console.log(`📝 Language ${language} not supported by AST, using LangChain splitter for: ${filePath || 'unknown'}`);
             return await this.langchainFallback.split(code, language, filePath);
@@ -155,30 +92,12 @@ export class AstCodeSplitter implements Splitter {
         this.markdownSplitter.setMentionedVocabProvider(provider);
     }
 
-    private getLanguageConfig(language: string): { parser: any; nodeTypes: string[] } | null {
-        const langMap: Record<string, { parser: any; nodeTypes: string[] }> = {
-            'javascript': { parser: JavaScript, nodeTypes: SPLITTABLE_NODE_TYPES.javascript },
-            'js': { parser: JavaScript, nodeTypes: SPLITTABLE_NODE_TYPES.javascript },
-            'typescript': { parser: TypeScript, nodeTypes: SPLITTABLE_NODE_TYPES.typescript },
-            'ts': { parser: TypeScript, nodeTypes: SPLITTABLE_NODE_TYPES.typescript },
-            'python': { parser: Python, nodeTypes: SPLITTABLE_NODE_TYPES.python },
-            'py': { parser: Python, nodeTypes: SPLITTABLE_NODE_TYPES.python },
-            'java': { parser: Java, nodeTypes: SPLITTABLE_NODE_TYPES.java },
-            'cpp': { parser: Cpp, nodeTypes: SPLITTABLE_NODE_TYPES.cpp },
-            'c++': { parser: Cpp, nodeTypes: SPLITTABLE_NODE_TYPES.cpp },
-            'c': { parser: Cpp, nodeTypes: SPLITTABLE_NODE_TYPES.cpp },
-            'go': { parser: Go, nodeTypes: SPLITTABLE_NODE_TYPES.go },
-            'rust': { parser: Rust, nodeTypes: SPLITTABLE_NODE_TYPES.rust },
-            'rs': { parser: Rust, nodeTypes: SPLITTABLE_NODE_TYPES.rust },
-            'cs': { parser: CSharp, nodeTypes: SPLITTABLE_NODE_TYPES.csharp },
-            'csharp': { parser: CSharp, nodeTypes: SPLITTABLE_NODE_TYPES.csharp },
-            'scala': { parser: Scala, nodeTypes: SPLITTABLE_NODE_TYPES.scala },
-            'haxe': { parser: Haxe, nodeTypes: SPLITTABLE_NODE_TYPES.haxe },
-            'hx': { parser: Haxe, nodeTypes: SPLITTABLE_NODE_TYPES.haxe },
-            'hxml': { parser: Hxml, nodeTypes: SPLITTABLE_NODE_TYPES.hxml }
-        };
-
-        return langMap[language.toLowerCase()] || null;
+    private async getLanguageConfig(language: string): Promise<{ parser: any; nodeTypes: string[] } | null> {
+        const nodeTypes = getSplittableTypes(language);
+        if (!nodeTypes) return null;
+        const parser = await loadLanguage(language);
+        if (!parser) return null;
+        return { parser, nodeTypes };
     }
 
     private extractChunks(

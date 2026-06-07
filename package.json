@@ -44,6 +44,7 @@
     },
     "pnpm": {
         "onlyBuiltDependencies": [
+            "tree-sitter",
             "tree-sitter-haxe",
             "tree-sitter-hxml"
         ]

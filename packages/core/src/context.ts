@@ -148,7 +148,7 @@ const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
     '.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.cpp', '.c', '.h', '.hpp',
     '.cs', '.go', '.rs', '.php', '.rb', '.swift', '.kt', '.scala', '.m', '.mm',
-    '.dart', '.hx', '.hxml',
+    '.dart', '.hx', '.hxml', '.ml', '.mli',
     // Text and markup files
     '.md', '.markdown', '.rst', '.ipynb',
     // '.txt',  '.json', '.yaml', '.yml', '.xml', '.html', '.htm',
@@ -3551,6 +3551,8 @@ export class Context {
             '.dart': 'dart',
             '.hx': 'haxe',
             '.hxml': 'hxml',
+            '.ml': 'ocaml',
+            '.mli': 'ocaml_interface',
             '.ipynb': 'jupyter',
             '.md': 'markdown',
             '.markdown': 'markdown',
