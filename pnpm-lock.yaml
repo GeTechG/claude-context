@@ -184,6 +184,9 @@ importers:
       tree-sitter-haxe:
         specifier: file:../../../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz
         version: file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz(tree-sitter@0.21.1)
+      tree-sitter-hxml:
+        specifier: file:../../../tree-sitter-hxml/tree-sitter-hxml-0.2.3.tgz
+        version: file:../tree-sitter-hxml/tree-sitter-hxml-0.2.3.tgz(tree-sitter@0.21.1)
       tree-sitter-java:
         specifier: ^0.21.0
         version: 0.21.0(tree-sitter@0.21.1)
@@ -3990,8 +3993,17 @@ packages:
         optional: true
 
   tree-sitter-haxe@file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz:
-    resolution: {integrity: sha512-Deze8RbgajlgtfTog+RJso5ylYsPxN9q5oezZa+4mDbejfL0UfWyduEyVvOSMeJItZNMbl6b3iYbv+2Zzyxo5w==, tarball: file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz}
+    resolution: {integrity: sha512-YFQTsnLd/iPPQMhz6EtC45bPmgQ5m1HfqsFepwsajTS/KdEC4NGCuFa+tfGtTH/ugOnB6jjWfDLa2wVDSpQyhQ==, tarball: file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz}
     version: 0.4.6
+    peerDependencies:
+      tree-sitter: ^0.25.0
+    peerDependenciesMeta:
+      tree-sitter:
+        optional: true
+
+  tree-sitter-hxml@file:../tree-sitter-hxml/tree-sitter-hxml-0.2.3.tgz:
+    resolution: {integrity: sha512-n47P1KeXIKcY4rO622NcAT2YyaSfSGduMpFHmZF581W8XhNn2Egx7Evl7NzLF4YvzGm3y6f5qYNkG6s55VxF+Q==, tarball: file:../tree-sitter-hxml/tree-sitter-hxml-0.2.3.tgz}
+    version: 0.2.3
     peerDependencies:
       tree-sitter: ^0.25.0
     peerDependenciesMeta:
@@ -8653,6 +8665,13 @@ snapshots:
       tree-sitter: 0.21.1
 
   tree-sitter-haxe@file:../tree-sitter-haxe/tree-sitter-haxe-0.4.6.tgz(tree-sitter@0.21.1):
+    dependencies:
+      node-addon-api: 8.7.0
+      node-gyp-build: 4.8.4
+    optionalDependencies:
+      tree-sitter: 0.21.1
+
+  tree-sitter-hxml@file:../tree-sitter-hxml/tree-sitter-hxml-0.2.3.tgz(tree-sitter@0.21.1):
     dependencies:
       node-addon-api: 8.7.0
       node-gyp-build: 4.8.4

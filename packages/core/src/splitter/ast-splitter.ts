@@ -14,6 +14,7 @@ const Rust = require('tree-sitter-rust');
 const CSharp = require('tree-sitter-c-sharp');
 const Scala = require('tree-sitter-scala');
 const Haxe = require('tree-sitter-haxe');
+const Hxml = require('tree-sitter-hxml');
 
 // Node types that represent logical code units
 const SPLITTABLE_NODE_TYPES = {
@@ -26,7 +27,8 @@ const SPLITTABLE_NODE_TYPES = {
     rust: ['function_item', 'impl_item', 'struct_item', 'enum_item', 'trait_item', 'mod_item'],
     csharp: ['method_declaration', 'class_declaration', 'interface_declaration', 'struct_declaration', 'enum_declaration'],
     scala: ['method_declaration', 'class_declaration', 'interface_declaration', 'constructor_declaration'],
-    haxe: ['ClassType', 'EnumType', 'AbstractType', 'DefType', 'ClassMethod']
+    haxe: ['ClassType', 'EnumType', 'AbstractType', 'DefType', 'ClassMethod'],
+    hxml: ['section']
 };
 
 // Map a tree-sitter node type to a normalized symbol_kind tag.
@@ -172,7 +174,8 @@ export class AstCodeSplitter implements Splitter {
             'csharp': { parser: CSharp, nodeTypes: SPLITTABLE_NODE_TYPES.csharp },
             'scala': { parser: Scala, nodeTypes: SPLITTABLE_NODE_TYPES.scala },
             'haxe': { parser: Haxe, nodeTypes: SPLITTABLE_NODE_TYPES.haxe },
-            'hx': { parser: Haxe, nodeTypes: SPLITTABLE_NODE_TYPES.haxe }
+            'hx': { parser: Haxe, nodeTypes: SPLITTABLE_NODE_TYPES.haxe },
+            'hxml': { parser: Hxml, nodeTypes: SPLITTABLE_NODE_TYPES.hxml }
         };
 
         return langMap[language.toLowerCase()] || null;
@@ -414,7 +417,7 @@ export class AstCodeSplitter implements Splitter {
         const supportedLanguages = [
             'javascript', 'js', 'typescript', 'ts', 'python', 'py',
             'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala',
-            'haxe', 'hx'
+            'haxe', 'hx', 'hxml'
         ];
         return supportedLanguages.includes(language.toLowerCase());
     }

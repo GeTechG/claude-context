@@ -3550,7 +3550,7 @@ export class Context {
             '.mm': 'objective-c',
             '.dart': 'dart',
             '.hx': 'haxe',
-            '.hxml': 'haxe',
+            '.hxml': 'hxml',
             '.ipynb': 'jupyter',
             '.md': 'markdown',
             '.markdown': 'markdown',
