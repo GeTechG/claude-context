@@ -34,7 +34,59 @@ function sparseToDict(sparse: { indices: number[]; values: number[] }): Record<s
     return out;
 }
 
+// Defensive varchar clamping. The collection schema declares per-field
+// max_length limits (see createCollection / createHybridCollection below). A
+// SINGLE chunk whose metadata overflows its field aborts the WHOLE insert
+// batch in Milvus (IllegalArgument 1100), silently dropping every other valid
+// chunk in that batch too — observed with godot's vendored apksig where
+// `imports` was 2533 > 2048. Clamp every varchar field to its limit before
+// insert. JSON-array fields are shrunk by dropping trailing elements so the
+// result stays valid JSON for graph-expansion's JSON.parse; plain strings are
+// byte-truncated. Keep VARCHAR_LIMITS in sync with the schema definitions.
+const VARCHAR_LIMITS: Record<string, number> = {
+    relativePath: 1024,
+    fileExtension: 32,
+    content_type: 32,
+    symbol_kind: 64,
+    symbol_name: 512,
+    parent_symbol: 512,
+    heading_path: 2048,
+    imports: 2048,
+    extends: 512,
+    implements: 2048,
+    mentioned_symbols: 4096,
+};
+const JSON_ARRAY_VARCHARS = new Set(['imports', 'implements', 'mentioned_symbols', 'heading_path']);
 
+function clampVarcharField(field: string, value: any): any {
+    const limit = VARCHAR_LIMITS[field];
+    if (limit == null || value == null) return value;
+    const s = typeof value === 'string' ? value : String(value);
+    if (Buffer.byteLength(s, 'utf8') <= limit) return value;
+    if (JSON_ARRAY_VARCHARS.has(field)) {
+        try {
+            const arr = JSON.parse(s);
+            if (Array.isArray(arr)) {
+                const a = arr.slice();
+                while (a.length && Buffer.byteLength(JSON.stringify(a), 'utf8') > limit) a.pop();
+                const out = JSON.stringify(a);
+                console.warn(`[MilvusDB] clamped varchar '${field}': ${arr.length}→${a.length} items (limit ${limit}B)`);
+                return out;
+            }
+        } catch { /* not JSON — fall through to byte truncation */ }
+    }
+    let truncated = Buffer.from(s, 'utf8').subarray(0, limit).toString('utf8');
+    while (truncated.length && Buffer.byteLength(truncated, 'utf8') > limit) truncated = truncated.slice(0, -1);
+    console.warn(`[MilvusDB] clamped varchar '${field}': truncated to ${Buffer.byteLength(truncated, 'utf8')}B (limit ${limit}B)`);
+    return truncated;
+}
+
+function clampRow(row: Record<string, any>): Record<string, any> {
+    for (const field of Object.keys(VARCHAR_LIMITS)) {
+        if (field in row) row[field] = clampVarcharField(field, row[field]);
+    }
+    return row;
+}
 
 export class MilvusVectorDatabase implements VectorDatabase {
     protected config: MilvusConfig;
@@ -432,7 +484,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
         }
 
         console.log('Inserting documents into collection:', collectionName);
-        const data = documents.map(doc => ({
+        const data = documents.map(doc => clampRow({
             id: doc.id,
             vector: doc.vector,
             content: doc.content,
@@ -834,7 +886,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
             if (doc.sparse_learned) {
                 row.sparse_learned = sparseToDict(doc.sparse_learned);
             }
-            return row;
+            return clampRow(row);
         });
 
         const resp: any = await this.client.insert({
