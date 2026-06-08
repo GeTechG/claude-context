@@ -223,8 +223,36 @@ export class SyncManager {
         }
     }
 
+    /**
+     * Read CLAUDE_CONTEXT_BACKGROUND_SYNC. Default ON (unset → true) to preserve
+     * upstream behavior. When explicitly set to a false value the MCP server does
+     * NO background indexing at all — no initial sync, no 5-minute polling, and no
+     * trigger-file watcher — so the index only ever changes via an explicit
+     * index_codebase tool call or the standalone infra/*-knowledge.js scripts run
+     * by hand. local-rag sets this off in .mcp.json to keep updates manual.
+     */
+    private isBackgroundSyncEnabled(): boolean {
+        const v = (envManager.get('CLAUDE_CONTEXT_BACKGROUND_SYNC') ?? '').trim().toLowerCase();
+        if (!v) return true;
+        if (['1', 'true', 'yes', 'on'].includes(v)) return true;
+        if (['0', 'false', 'no', 'off'].includes(v)) return false;
+        console.warn(
+            `[SYNC-DEBUG] Invalid CLAUDE_CONTEXT_BACKGROUND_SYNC value '${v}'. ` +
+            'Expected true/false. Background sync will remain enabled.'
+        );
+        return true;
+    }
+
     public startBackgroundSync(): void {
         console.log('[SYNC-DEBUG] startBackgroundSync() called');
+
+        // Manual-only mode: skip ALL background indexing (initial + periodic +
+        // trigger watcher). The index then changes only via explicit index_codebase
+        // calls or the standalone scripts. See isBackgroundSyncEnabled().
+        if (!this.isBackgroundSyncEnabled()) {
+            console.log('[SYNC-DEBUG] Background sync disabled via CLAUDE_CONTEXT_BACKGROUND_SYNC=false — manual updates only');
+            return;
+        }
 
         // Set up the trigger file watcher FIRST, independent of polling. Polling may
         // be gated off by other configuration (e.g. opt-in CLAUDE_CONTEXT_BACKGROUND_SYNC
