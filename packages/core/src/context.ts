@@ -181,6 +181,16 @@ const DEFAULT_IGNORE_PATTERNS = [
     '__pycache__/**',
     '.pytest_cache/**',
 
+    // Test directories — kept out of the reference index. This MUST stay in
+    // sync with the standalone indexers' EXTRA_IGNORES (infra/index-knowledge.js
+    // + infra/update-knowledge.js). Previously only those scripts ignored tests,
+    // while the MCP index_codebase / sync-watcher paths did not, so the two
+    // fought over the same Milvus collections (scripts purging tests, the MCP
+    // watcher re-adding them on the next change). Making it a DEFAULT pattern
+    // gives both paths one source of truth.
+    'tests/**',
+    '**/tests/**',
+
     // Logs and temporary files
     'logs/**',
     'tmp/**',
