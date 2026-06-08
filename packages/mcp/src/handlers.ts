@@ -1343,4 +1343,113 @@ export class ToolHandlers {
             };
         }
     }
-} 
+
+    /**
+     * list_categories — enumerate the knowledge-base categories and how much of
+     * each is actually searchable. A "category" is an immediate child directory
+     * of the knowledge root (e.g. `haxe`, `godot`, `game_engine_books`); all
+     * categories share the same Milvus collection(s) keyed by the root path,
+     * distinguished by their `relativePath` prefix. We read the root's child
+     * dirs (the canonical category set, which also surfaces dirs present on disk
+     * but not yet indexed) and count indexed chunks per category straight from
+     * Milvus — independent of the MCP snapshot registry, which is empty when the
+     * corpus was indexed via the standalone infra/*-knowledge.js scripts.
+     */
+    public async handleListCategories(args: any) {
+        const { path: rootPath } = args || {};
+        try {
+            const absRoot = ensureAbsolutePath(rootPath);
+
+            if (!fs.existsSync(absRoot) || !fs.statSync(absRoot).isDirectory()) {
+                return {
+                    content: [{ type: "text", text: `Error: Path '${absRoot}' does not exist or is not a directory.` }],
+                    isError: true
+                };
+            }
+
+            const addr = this.context.getCollectionAddress(absRoot);
+            const vdb = this.context.getVectorDatabase();
+
+            // Collections to count against, deduped by name (in non-split mode
+            // prose === code === legacy → a single "chunks" column).
+            const wanted = addr.isSplit
+                ? [{ label: 'code', name: addr.code }, { label: 'doc', name: addr.prose }]
+                : [{ label: 'chunks', name: addr.legacy }];
+            const cols: { label: string; name: string }[] = [];
+            for (const c of wanted) {
+                if (cols.some(x => x.name === c.name)) continue;
+                if (await vdb.hasCollection(c.name)) cols.push(c);
+            }
+
+            if (cols.length === 0) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `No index exists for '${absRoot}' yet. Index it with the index_codebase tool or the standalone infra/{index,update}-knowledge.js scripts, then ask again.`
+                    }]
+                };
+            }
+
+            // Categories = immediate, non-dot child directories of the root.
+            const categories = fs.readdirSync(absRoot, { withFileTypes: true })
+                .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+                .map(e => e.name)
+                .sort((a, b) => a.localeCompare(b));
+
+            const countFor = async (collName: string, cat: string): Promise<number> => {
+                try {
+                    // `relativePath` values look like `<category>/...`; the `/`
+                    // anchors the prefix so `go/%` can't match `golang/...`.
+                    const rows = await vdb.query(collName, `relativePath like "${cat}/%"`, ["count(*)"]);
+                    const raw = rows && rows[0] ? (rows[0]["count(*)"] ?? rows[0].count) : 0;
+                    const n = typeof raw === 'string' ? parseInt(raw, 10) : Number(raw);
+                    return Number.isFinite(n) ? n : 0;
+                } catch {
+                    return 0;
+                }
+            };
+
+            const rows: { cat: string; counts: Record<string, number>; total: number }[] = [];
+            for (const cat of categories) {
+                const counts: Record<string, number> = {};
+                let total = 0;
+                for (const c of cols) {
+                    const n = await countFor(c.name, cat);
+                    counts[c.label] = n;
+                    total += n;
+                }
+                rows.push({ cat, counts, total });
+            }
+
+            const indexed = rows.filter(r => r.total > 0);
+            const pending = rows.filter(r => r.total === 0);
+
+            let text = `Knowledge base categories under ${absRoot}\n`;
+            text += `(search a category by calling search_code with path="${absRoot}" and naming it in the query)\n`;
+
+            if (indexed.length === 0) {
+                text += `\nNothing is indexed yet — every category dir on disk has 0 chunks.`;
+            } else {
+                text += `\nSearchable — ask about any of these:\n`;
+                for (const r of indexed) {
+                    const breakdown = cols.map(c => `${(r.counts[c.label] || 0).toLocaleString()} ${c.label}`).join(' + ');
+                    text += `  • ${r.cat} — ${breakdown} chunks\n`;
+                }
+            }
+
+            if (pending.length > 0) {
+                text += `\nOn disk but NOT indexed (can't be searched until indexed):\n`;
+                for (const r of pending) text += `  • ${r.cat}\n`;
+            }
+
+            text += `\n${indexed.length} searchable / ${rows.length} total categories.`;
+
+            return { content: [{ type: "text", text }] };
+        } catch (error: any) {
+            return {
+                content: [{ type: "text", text: `Error listing categories: ${error?.message || String(error)}` }],
+                isError: true
+            };
+        }
+    }
+}

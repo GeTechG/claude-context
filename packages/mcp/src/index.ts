@@ -238,6 +238,20 @@ This tool is versatile and can be used before completing various tasks to retrie
                         }
                     },
                     {
+                        name: "list_categories",
+                        description: `List what the knowledge base actually contains — the categories you can ask about. A category is a top-level area of the corpus (e.g. a library or book set such as 'haxe', 'godot', 'game_engine_books'). Use this to discover the available topics before searching, when the user asks "what's in the knowledge base / what can I ask about", or to confirm whether a specific library is indexed. Returns each category with its indexed chunk counts (and a code/doc breakdown when the index is split), plus any categories that exist on disk but are NOT indexed yet (so can't be searched). Counts come straight from the vector store, so the result is accurate even when nothing is registered in the indexing-status snapshot. Pass the ABSOLUTE path to the knowledge root (the shared parent directory of the categories — the same path you pass to search_code).`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                path: {
+                                    type: "string",
+                                    description: `ABSOLUTE path to the knowledge root (the shared parent directory whose child directories are the categories; same path used for search_code).`
+                                }
+                            },
+                            required: ["path"]
+                        }
+                    },
+                    {
                         name: "expand_context",
                         description: `Follow the deterministic prose-graph to pull in a chunk's explicit 1-hop neighbours when a search_code answer is incomplete. Call it after search_code when you need the connected structure around a result — the parent/child sections, the code example next to a passage, co-mentioned chunks, the next chunk in the file, or an internally-linked page. Pass the \`Chunk-ID\` line from the search_code result as \`chunk_id\`. Returns each neighbour's relationship type (heading / code_example / co_mention / sequence / link), edge weight, location, heading path, content_type, and content. Optionally narrow with \`edge_types\` (e.g. ['heading','code_example'] for "this section and its examples") and bound with \`limit\`. This does NOT change retrieval ranking; it is a read-only navigation supplement to search_code. If the prose-graph side-index is unavailable it says so without affecting search.`,
                         inputSchema: {
@@ -324,6 +338,8 @@ This tool is versatile and can be used before completing various tasks to retrie
                     return await this.toolHandlers.handleClearIndex(args);
                 case "get_indexing_status":
                     return await this.toolHandlers.handleGetIndexingStatus(args);
+                case "list_categories":
+                    return await this.toolHandlers.handleListCategories(args);
 
                 default:
                     throw new Error(`Unknown tool: ${name}`);
