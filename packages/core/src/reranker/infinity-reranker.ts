@@ -1,4 +1,5 @@
 import { Reranker, RerankResult } from './base-reranker';
+import { wrapFetchWithAutostart } from '../embedding/sidecar-autostart';
 
 export interface InfinityRerankerConfig {
     model: string;
@@ -36,13 +37,15 @@ export class InfinityReranker extends Reranker {
         super();
         this.config = { ...config };
         this.config.baseURL = (config.baseURL || 'http://localhost:7997').replace(/\/+$/, '');
-        this.fetchImpl = config.fetch || (globalThis.fetch as typeof fetch);
+        const baseFetch = config.fetch || (globalThis.fetch as typeof fetch);
 
-        if (!this.fetchImpl) {
+        if (!baseFetch) {
             throw new Error(
                 '[InfinityReranker] global fetch is not available; pass config.fetch or run on Node 18+',
             );
         }
+        // Recover transparently when the sidecar is down (see sidecar-autostart).
+        this.fetchImpl = wrapFetchWithAutostart(baseFetch);
     }
 
     async rerank(query: string, documents: string[]): Promise<RerankResult[]> {

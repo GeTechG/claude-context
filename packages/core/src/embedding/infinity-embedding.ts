@@ -1,4 +1,5 @@
 import { Embedding, EmbeddingVector, SparseVector } from './base-embedding';
+import { wrapFetchWithAutostart } from './sidecar-autostart';
 
 export interface InfinityEmbeddingConfig {
     model: string;
@@ -60,13 +61,15 @@ export class InfinityEmbedding extends Embedding {
         super();
         this.config = { ...config };
         this.config.baseURL = (config.baseURL || 'http://localhost:7997').replace(/\/+$/, '');
-        this.fetchImpl = config.fetch || (globalThis.fetch as typeof fetch);
+        const baseFetch = config.fetch || (globalThis.fetch as typeof fetch);
 
-        if (!this.fetchImpl) {
+        if (!baseFetch) {
             throw new Error(
                 '[InfinityEmbedding] global fetch is not available; pass config.fetch or run on Node 18+',
             );
         }
+        // Recover transparently when the sidecar is down (see sidecar-autostart).
+        this.fetchImpl = wrapFetchWithAutostart(baseFetch);
 
         if (config.dimension) {
             this.dimension = config.dimension;
