@@ -22,6 +22,24 @@ import {
     resolveKnowledgeRoot,
 } from "./usage-logger.js";
 
+// retrieval-confidence-band: map a reranker relevance score (cross-encoder
+// sigmoid, saturates toward 1.0) onto a coarse low|medium|high band so any
+// caller of search_code can tell when a descriptive query under-performed and
+// should seed a symbol-based second hop or fall back to Serena. The thresholds
+// are a HEURISTIC — a relative within-query signal, NOT a calibrated quality
+// probability — and are env-overridable. Graceful: a missing/non-finite score
+// (legacy chunks or a disabled reranker stage) yields null so the band is
+// omitted and the surrounding format stays byte-compatible with the pre-band
+// output.
+function confidenceBand(score: unknown): "low" | "medium" | "high" | null {
+    if (typeof score !== "number" || !Number.isFinite(score)) return null;
+    const lowMax = Number(process.env.RAG_CONFIDENCE_LOW_MAX || "0.30");
+    const highMin = Number(process.env.RAG_CONFIDENCE_HIGH_MIN || "0.70");
+    if (score < lowMax) return "low";
+    if (score < highMin) return "medium";
+    return "high";
+}
+
 export class ToolHandlers {
     private context: Context;
     private snapshotManager: SnapshotManager;
@@ -856,16 +874,40 @@ export class ToolHandlers {
                 // that predate chunk_id exposure; all other lines byte-stable.
                 const chunkIdLine = result.chunk_id ? `   Chunk-ID: ${result.chunk_id}\n` : '';
 
+                // confidence-gated-second-hop: the old `Rank: N` line duplicated
+                // the leading ordinal and carried no signal. Replace it with a
+                // per-result relevance band derived from the reranker score so a
+                // caller knows which hits are weak. Falls back to the legacy
+                // `Rank: N` line when no reranker score is present, keeping the
+                // output byte-compatible for legacy/no-reranker results.
+                const band = confidenceBand(result.score);
+                const rankLine = band
+                    ? `   Relevance: ${band} (${(result.score as number).toFixed(3)})\n`
+                    : `   Rank: ${index + 1}\n`;
+
                 return `${index + 1}. Code snippet (${result.language}) [${codebaseInfo}]\n` +
                     `   Location: ${location}\n` +
                     chunkIdLine +
-                    `   Rank: ${index + 1}\n` +
+                    rankLine +
                     `   Context: \n\`\`\`${result.language}\n${context}\n\`\`\`\n`;
             }).join('\n');
 
             let resultMessage = `Found ${searchResults.length} results for query: "${query}" in codebase '${searchCodebasePath}'${indexingStatusMessage}`;
             if (searchCodebasePath !== absolutePath) {
                 resultMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
+            }
+            // confidence-gated-second-hop: surface a single subquery-level
+            // confidence band from the top reranker score so any caller (not
+            // just the assembler) knows when the whole result set is weak. A
+            // `low` band means even the best hit is poorly relevant — the
+            // descriptive query under-performed; seed a symbol-based re-query
+            // (use the Candidate symbols below) or fall to Serena. Heuristic,
+            // relative within-query signal — not a calibrated probability.
+            // Omitted (byte-compatible) when no reranker score is available.
+            const topBand = confidenceBand((searchResults[0] as any)?.score);
+            if (topBand) {
+                const topScore = ((searchResults[0] as any).score as number).toFixed(3);
+                resultMessage += `\nRetrieval confidence: ${topBand} (top ${topScore}) — heuristic within-query signal; low ⇒ descriptive query under-performed, seed a symbol-based re-query or fall to Serena.`;
             }
             resultMessage += `\n\n${formattedResults}`;
 
@@ -874,7 +916,12 @@ export class ToolHandlers {
             // full-definition lookup (see local-rag SKILL.md).
             const candidateSymbols = (searchResults[0] as any)?.candidateSymbols;
             if (Array.isArray(candidateSymbols) && candidateSymbols.length > 0) {
-                resultMessage += `\n\nCandidate symbols (top ${candidateSymbols.length}, for Serena \`find_symbol\` enrichment): ${candidateSymbols.join(', ')}`;
+                // Dual-purpose: Serena `find_symbol` enrichment AND seed terms for
+                // a confidence-gated symbol-seeded re-query when the band above is
+                // `low` (descriptive query under-performed; these identifiers came
+                // from the weak first result set and bridge to an identifier-rich
+                // second hop).
+                resultMessage += `\n\nCandidate symbols (top ${candidateSymbols.length}, for Serena \`find_symbol\` enrichment or as seed terms for a symbol-seeded re-query): ${candidateSymbols.join(', ')}`;
             }
 
             if (isIndexing) {

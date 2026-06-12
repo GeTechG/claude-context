@@ -3,7 +3,9 @@
 //
 // Two sources per chunk:
 //   code / docstring chunks → metadata (`symbol_name`, `parent_symbol`)
-//                             plus regex over the body for nested defs.
+//                             plus regex over the body for nested defs across
+//                             the corpus's languages (def keywords incl. OCaml/
+//                             ML `type`/`module` + `type t = …` record names).
 //   doc / code_example chunks → regex over the body for qualified names
 //                               (`Foo.bar.baz`) and markdown code spans
 //                               (`` `func()` ``).
@@ -21,7 +23,23 @@ export interface SymbolExtractorOptions {
 
 const DEFAULT_TOP_N = 10;
 
-const NESTED_DEF = /\b(?:class|function|def|fn|interface|enum|typedef|abstract)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+// Definition keywords across the corpus's languages (C/JS/TS/Haxe + Go/Swift/
+// Kotlin/Rust/OCaml/ML families). `let`/`and` are deliberately EXCLUDED here:
+// `let` introduces locals in the large TS corpus (noise across 100k+ chunks)
+// and `and` is also a boolean operator. OCaml/ML type & record names are
+// recovered by ML_TYPE_DEF below instead (the `=` anchor keeps it precise).
+// `fun` is excluded: in OCaml/F# it introduces a lambda (`fun x -> …`) so it
+// would capture the parameter, not a definition. `func` (Go/Swift/GDScript) is
+// kept — there it names a real function.
+const NESTED_DEF = /\b(?:class|function|func|proc|method|protocol|def|fn|interface|enum|typedef|abstract|type|module|val|struct|trait|impl|union|mod|record|namespace|package)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+// OCaml / F# / Reason / Haskell mutual type & record definitions: `type t = …`
+// and the `and t = …` continuations the generic def-keyword scan can't safely
+// capture. The `=` anchor restricts this to real type definitions (not the
+// boolean `and`). Recovers e.g. the Haxe compiler's `typer`, `typer_globals`,
+// `typer_expr`, `typer_field`, `pattern_context` records — the exact seeds the
+// previous C/JS-centric scan dropped (descriptive OCaml queries surfaced no
+// usable seed terms; see assembler-symbol-seeded-second-hop).
+const ML_TYPE_DEF = /\b(?:type|and)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=/g;
 // rag-graph-layer Phase 1.2: shared with markdown-splitter at split time
 // (mentioned_symbols metadata) and with this module at search time
 // (candidateSymbols enrichment).
@@ -36,6 +54,12 @@ export const SYMBOL_STOPWORDS: ReadonlySet<string> = new Set([
     'abstract', 'return', 'import', 'from', 'as', 'if', 'else', 'for',
     'while', 'try', 'catch', 'throw', 'new', 'delete', 'const', 'let',
     'var', 'public', 'private', 'protected', 'static', 'async', 'await',
+    // Newly-recognised def keywords + adjacent modifiers (so they are never
+    // captured as a symbol name, e.g. `module type X`, `let rec foo`).
+    'type', 'and', 'module', 'val', 'struct', 'trait', 'impl', 'union', 'mod',
+    'func', 'fun', 'proc', 'method', 'protocol', 'record', 'namespace',
+    'package', 'rec', 'mutable', 'inline', 'open', 'include', 'in', 'of',
+    'with', 'where',
 ]);
 const STOPWORDS = SYMBOL_STOPWORDS;
 
@@ -100,24 +124,34 @@ export function extractMentionedSymbolsFromText(
     });
 }
 
-function harvestFromCode(r: SemanticSearchResult, sink: Map<string, number>): void {
-    if (r.symbol_name && looksLikeSymbol(r.symbol_name)) {
-        bump(sink, r.symbol_name);
-    }
+// Names harvested here are TRUSTED — they are real definitions seen literally
+// in the returned code (chunk metadata or a def-keyword / record match), so
+// they bypass the vocabulary gate in extractCandidateSymbols (the per-codebase
+// vocab is incomplete and would otherwise drop true seeds like OCaml `type`
+// records). They are added to the `trusted` set as well as counted.
+function harvestFromCode(
+    r: SemanticSearchResult,
+    sink: Map<string, number>,
+    trusted: Set<string>,
+): void {
+    const add = (name: string | undefined | null) => {
+        if (!name || !looksLikeSymbol(name)) return;
+        bump(sink, name);
+        trusted.add(name);
+    };
+    add(r.symbol_name);
     if (r.parent_symbol && looksLikeSymbol(r.parent_symbol)) {
-        bump(sink, r.parent_symbol);
+        add(r.parent_symbol);
         if (r.symbol_name && looksLikeSymbol(r.symbol_name)) {
-            const qualified = `${r.parent_symbol}.${r.symbol_name}`;
-            if (looksLikeSymbol(qualified)) bump(sink, qualified);
+            add(`${r.parent_symbol}.${r.symbol_name}`);
         }
     }
     if (!r.content) return;
     let m: RegExpExecArray | null;
     NESTED_DEF.lastIndex = 0;
-    while ((m = NESTED_DEF.exec(r.content)) !== null) {
-        const name = m[1];
-        if (looksLikeSymbol(name)) bump(sink, name);
-    }
+    while ((m = NESTED_DEF.exec(r.content)) !== null) add(m[1]);
+    ML_TYPE_DEF.lastIndex = 0;
+    while ((m = ML_TYPE_DEF.exec(r.content)) !== null) add(m[1]);
 }
 
 function harvestFromDoc(r: SemanticSearchResult, sink: Map<string, number>): void {
@@ -152,14 +186,15 @@ export function extractCandidateSymbols(
     if (!results || results.length === 0 || topN <= 0) return [];
 
     const counts = new Map<string, number>();
+    const trusted = new Set<string>();
     for (const r of results) {
         if (isCodeDomain(r)) {
-            harvestFromCode(r, counts);
+            harvestFromCode(r, counts, trusted);
         } else if (isDocDomain(r)) {
             harvestFromDoc(r, counts);
         } else {
             // Unknown content_type (legacy chunks): try both, cheap enough.
-            harvestFromCode(r, counts);
+            harvestFromCode(r, counts, trusted);
             harvestFromDoc(r, counts);
         }
     }
@@ -168,6 +203,12 @@ export function extractCandidateSymbols(
     if (options.vocabulary && options.vocabulary.size > 0) {
         const vocab = options.vocabulary;
         entries = entries.filter(([name]) => {
+            // Real definitions seen in the returned code bypass the gate: the
+            // per-codebase vocabulary is incomplete (misses OCaml `type`
+            // records, many nested defs / methods), so hard-dropping a name we
+            // just saw defined would discard a true seed. The vocab gate still
+            // applies to lower-confidence doc-mention tokens.
+            if (trusted.has(name)) return true;
             if (vocab.has(name)) return true;
             // For qualified names, accept if any segment is in vocab —
             // covers cases where the doc references `argparse.ArgumentParser`
