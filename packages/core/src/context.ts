@@ -224,9 +224,9 @@ export interface ContextConfig {
     // pool (`hybrid_v6_prose_<hash>`) under SPLIT_COLLECTIONS=true. When
     // omitted (or === `embedding`), prose chunks/queries use the same
     // embedder as code → behavior is byte-identical to pre-change v6.
-    // The prose embedder MUST share the bge-m3 sparse sidecar (its /sparse
-    // call ignores `model`), so its EmbeddingVector still carries bge-m3
-    // lexical_weights for the prose pool's sparse channel.
+    // The prose embedder MUST share the learned-sparse sidecar (its /sparse
+    // call ignores `model`), so its EmbeddingVector still carries the shared
+    // learned-sparse lexical_weights for the prose pool's sparse channel.
     proseEmbedding?: Embedding;
     vectorDatabase?: VectorDatabase;
     codeSplitter?: Splitter;
@@ -243,7 +243,7 @@ export class Context {
 
     private embedding: Embedding;
     // prose-embedding-swap: distinct prose-pool dense embedder, or undefined
-    // when the prose pool shares the code embedder (default bge-m3).
+    // when the prose pool shares the code embedder (the default).
     private proseEmbedding?: Embedding;
     private vectorDatabase: VectorDatabase;
     private codeSplitter: Splitter;
@@ -366,9 +366,9 @@ export class Context {
     /**
      * prose-embedding-swap: single resolution point for "which dense embedder
      * serves this pool". Code/symbol pools always use `this.embedding`
-     * (bge-m3). The prose pool uses `this.proseEmbedding` when one is wired
-     * AND split mode is active; otherwise it falls back to `this.embedding`
-     * so the default (PROSE_DENSE_MODEL=bge-m3) path is byte-identical.
+     * (the code dense model). The prose pool uses `this.proseEmbedding` when
+     * one is wired AND split mode is active; otherwise it falls back to
+     * `this.embedding` so the shared-embedder default path is byte-identical.
      */
     private hasDistinctProseEmbedding(): boolean {
         return this.proseEmbedding !== undefined;
@@ -621,10 +621,10 @@ export class Context {
 
         // prose-embedding-swap: when the prose pool has a distinct dense model
         // (split mode only), embed the query a second time through it. The
-        // prose embedder shares the bge-m3 sparse sidecar, so its
-        // EmbeddingVector carries the prose dense vector + bge-m3 lexical
-        // sparse — exactly what the prose pool needs (dense swapped, sparse
-        // pinned to bge-m3 per spec). Default path: docQueryEmbedding ===
+        // prose embedder shares the learned-sparse sidecar, so its
+        // EmbeddingVector carries the prose dense vector + the shared
+        // learned-sparse lexical weights — exactly what the prose pool needs
+        // (dense per-pool, sparse shared). Default path: docQueryEmbedding ===
         // queryEmbedding (no extra call, byte-identical).
         let docQueryEmbedding: EmbeddingVector = queryEmbedding;
         if (addr.isSplit && this.hasDistinctProseEmbedding()) {
@@ -3313,9 +3313,9 @@ export class Context {
         // Generate embedding vectors.
         // prose-embedding-swap: in split mode with a distinct prose embedder,
         // embed prose chunks (doc/code_example) through the prose model and
-        // code chunks (code/docstring) through bge-m3. Both embedders share
-        // the bge-m3 sparse sidecar, so every chunk still carries bge-m3
-        // lexical_weights for the sparse channel. Default path (no distinct
+        // code chunks (code/docstring) through the code model. Both embedders
+        // share the learned-sparse sidecar, so every chunk still carries the
+        // learned-sparse lexical_weights for the sparse channel. Default path (no distinct
         // prose embedder) runs a single embedBatch — byte-identical to v6.
         const chunkContents = chunks.map(chunk => chunk.content);
         const batchAddr = this.getCollectionAddress(codebasePath);
@@ -3339,7 +3339,7 @@ export class Context {
             ]);
             proseIdx.forEach((origIdx, k) => { embeddings[origIdx] = proseEmb[k]; });
             codeIdx.forEach((origIdx, k) => { embeddings[origIdx] = codeEmb[k]; });
-            console.log(`[Context] 🧬 Split-embed batch: ${proseIdx.length} prose (${this.embeddingForPool('prose').getProvider()}) + ${codeIdx.length} code (bge-m3)`);
+            console.log(`[Context] 🧬 Split-embed batch: ${proseIdx.length} prose (${this.embeddingForPool('prose').getProvider()}) + ${codeIdx.length} code (${this.embeddingForPool('code').getProvider()})`);
         } else {
             embeddings = await this.embedding.embedBatch(chunkContents);
         }

@@ -91,7 +91,7 @@ export class InfinityEmbedding extends Embedding {
         const url = `${this.config.baseURL}/embeddings`;
         // input_type is NVIDIA NIM convention: asymmetric retrieval models
         // (nemotron-embed, e5, etc) require `query: ` vs `passage: ` prefixes
-        // applied server-side. Models without that requirement (bge-m3) ignore
+        // applied server-side. Symmetric models without that requirement ignore
         // the field, so passing it is always safe.
         const response = await this.fetchImpl(url, {
             method: 'POST',
@@ -121,9 +121,9 @@ export class InfinityEmbedding extends Embedding {
             throw new Error('[InfinityEmbedding] sparseURL not configured');
         }
         const url = `${this.sparseURL}/sparse`;
-        // learned-sparse-swap: forward input_type to /sparse. bge-m3 sparse is
-        // symmetric and ignores it (extra field), but doc-only learned-sparse
-        // models (opensearch-neural-sparse-encoding-doc-v3) are ASYMMETRIC —
+        // learned-sparse-swap: forward input_type to /sparse. The deployed
+        // learned-sparse model (opensearch-neural-sparse-encoding-multilingual-v1)
+        // is doc-only ASYMMETRIC (a symmetric model would ignore it) —
         // documents run the neural encoder while queries use a cheap
         // tokenizer + IDF weight-lookup. Without this hint the sparse sidecar
         // cannot tell a query from a passage on the wire.
@@ -245,8 +245,8 @@ export class InfinityEmbedding extends Embedding {
     async detectDimension(testText: string = 'test'): Promise<number> {
         try {
             // Probing call — indexer-side default ('passage') is fine because
-            // for nemotron-embed both prefixes return the same dim (MRL trim
-            // is applied identically) and bge-m3 ignores the field.
+            // the embedding dimension is independent of the query/passage
+            // prefix for our models (the prefix changes values, not the dim).
             const json = await this.postEmbeddings(this.preprocessText(testText), 'passage');
             const dim = json.data[0].embedding.length;
             return dim;

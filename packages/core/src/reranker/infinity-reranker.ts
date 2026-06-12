@@ -21,7 +21,7 @@ interface InfinityRerankResponse {
 /**
  * Infinity sidecar reranker. Talks to the OpenAI-compatible `/rerank`
  * endpoint of an Infinity v2 server. The server runs the cross-encoder
- * model named in `config.model` (e.g. `BAAI/bge-reranker-v2-m3`).
+ * model named in `config.model` (e.g. `nvidia/llama-nemotron-rerank-1b-v2`).
  *
  * Phase 2 note: Qwen3-Reranker-0.6B is the design target, but
  * `michaelf34/infinity:0.0.77` (latest at 2026-05-03) ships transformers
