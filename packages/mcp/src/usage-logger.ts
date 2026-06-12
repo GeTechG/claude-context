@@ -177,6 +177,43 @@ export function relativise(p: unknown): unknown {
     return relativisePath(p, { repoRoot, knowledgeRoot: defaultKnowledgeRoot(repoRoot) });
 }
 
+/**
+ * Resolve the single knowledge-base root this server serves, so the query
+ * tools can default `path` when the agent omits it (there is only ever one
+ * base in a local-rag deployment). Mirrors infra/lib/knowledge-root.js — the
+ * resolver the indexer uses — so the resolved path, and therefore the Milvus
+ * collection hash, is identical to what was indexed:
+ *   1. LOCAL_RAG_KNOWLEDGE_ROOT env (tilde-expanded)
+ *   2. <repo>/local-rag.config.json → knowledgeRoot (v1, tilde-expanded, absolute)
+ *   3. in-tree <repo>/knowledge
+ * Returns null when none resolve — the caller must then require an explicit path.
+ */
+export function resolveKnowledgeRoot(): string | null {
+    const env = process.env.LOCAL_RAG_KNOWLEDGE_ROOT;
+    if (typeof env === "string" && env.trim().length > 0) {
+        return path.resolve(expandTilde(env.trim()));
+    }
+    const repoRoot = defaultRepoRoot();
+    // Optional external corpus location (same field the indexer reads).
+    try {
+        const raw = fs.readFileSync(path.join(repoRoot, "local-rag.config.json"), "utf8");
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.knowledgeRoot === "string" && parsed.knowledgeRoot.trim().length > 0) {
+            const expanded = expandTilde(parsed.knowledgeRoot.trim());
+            if (path.isAbsolute(expanded)) return path.resolve(expanded);
+        }
+    } catch {
+        // missing / unparseable → fall through to in-tree default
+    }
+    const inTree = path.join(repoRoot, "knowledge");
+    try {
+        if (fs.statSync(inTree).isDirectory()) return inTree;
+    } catch {
+        // not present
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // Output directory
 // ---------------------------------------------------------------------------

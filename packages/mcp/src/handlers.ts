@@ -19,6 +19,7 @@ import {
     logRetrieval,
     logAnswer,
     relativise,
+    resolveKnowledgeRoot,
 } from "./usage-logger.js";
 
 export class ToolHandlers {
@@ -622,7 +623,7 @@ export class ToolHandlers {
     }
 
     public async handleSearchCode(args: any) {
-        const { path: codebasePath, query, limit = 10, extensionFilter, shapeHint } = args;
+        const { path: codebasePath, query, limit = 10, extensionFilter, shapeHint, categories } = args;
         const resultLimit = limit || 10;
 
         // agentic-reference-context-assembler: optional query_shape hint.
@@ -640,15 +641,32 @@ export class ToolHandlers {
             // Sync indexed codebases from cloud first
             await this.syncIndexedCodebasesFromCloud();
 
+            // `path` is optional: a local-rag deployment serves a single
+            // knowledge base, so when the agent omits it we resolve the
+            // configured knowledge root and query that collection. An explicit
+            // path still works (back-compat / multi-codebase setups).
+            const effectivePath = (typeof codebasePath === 'string' && codebasePath.trim().length > 0)
+                ? codebasePath
+                : resolveKnowledgeRoot();
+            if (!effectivePath) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error: no 'path' was provided and the knowledge root could not be resolved. Set LOCAL_RAG_KNOWLEDGE_ROOT, add local-rag.config.json, or pass an absolute path.`
+                    }],
+                    isError: true
+                };
+            }
+
             // Force absolute path resolution - warn if relative path provided
-            const absolutePath = ensureAbsolutePath(codebasePath);
+            const absolutePath = ensureAbsolutePath(effectivePath);
 
             // Validate path exists
             if (!fs.existsSync(absolutePath)) {
                 return {
                     content: [{
                         type: "text",
-                        text: `Error: Path '${absolutePath}' does not exist. Original input: '${codebasePath}'`
+                        text: `Error: Path '${absolutePath}' does not exist. Original input: '${effectivePath}'`
                     }],
                     isError: true
                 };
@@ -746,13 +764,50 @@ export class ToolHandlers {
                 filterExpr = `fileExtension in [${quoted}]`;
             }
 
+            // agent-selected category scope: each category is a top-level dir
+            // under the knowledge root, stored as the `relativePath` prefix in
+            // the single root-keyed collection (the exact prefix list_categories
+            // counts on). Multiple categories OR together; the agent picks them
+            // per query, so there is no server- or config-side hard restriction.
+            // Omitted/empty → no category filter → search every category.
+            let categoryExpr: string | undefined = undefined;
+            let scopedCategories: string[] | undefined = undefined;
+            if (Array.isArray(categories) && categories.length > 0) {
+                const cleanedCats = Array.from(new Set(
+                    categories
+                        .filter((v: any) => typeof v === 'string')
+                        // tolerate "haxe/", "/haxe", "haxe/io" → leading/trailing
+                        // slashes stripped; an inner path keeps its prefix.
+                        .map((v: string) => v.trim().replace(/^\/+|\/+$/g, ''))
+                        .filter((v: string) => v.length > 0)
+                ));
+                // Category names are directory paths under the root — reject
+                // anything that could break the Milvus expression or escape the
+                // prefix (quotes, %, whitespace, etc.).
+                const invalidCats = cleanedCats.filter((c: string) => !/^[A-Za-z0-9._\/-]+$/.test(c));
+                if (invalidCats.length > 0) {
+                    return {
+                        content: [{ type: 'text', text: `Error: Invalid category names in categories: ${JSON.stringify(invalidCats)}. Use plain directory names from list_categories (letters, digits, '.', '_', '-', '/').` }],
+                        isError: true
+                    };
+                }
+                if (cleanedCats.length > 0) {
+                    scopedCategories = cleanedCats;
+                    const clauses = cleanedCats.map((c: string) => `relativePath like "${c}/%"`);
+                    categoryExpr = clauses.length > 1 ? `(${clauses.join(' or ')})` : clauses[0];
+                }
+            }
+
+            // Combine category + extension scopes (AND); either may be absent.
+            const combinedFilter = [categoryExpr, filterExpr].filter(Boolean).join(' and ') || undefined;
+
             // Search in the specified codebase
             const searchResults = await this.context.semanticSearch(
                 searchCodebasePath,
                 query,
                 Math.min(resultLimit, 50),
                 0.3,
-                filterExpr,
+                combinedFilter,
                 queryShape
             );
 
@@ -772,6 +827,9 @@ export class ToolHandlers {
                 }
 
                 let noResultsMessage = `No results found for query: "${query}" in codebase '${searchCodebasePath}'`;
+                if (scopedCategories) {
+                    noResultsMessage += `\nScoped to categories: ${scopedCategories.join(', ')}. If a category is wrong or not indexed, check list_categories or widen the scope.`;
+                }
                 if (searchCodebasePath !== absolutePath) {
                     noResultsMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
                 }
@@ -839,6 +897,7 @@ export class ToolHandlers {
                         codebase: relativise(searchCodebasePath),
                         query,
                         ...(filterExpr ? { extensionFilter } : {}),
+                        ...(scopedCategories ? { categories: scopedCategories } : {}),
                         ...(queryShape ? { shapeHint: queryShape } : {}),
                         result_count: searchResults.length,
                         results: searchResults.map((r: any, i: number) => ({
@@ -914,12 +973,27 @@ export class ToolHandlers {
             // Sync indexed codebases from cloud first (mirrors handleSearchCode).
             await this.syncIndexedCodebasesFromCloud();
 
-            const absolutePath = ensureAbsolutePath(codebasePath);
+            // `path` optional — default to the single knowledge root (the chunk_id
+            // is the real key here; path only selects the collection / graph).
+            const effectivePath = (typeof codebasePath === 'string' && codebasePath.trim().length > 0)
+                ? codebasePath
+                : resolveKnowledgeRoot();
+            if (!effectivePath) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error: no 'path' was provided and the knowledge root could not be resolved. Set LOCAL_RAG_KNOWLEDGE_ROOT, add local-rag.config.json, or pass an absolute path.`
+                    }],
+                    isError: true
+                };
+            }
+
+            const absolutePath = ensureAbsolutePath(effectivePath);
             if (!fs.existsSync(absolutePath)) {
                 return {
                     content: [{
                         type: "text",
-                        text: `Error: Path '${absolutePath}' does not exist. Original input: '${codebasePath}'`
+                        text: `Error: Path '${absolutePath}' does not exist. Original input: '${effectivePath}'`
                     }],
                     isError: true
                 };
@@ -1358,7 +1432,17 @@ export class ToolHandlers {
     public async handleListCategories(args: any) {
         const { path: rootPath } = args || {};
         try {
-            const absRoot = ensureAbsolutePath(rootPath);
+            // `path` optional — default to the single configured knowledge root.
+            const effectiveRoot = (typeof rootPath === 'string' && rootPath.trim().length > 0)
+                ? rootPath
+                : resolveKnowledgeRoot();
+            if (!effectiveRoot) {
+                return {
+                    content: [{ type: "text", text: `Error: no 'path' was provided and the knowledge root could not be resolved. Set LOCAL_RAG_KNOWLEDGE_ROOT, add local-rag.config.json, or pass an absolute path.` }],
+                    isError: true
+                };
+            }
+            const absRoot = ensureAbsolutePath(effectiveRoot);
 
             if (!fs.existsSync(absRoot) || !fs.statSync(absRoot).isDirectory()) {
                 return {
@@ -1425,7 +1509,7 @@ export class ToolHandlers {
             const pending = rows.filter(r => r.total === 0);
 
             let text = `Knowledge base categories under ${absRoot}\n`;
-            text += `(search a category by calling search_code with path="${absRoot}" and naming it in the query)\n`;
+            text += `(to scope a search, call search_code with categories=[...] naming one or more of the categories below; omit categories to search every category. The knowledge root is resolved automatically — you don't need to pass path.)\n`;
 
             if (indexed.length === 0) {
                 text += `\nNothing is indexed yet — every category dir on disk has 0 chunks.`;

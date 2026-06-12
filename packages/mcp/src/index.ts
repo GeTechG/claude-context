@@ -180,11 +180,19 @@ This tool is versatile and can be used before completing various tasks to retrie
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `ABSOLUTE path to the codebase directory to search in.`
+                                    description: `Optional. ABSOLUTE path to the codebase root to search in. Omit it for the local knowledge base — the single configured knowledge root is resolved automatically. Only pass it to target a different indexed codebase.`
                                 },
                                 query: {
                                     type: "string",
                                     description: "Natural language query to search for in the codebase"
+                                },
+                                categories: {
+                                    type: "array",
+                                    items: {
+                                        type: "string"
+                                    },
+                                    description: "Optional: restrict the search to one or more knowledge-base categories (the top-level areas returned by list_categories, e.g. ['haxe'] or ['godot','pixi']). A category is a top-level directory under the knowledge root; results are filtered to chunks whose path falls under those categories. Choose the categories that fit the user's question — name them explicitly when the user does, otherwise infer from the question. Omit (or pass []) to search EVERY indexed category.",
+                                    default: []
                                 },
                                 limit: {
                                     type: "number",
@@ -206,7 +214,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                                     enum: ["single", "multi-hop", "comparison", "concept"]
                                 }
                             },
-                            required: ["path", "query"]
+                            required: ["query"]
                         }
                     },
                     {
@@ -239,16 +247,15 @@ This tool is versatile and can be used before completing various tasks to retrie
                     },
                     {
                         name: "list_categories",
-                        description: `List what the knowledge base actually contains — the categories you can ask about. A category is a top-level area of the corpus (e.g. a library or book set such as 'haxe', 'godot', 'game_engine_books'). Use this to discover the available topics before searching, when the user asks "what's in the knowledge base / what can I ask about", or to confirm whether a specific library is indexed. Returns each category with its indexed chunk counts (and a code/doc breakdown when the index is split), plus any categories that exist on disk but are NOT indexed yet (so can't be searched). Counts come straight from the vector store, so the result is accurate even when nothing is registered in the indexing-status snapshot. Pass the ABSOLUTE path to the knowledge root (the shared parent directory of the categories — the same path you pass to search_code).`,
+                        description: `List what the knowledge base actually contains — the categories you can ask about, and the exact names to pass to search_code's \`categories\` parameter. A category is a top-level area of the corpus (e.g. a library or book set such as 'haxe', 'godot', 'game_engine_books'). Use this to discover the available topics before searching, when the user asks "what's in the knowledge base / what can I ask about", or to confirm whether a specific library is indexed. Returns each category with its indexed chunk counts (and a code/doc breakdown when the index is split), plus any categories that exist on disk but are NOT indexed yet (so can't be searched). Counts come straight from the vector store, so the result is accurate even when nothing is registered in the indexing-status snapshot. Takes no required arguments — the knowledge root is resolved automatically.`,
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `ABSOLUTE path to the knowledge root (the shared parent directory whose child directories are the categories; same path used for search_code).`
+                                    description: `Optional. ABSOLUTE path to the knowledge root. Omit it for the local knowledge base (resolved automatically); only pass it to inspect a different indexed codebase.`
                                 }
-                            },
-                            required: ["path"]
+                            }
                         }
                     },
                     {
@@ -259,7 +266,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `ABSOLUTE path to the indexed codebase the chunk belongs to (same path used for search_code).`
+                                    description: `Optional. ABSOLUTE path to the indexed codebase the chunk belongs to. Omit it for the local knowledge base (resolved automatically); only pass it for a different indexed codebase.`
                                 },
                                 chunk_id: {
                                     type: "string",
@@ -280,7 +287,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                                     maximum: 50
                                 }
                             },
-                            required: ["path", "chunk_id"]
+                            required: ["chunk_id"]
                         }
                     },
                     {
