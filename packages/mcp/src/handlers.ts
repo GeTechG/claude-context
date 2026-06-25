@@ -190,6 +190,21 @@ export class ToolHandlers {
      * - If local snapshot is missing directories (exist in cloud), ignore them
      */
     private async syncIndexedCodebasesFromCloud(): Promise<void> {
+        // local-rag fix: this Zilliz-Cloud codebase reconciliation is run on every
+        // search_code / index_codebase / get_indexing_status. On a LOCAL Milvus
+        // whose index was built by the standalone infra/*-knowledge.js scripts, the
+        // SPLIT_COLLECTIONS=true / v6 collections are named `hybrid_v6_code_<hash>`
+        // (no `_chunks`), which this function's code-collection pattern does not
+        // match → codeCollectionsChecked stays 0 → the cloudCodebases set is empty
+        // → it concludes the codebase is "gone from cloud" and calls deleteSnapshot,
+        // wiping the merkle snapshot on EVERY search (then update-knowledge.js
+        // bootstraps + skips). The whole reconciliation is meaningless for a local,
+        // manually-indexed single codebase. Default OFF; opt in (Zilliz Cloud
+        // deployments) with CLAUDE_CONTEXT_CLOUD_RECONCILE=true.
+        const reconcile = (process.env.CLAUDE_CONTEXT_CLOUD_RECONCILE ?? '').trim().toLowerCase();
+        if (!['1', 'true', 'yes', 'on'].includes(reconcile)) {
+            return;
+        }
         try {
             console.log(`[SYNC-CLOUD] 🔄 Syncing indexed codebases from Zilliz Cloud...`);
 
@@ -283,11 +298,17 @@ export class ToolHandlers {
 
             console.log(`[SYNC-CLOUD] 📊 Found ${cloudCodebases.size} valid codebases in cloud (checked ${codeCollectionsChecked} code collections, ${successfulExtractions} successfully extracted)`);
 
-            // Safety guard: if we checked code collections but none returned results,
-            // treat this as an extraction failure rather than "cloud is empty".
-            // This prevents deleting all local codebases due to transient errors.
-            if (codeCollectionsChecked > 0 && successfulExtractions === 0) {
-                console.warn(`[SYNC-CLOUD] ⚠️  All ${codeCollectionsChecked} code collection extractions failed. Skipping sync to avoid accidental deletion of local codebases.`);
+            // Safety guard: never delete local codebases unless we POSITIVELY
+            // extracted at least one codebasePath from the cloud. The original
+            // condition required codeCollectionsChecked > 0, but when the code
+            // collections don't match the expected name pattern (e.g. the v6
+            // SPLIT_COLLECTIONS naming `hybrid_v6_code_<hash>` without `_chunks`),
+            // codeCollectionsChecked stays 0, the guard was bypassed, and every
+            // local codebase + its merkle snapshot got deleted. Bailing whenever
+            // successfulExtractions === 0 prevents that data loss regardless of the
+            // collection naming scheme.
+            if (successfulExtractions === 0) {
+                console.warn(`[SYNC-CLOUD] ⚠️  No codebasePath extracted from any cloud collection (checked ${codeCollectionsChecked} code collections). Skipping sync to avoid accidental deletion of local codebases.`);
                 return;
             }
 
