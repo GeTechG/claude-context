@@ -1,6 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
+import { createRequire } from "module";
+import { fileURLToPath } from "url";
 import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
@@ -21,6 +23,28 @@ import {
     relativise,
     resolveKnowledgeRoot,
 } from "./usage-logger.js";
+
+// The source registry belongs to the local-rag deployment rather than the
+// upstream MCP package. createRequire keeps the shared, tested CommonJS module
+// usable from this ESM build in both src/ and dist/ (same directory depth).
+const localRequire = createRequire(import.meta.url);
+const sourceRegistry: any = localRequire("../../../../../infra/lib/source-registry.js");
+const defaultRegistryPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../../local-rag.sources.json");
+
+function loadProvenanceContext(knowledgeRoot: string): { registry: any; state: any; diagnostic: string | null } {
+    try {
+        const registryPath = process.env.LOCAL_RAG_SOURCE_REGISTRY || defaultRegistryPath;
+        return { registry: sourceRegistry.loadRegistry(registryPath), state: sourceRegistry.loadState(knowledgeRoot), diagnostic: null };
+    } catch (error: any) {
+        return { registry: { version: 1, sources: [] }, state: { version: 1, sources: {} }, diagnostic: error?.message || String(error) };
+    }
+}
+
+function resultProvenance(relativePath: string, knowledgeRoot: string, context?: { registry: any; state: any }) {
+    const pctx = context || loadProvenanceContext(knowledgeRoot);
+    try { return sourceRegistry.resolveProvenance(relativePath, pctx.registry, pctx.state); }
+    catch (error: any) { return { source_id: null, status: "unregistered", freshness: { aggregate: "unregistered", reasons: [{ code: "PROVENANCE_RESOLUTION_FAILED" }] }, diagnostic: error?.message || String(error) }; }
+}
 
 // retrieval-confidence-band: map a reranker relevance score (cross-encoder
 // sigmoid, saturates toward 1.0) onto a coarse low|medium|high band so any
@@ -884,6 +908,22 @@ export class ToolHandlers {
             }
 
             // Format results
+            const provenanceContext = loadProvenanceContext(searchCodebasePath);
+            const structuredResults = searchResults.map((result: any, index: number) => {
+                const provenance = resultProvenance(result.relativePath, searchCodebasePath, provenanceContext);
+                return {
+                    rank: index + 1,
+                    relativePath: result.relativePath,
+                    startLine: result.startLine,
+                    endLine: result.endLine,
+                    content_type: result.content_type || result.contentType || null,
+                    language: result.language || null,
+                    score: typeof result.score === "number" ? result.score : null,
+                    chunk_id: result.chunk_id || null,
+                    candidate_symbols: Array.isArray(result.candidateSymbols) ? result.candidateSymbols : [],
+                    provenance,
+                };
+            });
             const formattedResults = searchResults.map((result: any, index: number) => {
                 const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
                 const context = truncateContent(result.content, 5000);
@@ -905,11 +945,17 @@ export class ToolHandlers {
                 const rankLine = band
                     ? `   Relevance: ${band} (${(result.score as number).toFixed(3)})\n`
                     : `   Rank: ${index + 1}\n`;
+                const provenance = structuredResults[index].provenance;
+                const observedVersion = provenance.resolved_revision || provenance.declared_version || provenance.requested_ref || "unknown";
+                const provenanceLines = provenance.source_id
+                    ? `   Source: ${provenance.source_id} (${provenance.kind})\n   Version: ${observedVersion}\n   Freshness: ${provenance.freshness.aggregate}${provenance.freshness.reasons?.length ? ` [${provenance.freshness.reasons.map((r: any) => r.code).join(", ")}]` : ""}\n`
+                    : `   Source: unregistered\n   Version: unknown\n   Freshness: unregistered${provenance.diagnostic ? ` [${provenance.diagnostic}]` : ""}\n`;
 
                 return `${index + 1}. Code snippet (${result.language}) [${codebaseInfo}]\n` +
                     `   Location: ${location}\n` +
                     chunkIdLine +
                     rankLine +
+                    provenanceLines +
                     `   Context: \n\`\`\`${result.language}\n${context}\n\`\`\`\n`;
             }).join('\n');
 
@@ -987,7 +1033,13 @@ export class ToolHandlers {
                 content: [{
                     type: "text",
                     text: resultMessage
-                }]
+                }],
+                structuredContent: {
+                    query,
+                    categories: scopedCategories || null,
+                    registry_diagnostic: provenanceContext.diagnostic,
+                    results: structuredResults,
+                }
             };
         } catch (error) {
             // Check if this is the collection limit error
@@ -1575,6 +1627,27 @@ export class ToolHandlers {
 
             const indexed = rows.filter(r => r.total > 0);
             const pending = rows.filter(r => r.total === 0);
+            const provenanceContext = loadProvenanceContext(absRoot);
+            const categoryMetadata = rows.map((row) => ({
+                category: row.cat,
+                counts: row.counts,
+                total: row.total,
+                indexed: row.total > 0,
+                sources: provenanceContext.registry.sources
+                    .filter((s: any) => s.category === row.cat)
+                    .map((s: any) => {
+                        const observed = provenanceContext.state.sources?.[s.source_id] || null;
+                        return {
+                            source_id: s.source_id,
+                            kind: s.kind,
+                            requested_ref: s.requested_ref || null,
+                            declared_version: s.declared_version || null,
+                            resolved_revision: observed?.resolved_revision || observed?.checksum || null,
+                            active_index_fingerprint: observed?.index?.corpus_fingerprint || null,
+                            freshness: sourceRegistry.freshnessFor(s, observed),
+                        };
+                    }),
+            }));
 
             let text = `Knowledge base categories under ${absRoot}\n`;
             text += `(to scope a search, call search_code with categories=[...] naming one or more of the categories below; omit categories to search every category. The knowledge root is resolved automatically — you don't need to pass path.)\n`;
@@ -1586,6 +1659,10 @@ export class ToolHandlers {
                 for (const r of indexed) {
                     const breakdown = cols.map(c => `${(r.counts[c.label] || 0).toLocaleString()} ${c.label}`).join(' + ');
                     text += `  • ${r.cat} — ${breakdown} chunks\n`;
+                    const metadata = categoryMetadata.find((m) => m.category === r.cat);
+                    for (const source of metadata?.sources || []) {
+                        text += `      Source: ${source.source_id} (${source.kind}); Version: ${source.resolved_revision || source.declared_version || source.requested_ref || 'unknown'}; Freshness: ${source.freshness.aggregate}\n`;
+                    }
                 }
             }
 
@@ -1596,7 +1673,10 @@ export class ToolHandlers {
 
             text += `\n${indexed.length} searchable / ${rows.length} total categories.`;
 
-            return { content: [{ type: "text", text }] };
+            return {
+                content: [{ type: "text", text }],
+                structuredContent: { registry_diagnostic: provenanceContext.diagnostic, categories: categoryMetadata },
+            };
         } catch (error: any) {
             return {
                 content: [{ type: "text", text: `Error listing categories: ${error?.message || String(error)}` }],
