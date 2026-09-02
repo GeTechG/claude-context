@@ -354,12 +354,18 @@ export function parseReferencesResponse(response: any): Location[] {
         for (const refs of Object.values(perKind as Record<string, unknown>)) {
             if (!Array.isArray(refs)) continue;
             for (const r of refs) {
-                const line = typeof r?.reference_line === 'number' ? r.reference_line : undefined;
+                const body = r?.body_location;
+                const startLine = typeof r?.reference_line === 'number'
+                    ? r.reference_line
+                    : typeof body?.start_line === 'number' ? body.start_line : undefined;
+                const endLine = typeof r?.reference_line === 'number'
+                    ? r.reference_line
+                    : typeof body?.end_line === 'number' ? body.end_line : startLine;
                 out.push({
                     filePath,
                     range: {
-                        start: pointFromLine(line),
-                        end: pointFromLine(line),
+                        start: pointFromLine(startLine),
+                        end: pointFromLine(endLine),
                     },
                 });
             }

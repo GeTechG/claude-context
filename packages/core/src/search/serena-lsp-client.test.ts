@@ -192,6 +192,16 @@ describe('parser primitives', () => {
         expect(parseReferencesResponse({ content: [{ type: 'text', text: 'References without surrounding lines: {}' }] })).toEqual([]);
     });
 
+    it('parseReferencesResponse accepts Serena 1.7 body locations', () => {
+        const text = JSON.stringify({
+            'node.cpp': { Method: [{ name_path: 'Node/update', body_location: { start_line: 105, end_line: 132 } }] },
+        });
+        expect(parseReferencesResponse({ content: [{ type: 'text', text }] })).toEqual([{
+            filePath: 'node.cpp',
+            range: { start: { line: 105, character: 0 }, end: { line: 132, character: 0 } },
+        }]);
+    });
+
     it('parseImplementationsResponse drops entries without relative_path', () => {
         const text = JSON.stringify([{ name_path: 'X' }, { name_path: 'Y', relative_path: 'y.hx', body_location: { start_line: 3, end_line: 4 } }]);
         const got = parseImplementationsResponse({ content: [{ type: 'text', text }] });
