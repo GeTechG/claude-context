@@ -12,6 +12,31 @@ import {
     PARENT_SCOPE_NODE_TYPES,
 } from './grammar-registry';
 
+// Terminal identifier node types at the end of a C/C++ declarator chain.
+const DECLARATOR_NAME_TYPES = new Set([
+    'identifier', 'field_identifier', 'qualified_identifier',
+    'destructor_name', 'operator_name',
+]);
+
+/**
+ * Resolve the identifier hiding under a C/C++ `declarator` chain, e.g.
+ * `function_definition` → `function_declarator` → `qualified_identifier`.
+ *
+ * tree-sitter-cpp gives `function_definition` NO `name` field, so without this
+ * every C/C++ function was stored with symbol_name = undefined — and the loose
+ * identifier scan in extractSymbolName picked up the RETURN TYPE instead
+ * (`StringName _global_enums(...)` was indexed as the symbol "StringName").
+ * Pointer/reference/array/init declarators nest, hence the walk.
+ */
+export function declaratorName(node: Parser.SyntaxNode): string | undefined {
+    let cur: Parser.SyntaxNode | null = (node as any).childForFieldName?.('declarator') ?? null;
+    for (let depth = 0; cur && depth < 8; depth++) {
+        if (DECLARATOR_NAME_TYPES.has(cur.type)) return cur.text || undefined;
+        cur = (cur as any).childForFieldName?.('declarator') ?? null;
+    }
+    return undefined;
+}
+
 export class AstCodeSplitter implements Splitter {
     private chunkSize: number = 2500;
     private chunkOverlap: number = 300;
@@ -125,7 +150,18 @@ export class AstCodeSplitter implements Splitter {
                 const nodeText = code.slice(currentNode.startIndex, currentNode.endIndex);
 
                 if (nodeText.trim().length > 0) {
-                    const symbolName = this.extractSymbolName(currentNode);
+                    const rawSymbolName = this.extractSymbolName(currentNode);
+                    // C++ out-of-line definitions carry their class in the name
+                    // (`CoreConstants::get_enum_values`). Store the bare name so
+                    // lookups work as in every other language, and keep the
+                    // qualifier as parent_symbol.
+                    const qualifierEnd = rawSymbolName ? rawSymbolName.lastIndexOf('::') : -1;
+                    const symbolName = qualifierEnd >= 0
+                        ? rawSymbolName!.slice(qualifierEnd + 2)
+                        : rawSymbolName;
+                    const symbolScope = qualifierEnd > 0
+                        ? rawSymbolName!.slice(0, qualifierEnd)
+                        : undefined;
                     const symbolKind = NODE_TYPE_TO_SYMBOL_KIND[currentNode.type];
                     const classStructural = (symbolKind === 'class' || symbolKind === 'abstract')
                         ? extractClassStructural(currentNode, language)
@@ -146,7 +182,7 @@ export class AstCodeSplitter implements Splitter {
                             content_type: 'code',
                             symbol_kind: symbolKind,
                             symbol_name: symbolName,
-                            parent_symbol: parentScope,
+                            parent_symbol: symbolScope ?? parentScope,
                             ...(fileStructural.imports && fileStructural.imports.length > 0
                                 ? { imports: fileStructural.imports }
                                 : {}),
@@ -206,6 +242,11 @@ export class AstCodeSplitter implements Splitter {
                 return fieldNode.text;
             }
         }
+
+        // C/C++ hide the identifier under a `declarator` chain, and the loose
+        // scan below would return the return type — resolve declarators first.
+        const declared = declaratorName(node);
+        if (declared) return declared;
 
         // Fall back to the first identifier-shaped direct child.
         for (const child of node.children) {

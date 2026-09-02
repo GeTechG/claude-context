@@ -84,6 +84,10 @@ export const GRAMMARS: GrammarSpec[] = [
         nodes: {
             function_definition: fn(), declaration: fn(),
             class_specifier: cls(), namespace_definition: cls(),
+            // Header APIs: member functions/fields are `field_declaration`,
+            // and Godot/cocos declare a lot of plain structs and enums.
+            field_declaration: method(), struct_specifier: cls(),
+            enum_specifier: enm(), union_specifier: cls(),
         },
     },
     {
