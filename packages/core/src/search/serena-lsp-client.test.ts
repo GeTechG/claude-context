@@ -1,9 +1,6 @@
-// rag-symbol-refs-lsp-pool: tests for SerenaLspClient. All daemon I/O is
-// stubbed via the test seams (clientFactory + healthProbe + stateFileResolver).
+// rag-symbol-refs-lsp-pool: tests for SerenaLspClient. All service I/O is
+// stubbed via the test seams (clientFactory + healthProbe + baseUrlOverride).
 
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import {
     SerenaLspClient,
     parseFindSymbolResponse,
@@ -11,13 +8,6 @@ import {
     parseImplementationsResponse,
     WHOLE_FILE_END_LINE,
 } from './serena-lsp-client';
-
-function tmpStateFile(payload: any): string {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'serena-state-'));
-    const file = path.join(dir, 'state.json');
-    fs.writeFileSync(file, JSON.stringify(payload), 'utf-8');
-    return file;
-}
 
 function fakeClient(impl: { callTool: (req: any) => Promise<any>; close?: () => Promise<void> }): any {
     return {
@@ -28,37 +18,33 @@ function fakeClient(impl: { callTool: (req: any) => Promise<any>; close?: () => 
 }
 
 describe('SerenaLspClient.detectBaseUrl', () => {
-    it('returns the URL when state.json exists and the daemon answers /', async () => {
-        const stateFile = tmpStateFile({ pid: 42, port: 12345, project: '/x' });
-        const client = new SerenaLspClient('/irrelevant', {
-            stateFileResolver: () => stateFile,
-            healthProbe: async () => true,
-        });
-        await expect(client.detectBaseUrl()).resolves.toBe('http://127.0.0.1:12345');
+    const ENV_KEY = 'SERENA_BASE_URL';
+    const savedEnv = process.env[ENV_KEY];
+    afterEach(() => {
+        if (savedEnv === undefined) delete process.env[ENV_KEY];
+        else process.env[ENV_KEY] = savedEnv;
     });
 
-    it('returns null when state.json is missing', async () => {
-        const client = new SerenaLspClient('/irrelevant', {
-            stateFileResolver: () => '/no/such/file.json',
-            healthProbe: async () => true,
-        });
-        await expect(client.detectBaseUrl()).resolves.toBeNull();
+    it('defaults to the compose service port when SERENA_BASE_URL is unset', async () => {
+        delete process.env[ENV_KEY];
+        const client = new SerenaLspClient({ healthProbe: async () => true });
+        await expect(client.detectBaseUrl()).resolves.toBe('http://127.0.0.1:18948');
+    });
+
+    it('honours SERENA_BASE_URL and strips a trailing slash', async () => {
+        process.env[ENV_KEY] = 'http://serena.internal:9999/';
+        const client = new SerenaLspClient({ healthProbe: async () => true });
+        await expect(client.detectBaseUrl()).resolves.toBe('http://serena.internal:9999');
     });
 
     it('returns null when health probe fails', async () => {
-        const stateFile = tmpStateFile({ pid: 42, port: 12345 });
-        const client = new SerenaLspClient('/irrelevant', {
-            stateFileResolver: () => stateFile,
-            healthProbe: async () => false,
-        });
+        const client = new SerenaLspClient({ healthProbe: async () => false });
         await expect(client.detectBaseUrl()).resolves.toBeNull();
     });
 
     it('caches the URL within TTL and re-resolves on forceRefresh', async () => {
-        const stateFile = tmpStateFile({ port: 1111 });
         let probeCount = 0;
-        const client = new SerenaLspClient('/irrelevant', {
-            stateFileResolver: () => stateFile,
+        const client = new SerenaLspClient({
             healthProbe: async () => { probeCount++; return true; },
         });
         await client.detectBaseUrl();
@@ -68,10 +54,10 @@ describe('SerenaLspClient.detectBaseUrl', () => {
         expect(probeCount).toBe(2);
     });
 
-    it('honours baseUrlOverride and never reads state.json', async () => {
-        const client = new SerenaLspClient('/irrelevant', {
+    it('honours baseUrlOverride and never probes', async () => {
+        const client = new SerenaLspClient({
             baseUrlOverride: 'http://override:9999',
-            stateFileResolver: () => { throw new Error('should not be called'); },
+            healthProbe: async () => { throw new Error('should not be called'); },
         });
         await expect(client.detectBaseUrl()).resolves.toBe('http://override:9999');
     });
@@ -83,9 +69,7 @@ describe('SerenaLspClient.findSymbol / findReferencingSymbols / findImplementati
         fake: ReturnType<typeof fakeClient>;
     } {
         const fake = fakeClient(impl);
-        const stateFile = tmpStateFile({ port: 1234 });
-        const client = new SerenaLspClient('/x', {
-            stateFileResolver: () => stateFile,
+        const client = new SerenaLspClient({
             healthProbe: async () => true,
             clientFactory: () => fake,
             transportFactory: () => ({}),

@@ -211,6 +211,45 @@ describe('Context ignore pattern isolation', () => {
         ]);
     });
 
+    // Corpus scope (local-rag.ragignore.example): the matcher's glob dialect is
+    // narrower than .gitignore — `*` expands to `.*` and therefore crosses `/`,
+    // and brace expansion is NOT supported. Both halves are asserted here so a
+    // later "tidy-up" of the ignore file into `{a,b}` form fails loudly instead
+    // of silently indexing everything it meant to exclude.
+    it('honours a corpus-scope *ignore file: `dir/*` is recursive, braces are literal', async () => {
+        const project = path.join(tempRoot, 'corpus');
+        await fs.mkdir(path.join(project, 'engine', 'platform', 'android', 'export'), { recursive: true });
+        await fs.mkdir(path.join(project, 'engine', 'drivers', 'alsa'), { recursive: true });
+        await fs.mkdir(path.join(project, 'engine', 'drivers', 'gles3'), { recursive: true });
+        await fs.writeFile(path.join(project, '.ragignore'),
+            '# corpus scope\nengine/platform/*\nengine/drivers/{alsa,wasapi}/*\n');
+        await fs.writeFile(path.join(project, 'engine', 'platform', 'android', 'export', 'export.md'), 'excluded, nested');
+        await fs.writeFile(path.join(project, 'engine', 'drivers', 'alsa', 'audio.md'), 'brace pattern does NOT exclude this');
+        await fs.writeFile(path.join(project, 'engine', 'drivers', 'gles3', 'render.md'), 'renderer stays');
+
+        const vectorDatabase = createVectorDatabase();
+        const context = new Context({
+            embedding: new TestEmbedding(),
+            vectorDatabase,
+            codeSplitter: new TestSplitter(),
+        });
+
+        const patterns = await context.getEffectiveIgnorePatterns(project);
+        expect(patterns).toContain('engine/platform/*');
+
+        await context.indexCodebase(project);
+        const indexedPaths = vectorDatabase.insert.mock.calls
+            .flatMap(([, documents]) => documents)
+            .map((document: any) => document.relativePath.replace(/\\/g, '/'))
+            .sort();
+
+        expect(indexedPaths).toEqual([
+            // `engine/platform/*` swallowed the whole subtree, three levels down.
+            'engine/drivers/alsa/audio.md',   // braces are literal — NOT excluded
+            'engine/drivers/gles3/render.md',
+        ]);
+    });
+
     it('treats leading-slash directory ignore patterns as root-anchored and recursive during sync', async () => {
         const project = path.join(tempRoot, 'project');
         await fs.mkdir(path.join(project, 'Library'), { recursive: true });

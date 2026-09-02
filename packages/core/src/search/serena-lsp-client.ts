@@ -4,20 +4,13 @@
 // stdio-less SSE transport. All errors fold to empty arrays so the pool
 // degrades to a no-op when the daemon is missing or the LSP can't compile.
 //
-// Daemon discovery follows configs/claude-plugin/scripts/serena-shared.sh:
-// the per-project state.json lives at
-//   ${XDG_CACHE_HOME:-$HOME/.cache}/serena-daemons/<KEY>/state.json
-// where KEY = sha256(realpath(<indexed codebase>))[:12]. The state file
-// only stores `{pid, port, ...}` — we construct the base URL ourselves
-// (`http://127.0.0.1:<port>`) and treat ANY HTTP response on `/` as
-// "alive" because Serena's MCP/SSE server doesn't expose `/health`.
+// scope-serena-to-compose: Serena runs as the `serena` service in
+// infra/docker-compose.yml on a fixed port, so there is nothing to discover —
+// the base URL is SERENA_BASE_URL (default http://127.0.0.1:18948). Any HTTP
+// response on /mcp counts as "alive"; Serena exposes no /health endpoint.
 
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
-import * as crypto from 'crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 export interface Location {
     filePath: string;
@@ -28,7 +21,7 @@ export interface Location {
 }
 
 export interface SerenaLspClientOptions {
-    /** Bypass `state.json` discovery — used by tests and edge-case deployments. */
+    /** Bypass SERENA_BASE_URL — used by tests and edge-case deployments. */
     baseUrlOverride?: string;
     /** Per-call timeout for LSP RPCs. */
     timeoutMs?: number;
@@ -42,12 +35,11 @@ export interface SerenaLspClientOptions {
      * transportFactory in practice (factories build different layers).
      */
     clientFactory?: () => unknown;
-    /** Test seam — override the default state-file resolver. */
-    stateFileResolver?: (indexPath: string) => string;
     /** Test seam — override the default health probe. */
     healthProbe?: (baseUrl: string) => Promise<boolean>;
 }
 
+const DEFAULT_BASE_URL = 'http://127.0.0.1:18948';
 const URL_TTL_MS = 30_000;
 const DEFAULT_TIMEOUT_MS = 1500;
 const HEALTH_PROBE_TIMEOUT_MS = 500;
@@ -58,23 +50,14 @@ const HEALTH_PROBE_TIMEOUT_MS = 500;
 const WHOLE_FILE_END_LINE = 1_000_000;
 export { WHOLE_FILE_END_LINE };
 
-function defaultStateFile(indexPath: string): string {
-    const cacheRoot = process.env.XDG_CACHE_HOME && process.env.XDG_CACHE_HOME.length > 0
-        ? process.env.XDG_CACHE_HOME
-        : path.join(os.homedir(), '.cache');
-    const real = fs.realpathSync(indexPath);
-    const key = crypto.createHash('sha256').update(real).digest('hex').slice(0, 12);
-    return path.join(cacheRoot, 'serena-daemons', key, 'state.json');
-}
-
 async function defaultHealthProbe(baseUrl: string): Promise<boolean> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), HEALTH_PROBE_TIMEOUT_MS);
     try {
-        // Serena's MCP/SSE server (uvicorn) returns 404 on `/` but is
-        // alive — any HTTP response confirms the port is bound to a
-        // working server. Connection refused / abort => dead daemon.
-        const res = await fetch(`${baseUrl}/`, { method: 'GET', signal: ctrl.signal });
+        // Serena answers /mcp only to a real MCP handshake, so a bare GET
+        // returns an error status — but ANY status proves the port is bound to
+        // a working server. Connection refused / abort => service down.
+        const res = await fetch(`${baseUrl}/mcp`, { method: 'GET', signal: ctrl.signal });
         return res.status > 0;
     } catch {
         return false;
@@ -84,7 +67,6 @@ async function defaultHealthProbe(baseUrl: string): Promise<boolean> {
 }
 
 export class SerenaLspClient {
-    private readonly indexPath: string;
     private readonly opts: SerenaLspClientOptions;
     private readonly timeoutMs: number;
     private cachedBaseUrl: string | null = null;
@@ -92,15 +74,15 @@ export class SerenaLspClient {
     private mcpClient: any | null = null;
     private mcpClientUrl: string | null = null;
 
-    constructor(indexPath: string, opts: SerenaLspClientOptions = {}) {
-        this.indexPath = indexPath;
+    constructor(opts: SerenaLspClientOptions = {}) {
         this.opts = opts;
         this.timeoutMs = opts.timeoutMs && opts.timeoutMs > 0 ? opts.timeoutMs : DEFAULT_TIMEOUT_MS;
     }
 
     /**
-     * Resolve the daemon's base URL. Returns null when the daemon is not
-     * running or its state.json is missing/stale. Cached for 30 seconds.
+     * Resolve the Serena service's base URL, confirming it answers. Returns
+     * null when the service is down, so the pool degrades to a no-op.
+     * The positive result is cached for 30 seconds.
      */
     async detectBaseUrl(forceRefresh = false): Promise<string | null> {
         if (this.opts.baseUrlOverride) {
@@ -110,19 +92,8 @@ export class SerenaLspClient {
         if (!forceRefresh && this.cachedBaseUrl && now - this.cachedAt < URL_TTL_MS) {
             return this.cachedBaseUrl;
         }
-        const stateFile = (this.opts.stateFileResolver ?? defaultStateFile)(this.indexPath);
-        let state: any;
-        try {
-            const raw = await fs.promises.readFile(stateFile, 'utf-8');
-            state = JSON.parse(raw);
-        } catch {
-            return null;
-        }
-        const port = state?.port;
-        if (typeof port !== 'number' || !Number.isFinite(port) || port <= 0) {
-            return null;
-        }
-        const baseUrl = `http://127.0.0.1:${port}`;
+        const configured = process.env.SERENA_BASE_URL;
+        const baseUrl = configured && configured.length > 0 ? configured.replace(/\/+$/, '') : DEFAULT_BASE_URL;
         const healthy = await (this.opts.healthProbe ?? defaultHealthProbe)(baseUrl);
         if (!healthy) {
             return null;
@@ -148,7 +119,7 @@ export class SerenaLspClient {
                 : new Client({ name: 'symbol-refs-lsp-pool', version: '0.1.0' }, { capabilities: {} });
             const transport = this.opts.transportFactory
                 ? this.opts.transportFactory(baseUrl)
-                : new SSEClientTransport(new URL(`${baseUrl}/sse`));
+                : new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`));
             await client.connect(transport as any);
             this.mcpClient = client;
             this.mcpClientUrl = baseUrl;
@@ -180,8 +151,8 @@ export class SerenaLspClient {
         if (!baseUrl) return null;
         const result = await this.callToolOnce(baseUrl, name, args);
         if (result !== undefined) return result;
-        // Retry once with a fresh discovery — handles port reassignment after
-        // a daemon restart between cache load and call.
+        // Retry once against a freshly probed URL — handles the service being
+        // restarted between cache load and call.
         this.invalidateCache();
         await this.disposeClient();
         const refreshed = await this.detectBaseUrl(true);

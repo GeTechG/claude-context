@@ -1,3 +1,4 @@
+import { classDocXmlToMarkdown } from './enrichment/class-doc-xml';
 import {
     Splitter,
     CodeChunk,
@@ -151,7 +152,11 @@ const DEFAULT_SUPPORTED_EXTENSIONS = [
     '.dart', '.hx', '.hxml', '.ml', '.mli',
     // Text and markup files
     '.md', '.markdown', '.rst', '.ipynb',
-    // '.txt',  '.json', '.yaml', '.yml', '.xml', '.html', '.htm',
+    // '.xml' is admitted only for class-reference documents: processFileList
+    // rewrites those to Markdown and SKIPS every other XML, so scene/meta files
+    // are read once and dropped rather than indexed as markup.
+    '.xml',
+    // '.txt',  '.json', '.yaml', '.yml', '.html', '.htm',
     // '.css', '.scss', '.less', '.sql', '.sh', '.bash', '.env'
 ];
 
@@ -748,7 +753,7 @@ export class Context {
             parsed = single;
         }
         if (!parsed) return [];
-        const lspClient = this.getOrCreateSymbolRefsLspClient(codebasePath);
+        const lspClient = this.getOrCreateSymbolRefsLspClient();
         try {
             return await runSymbolRefsPool({
                 query: subject,
@@ -990,12 +995,13 @@ export class Context {
 
     /**
      * Lazy-init the SerenaLspClient on first activation. Reused across
-     * subsequent queries; the client itself caches the daemon URL for 30s
-     * and the SSE connection for the process lifetime.
+     * subsequent queries; the client itself caches the service URL for 30s
+     * and the MCP connection for the process lifetime. The Serena service is
+     * bound to one corpus, so the codebase path is not part of its address.
      */
-    private getOrCreateSymbolRefsLspClient(codebasePath: string): SerenaLspClient {
+    private getOrCreateSymbolRefsLspClient(): SerenaLspClient {
         if (!this.symbolRefsLspClient) {
-            this.symbolRefsLspClient = new SerenaLspClient(codebasePath, {
+            this.symbolRefsLspClient = new SerenaLspClient({
                 baseUrlOverride: this.getSymbolRefsLspBaseUrl(),
                 timeoutMs: this.getSymbolRefsLspTimeoutMs(),
             });
@@ -3174,7 +3180,10 @@ export class Context {
     ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
-        const CHUNK_LIMIT = 450000;
+        // Env-overridable so a candidate reindex of a corpus larger than the
+        // default guard can run without editing code. The default is unchanged:
+        // it is a runaway-indexing brake, not a corpus size statement.
+        const CHUNK_LIMIT = Math.max(1, parseInt(envManager.get('CHUNK_LIMIT') || '450000', 10));
         console.log(`[Context] 🔧 Using EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE}`);
 
         let chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }> = [];
@@ -3186,8 +3195,25 @@ export class Context {
             const filePath = filePaths[i];
 
             try {
-                const content = await fs.promises.readFile(filePath, 'utf-8');
-                const language = this.getLanguageFromExtension(path.extname(filePath));
+                let content = await fs.promises.readFile(filePath, 'utf-8');
+                let language = this.getLanguageFromExtension(path.extname(filePath));
+
+                // Class-reference XML (Godot's `doc/classes/*.xml`) carries the
+                // API prose and the GDScript/C# examples that exist nowhere in
+                // the C++ sources. Rewrite it to Markdown so it lands in the
+                // prose pool with a heading path; any other XML is metadata and
+                // is skipped rather than indexed as markup.
+                if (language === 'xml') {
+                    const markdown = classDocXmlToMarkdown(content);
+                    if (markdown === null) {
+                        processedFiles++;
+                        onFileProcessed?.(filePath, i + 1, filePaths.length);
+                        continue;
+                    }
+                    content = markdown;
+                    language = 'markdown';
+                }
+
                 const chunks = await splitter.split(content, language, filePath);
 
                 // Log files with many chunks or large content
@@ -3564,6 +3590,7 @@ export class Context {
             '.ml': 'ocaml',
             '.mli': 'ocaml_interface',
             '.ipynb': 'jupyter',
+            '.xml': 'xml',
             '.md': 'markdown',
             '.markdown': 'markdown',
             '.rst': 'rst'
