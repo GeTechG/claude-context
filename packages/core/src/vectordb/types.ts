@@ -30,6 +30,27 @@ export interface VectorDocument {
     mentioned_symbols?: string;
 }
 
+/**
+ * #19: what an insert actually did. A batch is no longer all-or-nothing — a row
+ * Milvus refuses (e.g. `content` over the 65535-byte VarChar limit) is dropped
+ * and named, the rest are written, and the caller gets the count so the run can
+ * report `dropped: N` and exit non-zero instead of printing "complete".
+ */
+export interface DroppedRow {
+    id?: string;
+    relativePath?: string;
+    startLine?: number;
+    endLine?: number;
+    /** UTF-8 byte length of the row's `content`, the usual reason it was refused. */
+    contentBytes?: number;
+    reason: string;
+}
+
+export interface InsertResult {
+    inserted: number;
+    dropped: DroppedRow[];
+}
+
 export interface SearchOptions {
     topK?: number;
     filter?: Record<string, any>;
@@ -118,14 +139,14 @@ export interface VectorDatabase {
      * @param collectionName Collection name
      * @param documents Document array
      */
-    insert(collectionName: string, documents: VectorDocument[]): Promise<void>;
+    insert(collectionName: string, documents: VectorDocument[]): Promise<InsertResult | void>;
 
     /**
      * Insert hybrid vector documents
      * @param collectionName Collection name
      * @param documents Document array
      */
-    insertHybrid(collectionName: string, documents: VectorDocument[]): Promise<void>;
+    insertHybrid(collectionName: string, documents: VectorDocument[]): Promise<InsertResult | void>;
 
     /**
      * Search similar vectors

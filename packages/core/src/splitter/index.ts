@@ -20,6 +20,15 @@ export interface CodeChunk {
         extends?: string;
         implements?: string[];
         mentioned_symbols?: string[];
+        // #19: set by the chunk-size guard when a chunk had to be broken up to
+        // fit the Milvus `content` VarChar (65535 bytes). `part` is "i/n";
+        // `truncated` marks the one part whose tail was dropped as a last
+        // resort. Absent on every chunk that fit, which is nearly all of them.
+        oversized_split?: boolean;
+        part?: string;
+        part_index?: number;
+        part_count?: number;
+        truncated?: boolean;
     };
 }
 
@@ -60,6 +69,7 @@ export interface Splitter {
 }
 
 // Implementation class exports
+export * from './chunk-size-guard';
 export * from './langchain-splitter';
 export * from './ast-splitter';
 export * from './markdown-splitter';

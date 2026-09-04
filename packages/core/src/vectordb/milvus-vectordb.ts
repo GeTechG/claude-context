@@ -8,8 +8,10 @@ import {
     HybridSearchOptions,
     HybridSearchResult,
     HybridCollectionOptions,
+    InsertResult,
 } from './types';
 import { ClusterManager } from './zilliz-utils';
+import { insertRowsWithRecovery } from './insert-recovery';
 
 export interface MilvusConfig {
     address?: string;
@@ -57,6 +59,18 @@ const VARCHAR_LIMITS: Record<string, number> = {
     mentioned_symbols: 4096,
 };
 const JSON_ARRAY_VARCHARS = new Set(['imports', 'implements', 'mentioned_symbols', 'heading_path']);
+
+// #19: the two fields that are NOT clamped, because clamping them would corrupt
+// what is being indexed rather than a derived attribute: `content` is the chunk
+// itself (the splitter's chunk-size guard keeps it inside the limit) and
+// `metadata` is the JSON blob search results parse. They are screened here only
+// so a row that still overflows can be named and dropped on its own instead of
+// taking its batch down with it. Keep in sync with createCollection /
+// createHybridCollection.
+export const UNCLAMPED_VARCHAR_LIMITS: Record<string, number> = {
+    content: 65535,
+    metadata: 65535,
+};
 
 function clampVarcharField(field: string, value: any): any {
     const limit = VARCHAR_LIMITS[field];
@@ -475,7 +489,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
         return Array.isArray(collections) ? collections : [];
     }
 
-    async insert(collectionName: string, documents: VectorDocument[]): Promise<void> {
+    async insert(collectionName: string, documents: VectorDocument[]): Promise<InsertResult> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);
 
@@ -504,9 +518,14 @@ export class MilvusVectorDatabase implements VectorDatabase {
             mentioned_symbols: doc.mentioned_symbols ?? null,
         }));
 
-        await this.client.insert({
-            collection_name: collectionName,
-            data: data,
+        // #19: never all-or-nothing. A row the schema refuses is dropped and
+        // named; the rest of the batch is written.
+        return insertRowsWithRecovery({
+            collectionName,
+            operation: 'insert',
+            rows: data,
+            fieldLimits: UNCLAMPED_VARCHAR_LIMITS,
+            insert: (rows) => this.client!.insert({ collection_name: collectionName, data: rows }),
         });
     }
 
@@ -845,7 +864,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
         });
     }
 
-    async insertHybrid(collectionName: string, documents: VectorDocument[]): Promise<void> {
+    async insertHybrid(collectionName: string, documents: VectorDocument[]): Promise<InsertResult> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);
 
@@ -889,30 +908,21 @@ export class MilvusVectorDatabase implements VectorDatabase {
             return clampRow(row);
         });
 
-        const resp: any = await this.client.insert({
-            collection_name: collectionName,
-            data: data,
+        // code-collection-split: the SDK returns a status object on
+        // schema/field validation errors instead of throwing, so a bad batch
+        // used to be dropped on the floor with no log at all. #19: that check
+        // now lives in insertRowsWithRecovery, which additionally retries the
+        // batch without the rows Milvus refuses (an oversized `content` from a
+        // minified bundle) and reports each dropped row with its path, instead
+        // of throwing the whole batch — including every unrelated file in it —
+        // away.
+        return insertRowsWithRecovery({
+            collectionName,
+            operation: 'insertHybrid',
+            rows: data,
+            fieldLimits: UNCLAMPED_VARCHAR_LIMITS,
+            insert: (rows) => this.client!.insert({ collection_name: collectionName, data: rows }),
         });
-
-        // code-collection-split: surface silent insert failures (the SDK
-        // returns a status object on schema/field validation errors instead
-        // of throwing). Before this guard, a chunk batch with a missing or
-        // malformed `sparse_learned` field would log nothing and quietly
-        // drop the entire batch on the floor.
-        const status = resp?.status;
-        if (status && status.code !== 0 && status.error_code !== 'Success') {
-            throw new Error(
-                `[MilvusDB] insertHybrid into '${collectionName}' failed: ` +
-                `${status.error_code || 'UnknownError'} (${status.code}): ${status.reason || 'no reason given'}`,
-            );
-        }
-        const errIndex = Array.isArray(resp?.err_index) ? resp.err_index : [];
-        if (errIndex.length > 0) {
-            throw new Error(
-                `[MilvusDB] insertHybrid into '${collectionName}' partially failed: ` +
-                `${errIndex.length}/${data.length} rows rejected (status=${status?.reason || 'unknown'})`,
-            );
-        }
     }
 
     async hybridSearch(collectionName: string, searchRequests: HybridSearchRequest[], options?: HybridSearchOptions): Promise<HybridSearchResult[]> {

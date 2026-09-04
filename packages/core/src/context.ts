@@ -2,7 +2,9 @@ import { classDocXmlToMarkdown } from './enrichment/class-doc-xml';
 import {
     Splitter,
     CodeChunk,
-    AstCodeSplitter
+    AstCodeSplitter,
+    enforceChunkByteLimit,
+    MILVUS_CONTENT_MAX_BYTES
 } from './splitter';
 import {
     Embedding,
@@ -16,7 +18,8 @@ import {
     HybridSearchRequest,
     HybridSearchOptions,
     HybridSearchResult,
-    RerankStrategy
+    RerankStrategy,
+    InsertResult
 } from './vectordb';
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
@@ -35,6 +38,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { FileSynchronizer } from './sync/synchronizer';
+
+/**
+ * #19: an insert now reports the rows the vector database refused instead of
+ * throwing the whole batch away. Alternative VectorDatabase implementations
+ * (and the test doubles) still return void — nothing reported is nothing lost.
+ */
+function droppedCount(result: InsertResult | void): number {
+    return result && Array.isArray(result.dropped) ? result.dropped.length : 0;
+}
 
 // rag-graph-layer Phase 2: in-memory accumulator that records, per chunk
 // emitted during an indexCodebase run, just enough fields to build the
@@ -1337,7 +1349,7 @@ export class Context {
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
         requestSplitter?: Splitter
-    ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
+    ): Promise<{ indexedFiles: number; totalChunks: number; droppedChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🚀 Starting to index codebase with ${searchType}: ${codebasePath}`);
@@ -1380,7 +1392,7 @@ export class Context {
 
         if (codeFiles.length === 0) {
             progressCallback?.({ phase: 'No files to index', current: 100, total: 100, percentage: 100 });
-            return { indexedFiles: 0, totalChunks: 0, status: 'completed' };
+            return { indexedFiles: 0, totalChunks: 0, droppedChunks: 0, status: 'completed' };
         }
 
         // 3. Process each file with streaming chunk processing
@@ -1408,6 +1420,10 @@ export class Context {
         );
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
+        // #19: never let "completed" stand alone when chunks were lost.
+        if (result.droppedChunks > 0) {
+            console.error(`[Context] ❌ ${result.droppedChunks} chunk(s) were NOT indexed (rejected by the vector database) — the index is INCOMPLETE`);
+        }
 
         // prose-embedding-swap: a prose-only reindex (REINDEX_POOLS=prose)
         // must NOT overwrite the code-derived side-indexes — the symbol vocab
@@ -1440,6 +1456,7 @@ export class Context {
         return {
             indexedFiles: result.processedFiles,
             totalChunks: result.totalChunks,
+            droppedChunks: result.droppedChunks,
             status: result.status
         };
     }
@@ -1450,7 +1467,7 @@ export class Context {
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
         requestSplitter?: Splitter
-    ): Promise<{ added: number, removed: number, modified: number }> {
+    ): Promise<{ added: number, removed: number, modified: number, droppedChunks: number }> {
         const collectionName = this.getCollectionName(codebasePath);
         // code-collection-split: deletion set spans both v6 collections in
         // split mode. The synchronizer key stays single (`collectionName`,
@@ -1482,7 +1499,7 @@ export class Context {
         if (totalChanges === 0) {
             progressCallback?.({ phase: 'No changes detected', current: 100, total: 100, percentage: 100 });
             console.log('[Context] ✅ No file changes detected.');
-            return { added: 0, removed: 0, modified: 0 };
+            return { added: 0, removed: 0, modified: 0, droppedChunks: 0 };
         }
 
         console.log(`[Context] 🔄 Found changes: ${added.length} added, ${removed.length} removed, ${modified.length} modified.`);
@@ -1509,8 +1526,9 @@ export class Context {
         // Handle added and modified files
         const filesToIndex = [...added, ...modified].map(f => path.join(codebasePath, f));
 
+        let droppedChunks = 0;
         if (filesToIndex.length > 0) {
-            await this.processFileList(
+            const listResult = await this.processFileList(
                 filesToIndex,
                 codebasePath,
                 (filePath, fileIndex, totalFiles) => {
@@ -1518,12 +1536,19 @@ export class Context {
                 },
                 splitter
             );
+            droppedChunks = listResult.droppedChunks;
         }
 
         console.log(`[Context] ✅ Re-indexing complete. Added: ${added.length}, Removed: ${removed.length}, Modified: ${modified.length}`);
+        // #19: "Re-indexing complete! 100%" used to print even when whole
+        // batches had been rejected. Say what was lost, and hand the count to
+        // the caller so the run can fail.
+        if (droppedChunks > 0) {
+            console.error(`[Context] ❌ ${droppedChunks} chunk(s) were NOT indexed (rejected by the vector database) — the index is INCOMPLETE`);
+        }
         progressCallback?.({ phase: 'Re-indexing complete!', current: totalChanges, total: totalChanges, percentage: 100 });
 
-        return { added: added.length, removed: removed.length, modified: modified.length };
+        return { added: added.length, removed: removed.length, modified: modified.length, droppedChunks };
     }
 
     /**
@@ -3177,9 +3202,17 @@ export class Context {
         codebasePath: string,
         onFileProcessed?: (filePath: string, fileIndex: number, totalFiles: number) => void,
         splitter: Splitter = this.codeSplitter
-    ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
+    ): Promise<{ processedFiles: number; totalChunks: number; droppedChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
+        // #19: the Milvus `content` column is VarChar(65535 BYTES) on every
+        // collection this engine creates, and no splitter guarantees that — a
+        // minified bundle (three.js's 520 KB single-line draco_decoder.js) comes
+        // back as one chunk and takes its whole insert batch down with it.
+        // Enforced here rather than in each splitter so it holds for every
+        // language, every splitter and every collection. Env-overridable only
+        // for tests / a differently-declared schema.
+        const CHUNK_MAX_BYTES = Math.max(1, parseInt(envManager.get('CHUNK_MAX_BYTES') || String(MILVUS_CONTENT_MAX_BYTES), 10));
         // Env-overridable so a candidate reindex of a corpus larger than the
         // default guard can run without editing code. The default is unchanged:
         // it is a runaway-indexing brake, not a corpus size statement.
@@ -3189,6 +3222,7 @@ export class Context {
         let chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }> = [];
         let processedFiles = 0;
         let totalChunks = 0;
+        let droppedChunks = 0;
         let limitReached = false;
 
         for (let i = 0; i < filePaths.length; i++) {
@@ -3214,7 +3248,17 @@ export class Context {
                     language = 'markdown';
                 }
 
-                const chunks = await splitter.split(content, language, filePath);
+                const rawChunks = await splitter.split(content, language, filePath);
+                const chunks = enforceChunkByteLimit(rawChunks, {
+                    maxBytes: CHUNK_MAX_BYTES,
+                    onOversized: (info) => {
+                        console.warn(
+                            `[Context] ✂️  Oversized chunk in ${info.filePath || filePath} at line ${info.startLine}: ` +
+                            `${info.bytes}B > ${CHUNK_MAX_BYTES}B → split into ${info.parts} part(s)` +
+                            (info.truncatedBytes > 0 ? `, ${info.truncatedBytes}B truncated` : ''),
+                        );
+                    },
+                });
 
                 // Log files with many chunks or large content
                 if (chunks.length > 50) {
@@ -3230,11 +3274,18 @@ export class Context {
 
                     // Process batch when buffer reaches EMBEDDING_BATCH_SIZE
                     if (chunkBuffer.length >= EMBEDDING_BATCH_SIZE) {
+                        const batchSize = chunkBuffer.length;
                         try {
-                            await this.processChunkBuffer(chunkBuffer);
+                            droppedChunks += await this.processChunkBuffer(chunkBuffer);
                         } catch (error) {
+                            // #19: an escaping error means the whole batch is
+                            // gone (insertRowsWithRecovery only re-throws when
+                            // no row could be written at all). Count it, and
+                            // state the size in the "N/M rows rejected" form
+                            // infra/lib/index-state.js parses.
+                            droppedChunks += batchSize;
                             const searchType = isHybrid === true ? 'hybrid' : 'regular';
-                            console.error(`[Context] ❌ Failed to process chunk batch for ${searchType}:`, error);
+                            console.error(`[Context] ❌ Failed to process chunk batch for ${searchType}: ${batchSize}/${batchSize} rows rejected:`, error);
                             if (error instanceof Error) {
                                 console.error('[Context] Stack trace:', error.stack);
                             }
@@ -3266,11 +3317,13 @@ export class Context {
         // Process any remaining chunks in the buffer
         if (chunkBuffer.length > 0) {
             const searchType = isHybrid === true ? 'hybrid' : 'regular';
-            console.log(`📝 Processing final batch of ${chunkBuffer.length} chunks for ${searchType}`);
+            const batchSize = chunkBuffer.length;
+            console.log(`📝 Processing final batch of ${batchSize} chunks for ${searchType}`);
             try {
-                await this.processChunkBuffer(chunkBuffer);
+                droppedChunks += await this.processChunkBuffer(chunkBuffer);
             } catch (error) {
-                console.error(`[Context] ❌ Failed to process final chunk batch for ${searchType}:`, error);
+                droppedChunks += batchSize;
+                console.error(`[Context] ❌ Failed to process final chunk batch for ${searchType}: ${batchSize}/${batchSize} rows rejected:`, error);
                 if (error instanceof Error) {
                     console.error('[Context] Stack trace:', error.stack);
                 }
@@ -3280,6 +3333,7 @@ export class Context {
         return {
             processedFiles,
             totalChunks,
+            droppedChunks,
             status: limitReached ? 'limit_reached' : 'completed'
         };
     }
@@ -3287,8 +3341,8 @@ export class Context {
     /**
  * Process accumulated chunk buffer
  */
-    private async processChunkBuffer(chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>): Promise<void> {
-        if (chunkBuffer.length === 0) return;
+    private async processChunkBuffer(chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>): Promise<number> {
+        if (chunkBuffer.length === 0) return 0;
 
         // Extract chunks and ensure they all have the same codebasePath
         const chunks = chunkBuffer.map(item => item.chunk);
@@ -3300,13 +3354,15 @@ export class Context {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid' : 'regular';
         console.log(`[Context] 🔄 Processing batch of ${chunks.length} chunks (~${estimatedTokens} tokens) for ${searchType}`);
-        await this.processChunkBatch(chunks, codebasePath);
+        // #19: the number of chunks the vector database refused, so the caller
+        // can report the loss instead of reporting success.
+        return this.processChunkBatch(chunks, codebasePath);
     }
 
     /**
      * Process a batch of chunks
      */
-    private async processChunkBatch(chunks: CodeChunk[], codebasePath: string): Promise<void> {
+    private async processChunkBatch(chunks: CodeChunk[], codebasePath: string): Promise<number> {
         const isHybrid = this.getIsHybrid();
 
         // prose-embedding-swap: REINDEX_POOLS filter — drop chunks whose target
@@ -3322,7 +3378,7 @@ export class Context {
                     const label: 'prose' | 'code' = target === addrF.prose ? 'prose' : 'code';
                     return poolFilter.has(label);
                 });
-                if (chunks.length === 0) return;
+                if (chunks.length === 0) return 0;
             }
         }
 
@@ -3435,7 +3491,7 @@ export class Context {
                 } = chunk.metadata;
 
                 return {
-                    id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
+                    id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content, chunk.metadata.part),
                     content: chunk.content, // Full text content for BM25 and storage
                     vector: embeddings[index].vector, // Dense vector
                     relativePath,
@@ -3485,12 +3541,14 @@ export class Context {
                     bucket.push(documents[i]);
                     byCollection.set(target, bucket);
                 }
+                let dropped = 0;
                 for (const [target, bucket] of byCollection.entries()) {
                     if (bucket.length === 0) continue;
-                    await this.vectorDatabase.insertHybrid(target, bucket);
+                    dropped += droppedCount(await this.vectorDatabase.insertHybrid(target, bucket));
                 }
+                return dropped;
             } else {
-                await this.vectorDatabase.insertHybrid(addr.legacy, documents);
+                return droppedCount(await this.vectorDatabase.insertHybrid(addr.legacy, documents));
             }
         } else {
             // Create regular vector documents
@@ -3509,7 +3567,7 @@ export class Context {
                 } = chunk.metadata;
 
                 return {
-                    id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
+                    id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content, chunk.metadata.part),
                     vector: embeddings[index].vector,
                     content: chunk.content,
                     relativePath,
@@ -3549,12 +3607,14 @@ export class Context {
                     bucket.push(documents[i]);
                     byCollection.set(target, bucket);
                 }
+                let dropped = 0;
                 for (const [target, bucket] of byCollection.entries()) {
                     if (bucket.length === 0) continue;
-                    await this.vectorDatabase.insert(target, bucket);
+                    dropped += droppedCount(await this.vectorDatabase.insert(target, bucket));
                 }
+                return dropped;
             } else {
-                await this.vectorDatabase.insert(addr.legacy, documents);
+                return droppedCount(await this.vectorDatabase.insert(addr.legacy, documents));
             }
         }
     }
@@ -3606,8 +3666,12 @@ export class Context {
      * @param content Chunk content
      * @returns Hash-based unique ID
      */
-    private generateId(relativePath: string, startLine: number, endLine: number, content: string): string {
-        const combinedString = `${relativePath}:${startLine}:${endLine}:${content}`;
+    private generateId(relativePath: string, startLine: number, endLine: number, content: string, part?: string): string {
+        // #19: the parts of an oversized chunk that was cut mid-line all carry
+        // the same line range, so `part` ("2/8") is what separates them. Absent
+        // for every chunk that was not split, which keeps ids byte-identical to
+        // what earlier collections were built with.
+        const combinedString = `${relativePath}:${startLine}:${endLine}:${part ? `${part}:` : ''}${content}`;
         const hash = crypto.createHash('sha256').update(combinedString, 'utf-8').digest('hex');
         return `chunk_${hash.substring(0, 16)}`;
     }
