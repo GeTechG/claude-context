@@ -25,6 +25,14 @@
 //     can only ever hit the call that failed;
 //   - a disposed connection terminates its server session (DELETE) before it
 //     closes, so the client leaks nothing either.
+//
+// local-rag #78: what one call knows is that call's own. The connection an
+// attempt ran on and the error the service reported for it are held per call, so
+// a predecessor the chain abandoned — one settles around two budgets later,
+// while its successor is running — can neither tear down the connection its
+// successor is calling on nor put its message into the successor's record. An
+// abandoned call also stops before its retry: nobody is waiting for a second
+// attempt, and sending one would break the single-call-in-flight contract above.
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -69,6 +77,21 @@ const SESSION_TERMINATE_TIMEOUT_MS = 1000;
 // zombie keeps its connection until it settles (mirrors infra's call guard).
 const CHAIN_STEP_ATTEMPT_FACTOR = 2;
 const CHAIN_STEP_SLACK_MS = 5000;
+
+// local-rag #78: everything one call must not share with another. The error the
+// service reported for THIS call's last attempt, the connection THIS call's last
+// attempt ran on, and whether the chain has already given up waiting for it.
+// Held per call rather than in fields on the client: a field can be written by a
+// predecessor the chain abandoned — one settles around two budgets later, while
+// its successor is running — and neither a reason nor a connection may cross
+// from one call to another. A sequence guard would refuse such a write after the
+// fact; per-call state makes it unrepresentable.
+interface PendingCall {
+    seq: number;
+    abandoned: boolean;
+    error: string | null;
+    client: any | null;
+}
 
 function withDeadline<T>(promise: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
     if (!(ms > 0) || !Number.isFinite(ms)) return promise;
@@ -125,7 +148,6 @@ export class SerenaLspClient {
     // entry and report a failure that call never had. Each call takes a
     // monotonic sequence and may only write while it is still the latest.
     private lastToolError = new Map<string, { seq: number; error: { reason: string; attempts: number; at: number } | null }>();
-    private lastAttemptError: string | null = null;
     private callSequence = 0;
 
     constructor(opts: SerenaLspClientOptions = {}) {
@@ -222,6 +244,24 @@ export class SerenaLspClient {
         }
     }
 
+    /**
+     * local-rag #78: dispose the connection ONE CALL ran on, and only that one.
+     *
+     * `disposeClient()` reads whatever the client holds at the moment it is
+     * called, which is the right thing for `ensureClient` (it owns the swap) and
+     * the wrong thing for a call's retry path: a call that was abandoned and
+     * settles late would tear down the connection its successor is using, and
+     * the successor's in-flight request would be rejected by its own client
+     * closing under it. So the retry disposes only the connection its own
+     * attempt actually ran on, and only while that is still the client's
+     * connection — if it has already been replaced, it is somebody else's and
+     * there is nothing here to close.
+     */
+    private async disposeCallConnection(call: PendingCall): Promise<void> {
+        if (!call.client || this.mcpClient !== call.client) return;
+        await this.disposeClient();
+    }
+
     /** Tear down any cached MCP connection. Idempotent. */
     async close(): Promise<void> {
         await this.disposeClient();
@@ -234,8 +274,15 @@ export class SerenaLspClient {
         // chain: the step yields null, the chain advances, and the zombie is
         // left to settle on its own (the outer guard defers the close).
         const deadline = this.timeoutMs * CHAIN_STEP_ATTEMPT_FACTOR + CHAIN_STEP_SLACK_MS;
-        const seq = ++this.callSequence;
-        const run = this.queue.then(() => withDeadline(this.callToolSerial(name, args, seq), deadline, () => {
+        const call: PendingCall = { seq: ++this.callSequence, abandoned: false, error: null, client: null };
+        const seq = call.seq;
+        const run = this.queue.then(() => withDeadline(this.callToolSerial(name, args, call), deadline, () => {
+            // The chain has given up on this call. It is marked here, before the
+            // record below, because everything the zombie may still do to shared
+            // state hangs off this flag (#78): it must not tear down the
+            // connection its successor is on, and it must not send a second
+            // attempt nobody is waiting for.
+            call.abandoned = true;
             console.warn(`[SerenaLspClient] ${name} abandoned after ${deadline}ms; the chain moves on`);
             // local-rag #64: the abandonment is itself the service failing to
             // answer, and it is the LOUDEST such case — the call outlived two
@@ -255,7 +302,8 @@ export class SerenaLspClient {
         return run;
     }
 
-    private async callToolSerial(name: string, args: Record<string, unknown>, seq = ++this.callSequence): Promise<any | null> {
+    private async callToolSerial(name: string, args: Record<string, unknown>, call: PendingCall = { seq: ++this.callSequence, abandoned: false, error: null, client: null }): Promise<any | null> {
+        const seq = call.seq;
         // local-rag #64: a call that the service never answered and a call the
         // service answered with nothing are both `null` to every caller of this
         // method, and telling them apart from the outside by elapsed time cannot
@@ -267,7 +315,6 @@ export class SerenaLspClient {
         // This call claims the slot; an older, abandoned one can no longer write.
         const current = this.lastToolError.get(name);
         if (!current || current.seq <= seq) this.lastToolError.set(name, { seq, error: null });
-        this.lastAttemptError = null;
         const record = (reason: string, attempts: number): void => {
             const held = this.lastToolError.get(name);
             if (held && held.seq > seq) return;
@@ -275,26 +322,33 @@ export class SerenaLspClient {
         };
         const baseUrl = await this.detectBaseUrl();
         if (!baseUrl) { record('no base URL', 0); return null; }
-        const result = await this.callToolOnce(baseUrl, name, args);
+        const result = await this.callToolOnce(baseUrl, name, args, call);
         // A tool RESULT flagged `isError` is the service declining to answer —
         // Serena's refusal of an over-long reference enumeration arrives this
         // way, as a result and not as an exception, and that refusal is the
         // 487 048-character case this whole change exists for. It is not an
         // answer of "nothing references this" and must not be recorded as one.
-        if (result === null && this.lastAttemptError) { record(this.lastAttemptError, 1); return null; }
+        if (result === null && call.error) { record(call.error, 1); return null; }
         if (result !== undefined) return result;
+        // local-rag #78: a call the chain has already abandoned stops here. Its
+        // caller was handed `null` around two budgets ago, so a second attempt
+        // is work nobody is waiting for — and everything the retry does next
+        // touches state that now belongs to a successor: it would tear down the
+        // connection that successor is calling on and put a second call in
+        // flight on a client whose whole contract (#62) is one at a time.
+        if (call.abandoned) { record(call.error || 'abandoned before its retry', 1); return null; }
         // Retry once against a freshly probed URL — handles the service being
         // restarted between cache load and call.
         this.invalidateCache();
-        await this.disposeClient();
+        await this.disposeCallConnection(call);
         const refreshed = await this.detectBaseUrl(true);
-        if (!refreshed) { record(this.lastAttemptError || 'no base URL on retry', 1); return null; }
-        const retry = await this.callToolOnce(refreshed, name, args);
+        if (!refreshed) { record(call.error || 'no base URL on retry', 1); return null; }
+        const retry = await this.callToolOnce(refreshed, name, args, call);
         // Same rule as the first attempt: a `null` with an attempt error behind
         // it is the service declining (an `isError` result), not an answer of
         // nothing.
-        if (retry === null && this.lastAttemptError) { record(this.lastAttemptError, 2); return null; }
-        if (retry === undefined) { record(this.lastAttemptError || 'both attempts failed', 2); return null; }
+        if (retry === null && call.error) { record(call.error, 2); return null; }
+        if (retry === undefined) { record(call.error || 'both attempts failed', 2); return null; }
         return retry;
     }
 
@@ -312,8 +366,15 @@ export class SerenaLspClient {
         baseUrl: string,
         name: string,
         args: Record<string, unknown>,
+        call: PendingCall,
     ): Promise<any | null | undefined> {
         const client = await this.ensureClient(baseUrl);
+        // The connection THIS attempt runs on, remembered so that the retry can
+        // dispose the one it actually used rather than whatever the client holds
+        // by then (#78). `null` when the connect failed: there is nothing to
+        // dispose in that case, and `ensureClient` has already terminated the
+        // half-open session itself.
+        call.client = client || null;
         if (!client) return undefined;
         try {
             const response = await client.callTool({ name, arguments: args }, undefined, {
@@ -323,7 +384,7 @@ export class SerenaLspClient {
                 // Surfaced to `callToolSerial` so it is recorded as a call the
                 // service did not answer, rather than swallowed into the same
                 // `null` an unreferenced symbol returns.
-                this.lastAttemptError = `${name} returned isError`;
+                call.error = `${name} returned isError`;
                 console.warn(`[SerenaLspClient] ${name} returned isError`);
                 return null;
             }
@@ -332,7 +393,7 @@ export class SerenaLspClient {
             const reason = err instanceof Error ? err.message : String(err);
             // Kept so `callToolSerial` can record what the service actually said
             // (`MCP error -32001: Request timed out`) rather than a guess.
-            this.lastAttemptError = reason;
+            call.error = reason;
             console.warn(`[SerenaLspClient] ${name} failed: ${reason}`);
             return undefined;
         }

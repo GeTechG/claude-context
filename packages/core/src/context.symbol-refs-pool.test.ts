@@ -228,3 +228,42 @@ describe('Context.runSymbolRefsPoolForSubject — activation gates', () => {
         expect(out).toEqual([]);
     });
 });
+
+// local-rag #66: the engine publishes a disposal for the clients it created.
+// Before it existed, the only way to close the symbol-refs client was to reach
+// into the private field the pool assigns — a name a rebuild can rename with no
+// signal to any embedder — and every embedder that did not know the name leaked
+// the MCP session and kept a never-settling SSE `GET` holding the event loop.
+describe('Context — close (local-rag #66)', () => {
+    it('closes the client the symbol-refs pool created, through the engine\'s own creator', async () => {
+        const ctx = makeCtx() as any;
+        const client = ctx.getOrCreateSymbolRefsLspClient();
+        expect(ctx.symbolRefsLspClient).toBe(client);
+        const closed = jest.spyOn(client, 'close');
+        await ctx.close();
+        expect(closed).toHaveBeenCalledTimes(1);
+        // The reference is dropped, so nothing can hand a closed client out again.
+        expect(ctx.symbolRefsLspClient).toBeNull();
+    });
+
+    it('is idempotent, and a later activation gets a working client rather than the closed one', async () => {
+        const ctx = makeCtx() as any;
+        const first = ctx.getOrCreateSymbolRefsLspClient();
+        const closed = jest.spyOn(first, 'close');
+        await ctx.close();
+        await ctx.close();
+        expect(closed).toHaveBeenCalledTimes(1);
+        const second = ctx.getOrCreateSymbolRefsLspClient();
+        expect(second).not.toBe(first);
+    });
+
+    it('is safe when the pool never activated, and leaves the caller\'s handles alone', async () => {
+        const database = createVectorDatabase();
+        const ctx = new Context({ embedding: new TestEmbedding(), vectorDatabase: database }) as any;
+        await expect(ctx.close()).resolves.toBeUndefined();
+        expect(ctx.symbolRefsLspClient).toBeNull();
+        // The vector database and the embedder were handed in by the caller and
+        // may be shared; disposal of the engine must not touch them.
+        for (const method of Object.values(database)) expect(method).not.toHaveBeenCalled();
+    });
+});

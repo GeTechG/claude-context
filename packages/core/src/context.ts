@@ -396,6 +396,41 @@ export class Context {
     }
 
     /**
+     * local-rag #66: release every client this Context created.
+     *
+     * The symbol-refs pool creates a `SerenaLspClient` lazily and keeps it for
+     * the process lifetime, and its MCP transport holds a standalone SSE `GET` —
+     * a request that never settles — so its socket stays ref'd and keeps the
+     * host's event loop alive. Without a published disposal every embedder of
+     * this engine either leaks that server-side session on shutdown or reaches
+     * into a private field of ours, which a rebuild can rename with no signal to
+     * them (that is exactly what local-rag's arm drivers had to do in #63).
+     *
+     * Idempotent, and safe when the pool never activated: a process whose
+     * prompts never made a symbol-refs call is the ordinary case. The client's
+     * own `close()` terminates the server session before it closes the socket.
+     * The reference is dropped BEFORE the close is awaited, so a concurrent
+     * activation gets a fresh client rather than the one being torn down, and a
+     * close that throws still leaves nothing behind.
+     *
+     * It is a disposal, not a shutdown latch: a query still in flight during it
+     * can activate the pool again and get a fresh client, which is what makes a
+     * Context reusable after a close. Callers that must guarantee nothing
+     * reopens (an arm driver) close after their last query, not beside it.
+     *
+     * Deliberately not closed here: the vector database and the embedding. They
+     * are handed to this Context by its caller (a `vectorDatabase` is required
+     * in the config), may be shared with other consumers, and are the caller's
+     * to release.
+     */
+    async close(): Promise<void> {
+        const lspClient = this.symbolRefsLspClient;
+        this.symbolRefsLspClient = null;
+        if (!lspClient) return;
+        await lspClient.close();
+    }
+
+    /**
      * Get embedding instance
      */
     getEmbedding(): Embedding {

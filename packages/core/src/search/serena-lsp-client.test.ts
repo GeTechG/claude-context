@@ -358,6 +358,14 @@ describe('SerenaLspClient — getLastToolError (local-rag #64)', () => {
         // second runs while the first is still pending and answers, and the
         // first's own `record()` then fires late. The successor's entry must
         // survive it.
+        //
+        // local-rag #78: the zombie settles with a FAILURE, and that is the
+        // whole point of the test. Settling it successfully returns at
+        // `if (result !== undefined) return result` — `record()` is never
+        // reached, the test writes nothing, and it passes just as well with the
+        // sequence guard deleted. A service declining the call (`isError`) is
+        // the exact shape #64 exists for, and it takes the zombie through
+        // `record()` with the successor's entry already in the slot.
         const client = make();
         let settleFirst: ((value: any) => void) | null = null;
         let call = 0;
@@ -373,9 +381,98 @@ describe('SerenaLspClient — getLastToolError (local-rag #64)', () => {
         // The successor claims the slot and is answered.
         await (client as any).callTool('find_referencing_symbols', {});
         expect(client.getLastToolError('find_referencing_symbols')).toBeUndefined();
-        // Now the zombie settles, as one does around two timeouts later.
-        if (settleFirst) (settleFirst as any)({ content: [{ type: 'text', text: '[]' }] });
+        // Now the zombie settles, as one does around two timeouts later — with
+        // the service declining, so it runs `record()` against the guard.
+        if (settleFirst) (settleFirst as any)({ isError: true, content: [] });
         await new Promise((resolve) => setTimeout(resolve, 20));
         expect(client.getLastToolError('find_referencing_symbols')).toBeUndefined();
     }, 20000);
+
+    it('the same late failure IS recorded when no successor claimed the slot', async () => {
+        // The control for the test above: it proves the zombie's late failure
+        // really does reach `record()`, so that "the successor's entry survived"
+        // is evidence about the guard and not about a path nothing walks.
+        const client = make();
+        let settleFirst: ((value: any) => void) | null = null;
+        client.ensureClient = jest.fn(async () => ({
+            callTool: jest.fn(() => new Promise((resolve) => { settleFirst = resolve; })),
+        }));
+        const first = (client as any).callTool('find_referencing_symbols', {});
+        await expect(first).resolves.toBeNull();
+        expect(client.getLastToolError('find_referencing_symbols').reason).toMatch(/abandoned after \d+ms/);
+        if (settleFirst) (settleFirst as any)({ isError: true, content: [] });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const recorded = client.getLastToolError('find_referencing_symbols');
+        expect(recorded.reason).toMatch(/isError/);
+        expect(recorded.attempts).toBe(1);
+    }, 20000);
+
+    it('a zombie\'s attempt error is not recorded as the successor\'s reason', async () => {
+        // local-rag #78 (b): `lastAttemptError` used to be one field shared by
+        // every call, so a predecessor settling late could put its message into
+        // the successor's record and `trace.reference_error` would name a
+        // failure that call never had. Here the successor gets no connection at
+        // all — it has no message of its own — and the zombie fails in the exact
+        // window between the successor's last attempt and what it records.
+        const client = make();
+        let rejectZombie: ((error: any) => void) | null = null;
+        let ensured = 0;
+        client.ensureClient = jest.fn(async () => {
+            ensured += 1;
+            if (ensured === 1) return { callTool: jest.fn(() => new Promise((_resolve, reject) => { rejectZombie = reject; })) };
+            // The successor's attempts: no connection, so nothing of its own is
+            // ever written. On its retry the zombie's own attempt fails.
+            if (ensured === 3 && rejectZombie) {
+                (rejectZombie as any)(new Error('the zombie could not reach the service'));
+                for (let tick = 0; tick < 5; tick += 1) await Promise.resolve();
+            }
+            return null;
+        });
+        const zombie = (client as any).callTool('find_referencing_symbols', {});
+        await expect(zombie).resolves.toBeNull();
+        await expect((client as any).callTool('find_referencing_symbols', {})).resolves.toBeNull();
+        const recorded = client.getLastToolError('find_referencing_symbols');
+        expect(recorded.reason).toBe('both attempts failed');
+        expect(recorded.attempts).toBe(2);
+    }, 20000);
+
+    it('an abandoned call that settles late does not tear down the connection its successor is on', async () => {
+        // local-rag #78 (a): the retry path used to call `disposeClient()`, which
+        // reads whatever connection the client holds NOW. A call abandoned around
+        // two budgets earlier reaches that line while its successor is mid-call
+        // on the shared connection, and closes it under it.
+        jest.useFakeTimers();
+        try {
+            const transport = { terminateSession: jest.fn(async () => undefined), close: jest.fn() };
+            let rejectFirst: ((error: any) => void) | null = null;
+            let calls = 0;
+            const fake = fakeClient({
+                callTool: () => {
+                    calls += 1;
+                    // The zombie's attempt, then the successor's, which is still
+                    // in flight when the zombie finally fails.
+                    if (calls === 1) return new Promise((_resolve, reject) => { rejectFirst = reject; });
+                    return new Promise(() => undefined);
+                },
+            });
+            const client = new SerenaLspClient({ baseUrlOverride: 'http://stub', timeoutMs: 100, clientFactory: () => fake, transportFactory: () => transport });
+            const zombie = client.findReferencingSymbols('X/y', 'a.hx', 5);
+            const successor = client.findImplementations('X/y', 'a.hx', 5);
+            await jest.advanceTimersByTimeAsync(100 * 2 + 5000 + 10);
+            await expect(zombie).resolves.toEqual([]);
+            expect(calls).toBe(2);
+            // The successor is on the connection; now the zombie's own attempt
+            // fails, which is what used to send it into the retry path.
+            (rejectFirst as any)(new Error('MCP error -32001: Request timed out'));
+            await jest.advanceTimersByTimeAsync(100);
+            expect(fake.close).not.toHaveBeenCalled();
+            expect(transport.terminateSession).not.toHaveBeenCalled();
+            // And the zombie sent no second attempt: nobody was waiting for it.
+            expect(calls).toBe(2);
+            await jest.advanceTimersByTimeAsync(100 * 2 + 5000 + 10);
+            await expect(successor).resolves.toEqual([]);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
 });
