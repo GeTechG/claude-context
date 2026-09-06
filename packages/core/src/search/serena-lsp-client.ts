@@ -90,7 +90,24 @@ interface PendingCall {
     seq: number;
     abandoned: boolean;
     error: string | null;
-    client: any | null;
+    connection: Connection | null;
+}
+
+// local-rag #81: a connection is ONE thing. The MCP session, the transport it
+// rides on and the URL they were established against were three fields that
+// could be written apart — `ensureClient` published the transport before an
+// unbounded `connect()` and the client after it, so an establishment that
+// completed late could leave `mcpClient === C1` beside `mcpTransport === T2` and
+// a later dispose then ended one session and leaked the other. Held together and
+// replaced together, that is unrepresentable. The epoch names the connection, so
+// a teardown can say WHICH one it means: the layer above (infra's call guard)
+// defers the teardown of an abandoned call, and by the time it runs the client
+// may be on a different connection entirely.
+interface Connection {
+    epoch: number;
+    client: any;
+    transport: any;
+    url: string;
 }
 
 function withDeadline<T>(promise: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
@@ -132,9 +149,15 @@ export class SerenaLspClient {
     private readonly timeoutMs: number;
     private cachedBaseUrl: string | null = null;
     private cachedAt = 0;
-    private mcpClient: any | null = null;
-    private mcpClientUrl: string | null = null;
-    private mcpTransport: any | null = null;
+    private connection: Connection | null = null;
+    private connectionSequence = 0;
+    // local-rag #85: `close()` is a latch, not only a teardown. A call in flight
+    // when it ran is NOT abandoned, so it takes the ordinary retry path — and
+    // that path would establish a fresh transport, whose standalone SSE `GET`
+    // never settles, on a client its owner has already dropped the reference to.
+    // Nothing would ever close it, and the host's event loop would be held by a
+    // socket nobody can name: #63, reached through the method that fixed it.
+    private closed = false;
     // One call in flight per instance (#62). The chain never rejects: a
     // failed call settles the chain so the next call still runs.
     private queue: Promise<unknown> = Promise.resolve();
@@ -168,8 +191,7 @@ export class SerenaLspClient {
         if (!forceRefresh && this.cachedBaseUrl && now - this.cachedAt < URL_TTL_MS) {
             return this.cachedBaseUrl;
         }
-        const configured = process.env.SERENA_BASE_URL;
-        const baseUrl = configured && configured.length > 0 ? configured.replace(/\/+$/, '') : DEFAULT_BASE_URL;
+        const baseUrl = this.configuredBaseUrl();
         const healthy = await (this.opts.healthProbe ?? defaultHealthProbe)(baseUrl);
         if (!healthy) {
             return null;
@@ -184,32 +206,47 @@ export class SerenaLspClient {
         this.cachedAt = 0;
     }
 
-    private async ensureClient(baseUrl: string): Promise<any | null> {
-        if (this.mcpClient && this.mcpClientUrl === baseUrl) {
-            return this.mcpClient;
+    private async ensureClient(baseUrl: string): Promise<Connection | null> {
+        // local-rag #85: a closed client establishes nothing. This is the
+        // structural backstop behind the check in `callToolOnce`: whatever path
+        // reaches here after `close()`, no socket is opened.
+        if (this.closed) return null;
+        if (this.connection && this.connection.url === baseUrl) {
+            return this.connection;
         }
-        await this.disposeClient();
+        await this.disposeConnection();
+        const epoch = ++this.connectionSequence;
+        // Built into LOCALS, never into the shared fields (#81). A connect is
+        // unbounded, so an establishment can complete long after the client has
+        // moved on; publishing the transport first is what let the two halves of
+        // one connection be written apart. The half-open session a failed connect
+        // may already have opened is still terminated — only the transport can
+        // close it (#61 review) — and it is terminated from the local.
+        let client: any = null;
+        let transport: any = null;
         try {
-            const client = this.opts.clientFactory
+            client = this.opts.clientFactory
                 ? (this.opts.clientFactory() as any)
                 : new Client({ name: 'symbol-refs-lsp-pool', version: '0.1.0' }, { capabilities: {} });
-            const transport = this.opts.transportFactory
+            transport = this.opts.transportFactory
                 ? this.opts.transportFactory(baseUrl)
                 : new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`));
-            // Kept BEFORE connect: a connect that fails after its initialize
-            // POST has already opened a session, and only the transport can
-            // close it (#61 review).
-            this.mcpTransport = transport;
             await client.connect(transport as any);
-            this.mcpClient = client;
-            this.mcpClientUrl = baseUrl;
-            return client;
         } catch (err) {
             console.warn(`[SerenaLspClient] connect failed: ${err instanceof Error ? err.message : err}`);
-            await this.terminateTransport(this.mcpTransport);
-            this.mcpTransport = null;
+            await this.terminateTransport(transport);
             return null;
         }
+        // Still the newest establishment, and the client still open? Otherwise
+        // this one belongs to nobody: a successor has installed its own
+        // connection, or the client was closed while this one was connecting, and
+        // installing here would leak whichever of the two nothing then holds.
+        if (this.connectionSequence !== epoch || this.closed) {
+            await this.tearDown(client, transport);
+            return null;
+        }
+        this.connection = { epoch, client, transport, url: baseUrl };
+        return this.connection;
     }
 
     private async terminateTransport(transport: any | null): Promise<void> {
@@ -223,33 +260,34 @@ export class SerenaLspClient {
         }
     }
 
-    private async disposeClient(): Promise<void> {
-        if (!this.mcpClient) return;
-        const client = this.mcpClient;
-        const transport = this.mcpTransport;
-        this.mcpClient = null;
-        this.mcpClientUrl = null;
-        this.mcpTransport = null;
-        // Close the server session before the socket (#61): `close()` alone
-        // aborts the stream and leaves the session alive on the server. The
-        // DELETE is bounded, and the close runs whatever it did.
+    // Close the server session before the socket (#61): `close()` alone aborts
+    // the stream and leaves the session alive on the server. The DELETE is
+    // bounded, and the close runs whatever it did.
+    private async tearDown(client: any, transport: any): Promise<void> {
         try {
             await this.terminateTransport(transport);
         } finally {
             try {
-                await client.close();
+                if (client) await client.close();
             } catch {
                 /* swallow — best effort */
             }
         }
     }
 
+    private async disposeConnection(): Promise<void> {
+        const held = this.connection;
+        if (!held) return;
+        this.connection = null;
+        await this.tearDown(held.client, held.transport);
+    }
+
     /**
      * local-rag #78: dispose the connection ONE CALL ran on, and only that one.
      *
-     * `disposeClient()` reads whatever the client holds at the moment it is
-     * called, which is the right thing for `ensureClient` (it owns the swap) and
-     * the wrong thing for a call's retry path: a call that was abandoned and
+     * A teardown that reads whatever the client holds at the moment it is called
+     * is the right thing for `ensureClient` (it owns the swap) and the wrong
+     * thing for a call's retry path: a call that was abandoned and
      * settles late would tear down the connection its successor is using, and
      * the successor's in-flight request would be rejected by its own client
      * closing under it. So the retry disposes only the connection its own
@@ -258,13 +296,63 @@ export class SerenaLspClient {
      * there is nothing here to close.
      */
     private async disposeCallConnection(call: PendingCall): Promise<void> {
-        if (!call.client || this.mcpClient !== call.client) return;
-        await this.disposeClient();
+        if (!call.connection) return;
+        await this.closeConnectionEpoch(call.connection.epoch);
     }
 
-    /** Tear down any cached MCP connection. Idempotent. */
+    /**
+     * local-rag #81: the connection this client holds right now, named so that a
+     * layer above can defer a teardown and still say WHICH connection it meant.
+     * `0` when there is none.
+     */
+    currentConnectionEpoch(): number {
+        return this.connection ? this.connection.epoch : 0;
+    }
+
+    /**
+     * local-rag #81: tear down the connection `epoch` names, and only that one.
+     * A no-op once it has been replaced — it is then somebody else's and there is
+     * nothing here to close. Deliberately NOT the same method as `close()`: this
+     * resets a connection and leaves the client usable, while `close()` latches
+     * the client shut. The call guard defers a teardown for an abandoned call
+     * and must never turn a watchdog into a permanent kill of a client the build
+     * is still using.
+     */
+    async closeConnectionEpoch(epoch: number): Promise<boolean> {
+        if (!this.connection || this.connection.epoch !== epoch) return false;
+        await this.disposeConnection();
+        return true;
+    }
+
+    /**
+     * Tear down any cached MCP connection and refuse to open another. Idempotent.
+     *
+     * local-rag #85: this is a LATCH. A call in flight when it runs ends in a
+     * recorded error rather than in a fresh transport nobody owns — its caller
+     * has already dropped the reference that could have closed one.
+     */
     async close(): Promise<void> {
-        await this.disposeClient();
+        this.closed = true;
+        await this.disposeConnection();
+    }
+
+    /** Whether `close()` has run. A closed client never establishes a connection again. */
+    isClosed(): boolean {
+        return this.closed;
+    }
+
+    /**
+     * local-rag #77: the base URL this client WOULD probe, answered without
+     * touching the network. `detectBaseUrl()` reports `null` both for a service
+     * that is busy and for one that is not running, and in the configuration
+     * where it does that — no override — the URL it tried is its own default,
+     * which no caller can name. A caller that must ask the socket which of the
+     * two it is needs an address, and asking for one must not itself cost a probe.
+     */
+    configuredBaseUrl(): string {
+        if (this.opts.baseUrlOverride) return this.opts.baseUrlOverride;
+        const configured = process.env.SERENA_BASE_URL;
+        return configured && configured.length > 0 ? configured.replace(/\/+$/, '') : DEFAULT_BASE_URL;
     }
 
     private callTool(name: string, args: Record<string, unknown>): Promise<any | null> {
@@ -274,7 +362,7 @@ export class SerenaLspClient {
         // chain: the step yields null, the chain advances, and the zombie is
         // left to settle on its own (the outer guard defers the close).
         const deadline = this.timeoutMs * CHAIN_STEP_ATTEMPT_FACTOR + CHAIN_STEP_SLACK_MS;
-        const call: PendingCall = { seq: ++this.callSequence, abandoned: false, error: null, client: null };
+        const call: PendingCall = { seq: ++this.callSequence, abandoned: false, error: null, connection: null };
         const seq = call.seq;
         const run = this.queue.then(() => withDeadline(this.callToolSerial(name, args, call), deadline, () => {
             // The chain has given up on this call. It is marked here, before the
@@ -302,7 +390,7 @@ export class SerenaLspClient {
         return run;
     }
 
-    private async callToolSerial(name: string, args: Record<string, unknown>, call: PendingCall = { seq: ++this.callSequence, abandoned: false, error: null, client: null }): Promise<any | null> {
+    private async callToolSerial(name: string, args: Record<string, unknown>, call: PendingCall = { seq: ++this.callSequence, abandoned: false, error: null, connection: null }): Promise<any | null> {
         const seq = call.seq;
         // local-rag #64: a call that the service never answered and a call the
         // service answered with nothing are both `null` to every caller of this
@@ -337,6 +425,12 @@ export class SerenaLspClient {
         // connection that successor is calling on and put a second call in
         // flight on a client whose whole contract (#62) is one at a time.
         if (call.abandoned) { record(call.error || 'abandoned before its retry', 1); return null; }
+        // local-rag #85: a call in flight when `close()` ran stops here too, and
+        // for the same reason turned round: the retry below re-probes the URL and
+        // establishes a connection, and this client's owner has already dropped
+        // its reference. The call ends with the closure recorded as its reason,
+        // which is what a caller must be able to read instead of a hang.
+        if (this.closed) { record(call.error || 'client closed', 1); return null; }
         // Retry once against a freshly probed URL — handles the service being
         // restarted between cache load and call.
         this.invalidateCache();
@@ -368,14 +462,24 @@ export class SerenaLspClient {
         args: Record<string, unknown>,
         call: PendingCall,
     ): Promise<any | null | undefined> {
-        const client = await this.ensureClient(baseUrl);
+        // local-rag #85: an attempt on a closed client ends in a RECORDED error
+        // and opens nothing. Without this the in-flight call's ordinary retry
+        // path establishes a fresh transport on a client its owner has already
+        // let go of, and the never-settling SSE `GET` behind it holds the host's
+        // event loop with no reference left that could close it.
+        if (this.closed) {
+            call.error = 'client closed';
+            return undefined;
+        }
+        const connection = await this.ensureClient(baseUrl);
         // The connection THIS attempt runs on, remembered so that the retry can
         // dispose the one it actually used rather than whatever the client holds
         // by then (#78). `null` when the connect failed: there is nothing to
         // dispose in that case, and `ensureClient` has already terminated the
         // half-open session itself.
-        call.client = client || null;
-        if (!client) return undefined;
+        call.connection = connection;
+        if (!connection) return undefined;
+        const client = connection.client;
         try {
             const response = await client.callTool({ name, arguments: args }, undefined, {
                 timeout: this.timeoutMs,

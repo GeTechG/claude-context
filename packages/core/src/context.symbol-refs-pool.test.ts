@@ -215,6 +215,24 @@ describe('Context.runSymbolRefsPoolForSubject — activation gates', () => {
         expect(lsp.findReferencingSymbols).toHaveBeenCalledWith('BytesBuffer', 'std/BytesBuffer.hx', 20);
     });
 
+    // local-rag #85 review: the latch must fail the ACTIVATION, not the query.
+    // `symbolRefsPoolPromise` is the only one of the four pools that enters the
+    // caller's `Promise.all` without a `.catch()` of its own — the other three
+    // each carry one — so anything that escapes this method fails the whole
+    // hybrid search rather than costing it one channel. A latch that traded a
+    // leaked transport for a lost answer would be a worse bargain than the leak.
+    it('degrades to a no-op rather than failing the query when the engine has been released', async () => {
+        process.env.SYMBOL_REFS_POOL = 'true';
+        const ctx = makeCtx() as any;
+        withVocab(ctx, new Set(['Bytes', 'toString']));
+        await ctx.close();
+        const out = await ctx.runSymbolRefsPoolForSubject('Bytes.toString', { codeSignal: true, docSignal: false }, '/codebase', 'col');
+        expect(out).toEqual([]);
+        // And it really was the latch that stopped it, not an activation gate:
+        // the creator still refuses.
+        expect(() => ctx.getOrCreateSymbolRefsLspClient()).toThrow(/closed/i);
+    });
+
     it('returns [] without throwing when runSymbolRefsPool internals reject', async () => {
         process.env.SYMBOL_REFS_POOL = 'true';
         const ctx = makeCtx() as any;
@@ -246,15 +264,28 @@ describe('Context — close (local-rag #66)', () => {
         expect(ctx.symbolRefsLspClient).toBeNull();
     });
 
-    it('is idempotent, and a later activation gets a working client rather than the closed one', async () => {
+    // local-rag #85: this used to assert the opposite — that a later activation
+    // got a fresh client — and that reusability is exactly what made `close()`
+    // unsafe as published API. A call in flight when it ran is not abandoned, so
+    // it retries; the retry re-creates a client; and the never-settling SSE GET
+    // behind the new transport holds the host's event loop with no reference left
+    // that could close it. #63, through the method that fixed it.
+    it('is idempotent, and latches: nothing re-activates a released engine', async () => {
         const ctx = makeCtx() as any;
         const first = ctx.getOrCreateSymbolRefsLspClient();
         const closed = jest.spyOn(first, 'close');
         await ctx.close();
         await ctx.close();
         expect(closed).toHaveBeenCalledTimes(1);
-        const second = ctx.getOrCreateSymbolRefsLspClient();
-        expect(second).not.toBe(first);
+        expect(() => ctx.getOrCreateSymbolRefsLspClient()).toThrow(/closed/i);
+        expect(ctx.symbolRefsLspClient).toBeNull();
+    });
+
+    it('latches even when the pool never activated, so a released engine opens nothing', async () => {
+        const ctx = makeCtx() as any;
+        await ctx.close();
+        expect(() => ctx.getOrCreateSymbolRefsLspClient()).toThrow(/closed/i);
+        expect(ctx.symbolRefsLspClient).toBeNull();
     });
 
     it('is safe when the pool never activated, and leaves the caller\'s handles alone', async () => {

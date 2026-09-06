@@ -305,6 +305,10 @@ export class Context {
     // Context instance, reused across queries). Created on the first
     // pool activation and reused to amortise the SSE handshake.
     private symbolRefsLspClient: SerenaLspClient | null = null;
+    // local-rag #85: `close()` is a latch. Once it has run this Context creates
+    // no replacement client, so a call that was in flight when it ran cannot
+    // resurrect the transport its owner has already stopped holding.
+    private closed = false;
     // rag-symbol-refs-multi-hop: print the symbol-refs pool wiring banner
     // exactly once per process so the MCP log is grep-able for hop mode.
     private symbolRefsStartupBannerLogged = false;
@@ -409,21 +413,30 @@ export class Context {
      * Idempotent, and safe when the pool never activated: a process whose
      * prompts never made a symbol-refs call is the ordinary case. The client's
      * own `close()` terminates the server session before it closes the socket.
-     * The reference is dropped BEFORE the close is awaited, so a concurrent
-     * activation gets a fresh client rather than the one being torn down, and a
-     * close that throws still leaves nothing behind.
+     * The reference is dropped BEFORE the close is awaited, so a close that
+     * throws still leaves nothing behind.
      *
-     * It is a disposal, not a shutdown latch: a query still in flight during it
-     * can activate the pool again and get a fresh client, which is what makes a
-     * Context reusable after a close. Callers that must guarantee nothing
-     * reopens (an arm driver) close after their last query, not beside it.
+     * local-rag #85: it is a LATCH, not only a disposal. It used to be the
+     * latter, and the discipline that made that safe — "close after your last
+     * query, not beside it" — was prose no embedder could enforce. A call in
+     * flight when `close()` ran is not abandoned, so it takes its ordinary retry
+     * path; that path re-establishes an MCP transport whose standalone SSE `GET`
+     * never settles; and nothing owns it, because the field was already nulled.
+     * The host process is then held by a socket nobody can name, which is #63
+     * arrived at through the method that fixed it. So an activation after
+     * `close()` throws, and the in-flight call ends in a recorded error.
      *
-     * Deliberately not closed here: the vector database and the embedding. They
-     * are handed to this Context by its caller (a `vectorDatabase` is required
-     * in the config), may be shared with other consumers, and are the caller's
-     * to release.
+     * Deliberately not closed here: the vector database and the embedding.
+     * Neither holds a transport this engine established, which is what this
+     * disposal is for. The vector database is required in the config and is the
+     * caller's; the embedding usually is too, but NOT always — with no
+     * `config.embedding` the constructor builds an `OpenAIEmbedding` of its own,
+     * which publishes no disposal and keeps no session. "The caller handed it to
+     * us" would therefore be false for that one, and the true reason is the one
+     * stated here.
      */
     async close(): Promise<void> {
+        this.closed = true;
         const lspClient = this.symbolRefsLspClient;
         this.symbolRefsLspClient = null;
         if (!lspClient) return;
@@ -783,8 +796,10 @@ export class Context {
      * rag-symbol-refs-lsp-pool: build the 4th pool by walking LSP
      * declaration → references + implementations from the Serena daemon.
      * Returns [] when any activation gate fails (env off, no parse, vocab
-     * miss, daemon unreachable). Never throws — pool degrades to no-op so
-     * the other 3 pools continue to serve.
+     * miss, daemon unreachable, engine released). Never throws — pool degrades
+     * to a no-op so the other 3 pools continue to serve; the caller's
+     * `Promise.all` gives this promise no `.catch()` of its own, so anything
+     * that escapes here fails the whole hybrid search.
      */
     private async runSymbolRefsPoolForSubject(
         subject: string,
@@ -822,8 +837,15 @@ export class Context {
             parsed = single;
         }
         if (!parsed) return [];
-        const lspClient = this.getOrCreateSymbolRefsLspClient();
         try {
+            // local-rag #85: INSIDE the try. The creator refuses on a released
+            // engine, and this pool's contract — stated in the docblock above and
+            // relied on by `Promise.all` in the caller, which gives this promise
+            // no `.catch()` of its own the way it does its three siblings — is
+            // that it degrades to a no-op rather than failing the query. A latch
+            // that failed the whole hybrid search would trade a leaked transport
+            // for a lost answer.
+            const lspClient = this.getOrCreateSymbolRefsLspClient();
             return await runSymbolRefsPool({
                 query: subject,
                 parsed,
@@ -1147,6 +1169,14 @@ export class Context {
      * bound to one corpus, so the codebase path is not part of its address.
      */
     private getOrCreateSymbolRefsLspClient(): SerenaLspClient {
+        // local-rag #85: a released Context creates nothing. A late retry that
+        // reached here would open a transport this Context no longer holds a
+        // reference to, so it fails loudly instead — the embedder that closed
+        // beside its work learns that it did, rather than losing the process to a
+        // socket it cannot find.
+        if (this.closed) {
+            throw new Error('Context has been closed: its symbol-refs client cannot be re-created. Close the engine after its last query, not beside one.');
+        }
         if (!this.symbolRefsLspClient) {
             this.symbolRefsLspClient = new SerenaLspClient({
                 baseUrlOverride: this.getSymbolRefsLspBaseUrl(),

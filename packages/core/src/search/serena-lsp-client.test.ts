@@ -286,6 +286,144 @@ describe('SerenaLspClient session hygiene', () => {
     });
 });
 
+// local-rag #81 / #85: the connection an attempt owns, and a close that latches.
+describe('SerenaLspClient connection ownership (local-rag #81, #85)', () => {
+    const pair = () => ({
+        transport: { terminateSession: jest.fn(async () => undefined), close: jest.fn() },
+        client: fakeClient({ callTool: async () => ({ content: [{ type: 'text', text: '[]' }] }) }),
+    });
+
+    it('an establishment that finishes after it was superseded installs nothing and releases what it built', async () => {
+        // The zombie's connect is still running when the chain gives up on its
+        // call; the successor then establishes a connection of its own. When the
+        // late connect finally resolves it must find that it is nobody's: it
+        // releases its own session and socket and leaves the client on the
+        // successor's connection. Publishing it would leave one half of one
+        // connection beside one half of another, and a later dispose would end
+        // one session and leak the other.
+        jest.useFakeTimers();
+        try {
+            const late = pair();
+            const live = pair();
+            let releaseLateConnect: (() => void) | null = null;
+            let built = 0;
+            const client = new SerenaLspClient({
+                baseUrlOverride: 'http://stub',
+                timeoutMs: 50,
+                clientFactory: () => {
+                    built += 1;
+                    if (built === 1) {
+                        late.client.connect = jest.fn(() => new Promise<void>((resolve) => { releaseLateConnect = resolve; }));
+                        return late.client;
+                    }
+                    return live.client;
+                },
+                transportFactory: () => (built === 1 ? late.transport : live.transport),
+            });
+
+            const abandoned = client.findReferencingSymbols('X/y', 'a.hx', 5);
+            await jest.advanceTimersByTimeAsync(50 * 2 + 5000 + 10);
+            await expect(abandoned).resolves.toEqual([]);
+
+            // The successor establishes its own connection and is answered.
+            await expect(client.findSymbol('X')).resolves.toEqual([]);
+            const successorEpoch = client.currentConnectionEpoch();
+            expect(successorEpoch).toBeGreaterThan(0);
+
+            // Now the zombie's connect completes, two connections too late.
+            (releaseLateConnect as any)();
+            await jest.advanceTimersByTimeAsync(10);
+
+            expect(client.currentConnectionEpoch()).toBe(successorEpoch);
+            expect(late.transport.terminateSession).toHaveBeenCalledTimes(1);
+            expect(late.client.close).toHaveBeenCalledTimes(1);
+            expect(live.transport.terminateSession).not.toHaveBeenCalled();
+            expect(live.client.close).not.toHaveBeenCalled();
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it('a teardown names the connection it disposes, and leaves the client usable', async () => {
+        const first = pair();
+        const second = pair();
+        let built = 0;
+        const client = new SerenaLspClient({
+            baseUrlOverride: 'http://stub',
+            clientFactory: () => { built += 1; return built === 1 ? first.client : second.client; },
+            transportFactory: () => (built === 1 ? first.transport : second.transport),
+        });
+        await client.findSymbol('X');
+        const epoch = client.currentConnectionEpoch();
+
+        // A connection this client does not hold is not this client's to close.
+        await expect(client.closeConnectionEpoch(epoch + 1)).resolves.toBe(false);
+        expect(first.client.close).not.toHaveBeenCalled();
+
+        await expect(client.closeConnectionEpoch(epoch)).resolves.toBe(true);
+        expect(first.transport.terminateSession).toHaveBeenCalledTimes(1);
+        expect(first.client.close).toHaveBeenCalledTimes(1);
+        expect(client.currentConnectionEpoch()).toBe(0);
+
+        // Naming it again disposes nothing, and the client is NOT latched: this
+        // teardown resets a connection, which is what the call guard defers for
+        // an abandoned call. A guard that reached for the latching close would
+        // permanently kill a client the build is still using.
+        await expect(client.closeConnectionEpoch(epoch)).resolves.toBe(false);
+        await expect(client.findSymbol('X')).resolves.toEqual([]);
+        expect(client.currentConnectionEpoch()).toBeGreaterThan(epoch);
+        expect(client.isClosed()).toBe(false);
+    });
+
+    it('a call in flight when close() runs ends in a recorded error and opens no new transport', async () => {
+        // local-rag #85. The in-flight call is not abandoned, so it takes the
+        // ordinary retry path — and that path used to establish a fresh MCP
+        // transport, whose standalone SSE GET never settles, on a client whose
+        // owner has already dropped the reference. Nothing could ever close it.
+        let transports = 0;
+        let rejectInFlight: ((error: any) => void) | null = null;
+        const transport = { terminateSession: jest.fn(async () => undefined), close: jest.fn() };
+        const inner = fakeClient({
+            callTool: () => new Promise((_resolve, reject) => { rejectInFlight = reject; }),
+            // The SDK rejects what is in flight when the session goes away.
+            close: async () => { if (rejectInFlight) (rejectInFlight as any)(new Error('MCP error -32000: Connection closed')); },
+        });
+        const client = new SerenaLspClient({
+            baseUrlOverride: 'http://stub',
+            timeoutMs: 50,
+            clientFactory: () => inner,
+            transportFactory: () => { transports += 1; return transport; },
+        });
+        const flight = client.findReferencingSymbols('X/y', 'a.hx', 5);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(transports).toBe(1);
+
+        await client.close();
+        await expect(flight).resolves.toEqual([]);
+
+        const recorded = client.getLastToolError('find_referencing_symbols');
+        expect(recorded).toBeTruthy();
+        expect(recorded!.reason).toMatch(/closed/i);
+        expect(transports).toBe(1);
+        expect(client.currentConnectionEpoch()).toBe(0);
+        expect(client.isClosed()).toBe(true);
+    }, 20000);
+
+    it('a closed client establishes nothing, whatever asks it to', async () => {
+        let transports = 0;
+        const client = new SerenaLspClient({
+            baseUrlOverride: 'http://stub',
+            timeoutMs: 50,
+            clientFactory: () => fakeClient({ callTool: async () => ({ content: [{ type: 'text', text: '[]' }] }) }),
+            transportFactory: () => { transports += 1; return { terminateSession: jest.fn(async () => undefined), close: jest.fn() }; },
+        });
+        await client.close();
+        await expect(client.findSymbol('X')).resolves.toEqual([]);
+        expect(transports).toBe(0);
+        expect(client.currentConnectionEpoch()).toBe(0);
+    });
+});
+
 describe('parser primitives', () => {
     it('parseFindSymbolResponse returns [] on garbage', () => {
         expect(parseFindSymbolResponse(null)).toEqual([]);
@@ -320,10 +458,20 @@ describe('parser primitives', () => {
 // with nothing, by what the service itself said.
 describe('SerenaLspClient — getLastToolError (local-rag #64)', () => {
     const make = (): any => new (SerenaLspClient as any)({ baseUrlOverride: 'http://serena:1', timeoutMs: 50 });
+    // local-rag #81: an attempt is handed the CONNECTION it runs on — session,
+    // transport and URL as one object — rather than a bare client, so a teardown
+    // can name which connection it means. These doubles stand in for one.
+    let stubEpoch = 0;
+    const connection = (callTool: any): any => ({
+        epoch: ++stubEpoch,
+        client: { callTool },
+        transport: { terminateSession: jest.fn(async () => undefined), close: jest.fn() },
+        url: 'http://serena:1',
+    });
 
     it('records a tool result flagged isError — the service declining an over-long answer is not "no references"', async () => {
         const client = make();
-        client.ensureClient = jest.fn(async () => ({ callTool: jest.fn(async () => ({ isError: true, content: [] })) }));
+        client.ensureClient = jest.fn(async () => connection(jest.fn(async () => ({ isError: true, content: [] }))));
         const out = await (client as any).callTool('find_referencing_symbols', {});
         expect(out).toBeNull();
         expect(client.getLastToolError('find_referencing_symbols')).toBeTruthy();
@@ -332,7 +480,7 @@ describe('SerenaLspClient — getLastToolError (local-rag #64)', () => {
 
     it('records nothing when the service answered, even with an empty result', async () => {
         const client = make();
-        client.ensureClient = jest.fn(async () => ({ callTool: jest.fn(async () => ({ content: [{ type: 'text', text: '[]' }] })) }));
+        client.ensureClient = jest.fn(async () => connection(jest.fn(async () => ({ content: [{ type: 'text', text: '[]' }] }))));
         await (client as any).callTool('find_referencing_symbols', {});
         expect(client.getLastToolError('find_referencing_symbols')).toBeUndefined();
     });
@@ -345,7 +493,7 @@ describe('SerenaLspClient — getLastToolError (local-rag #64)', () => {
         // exact hole mechanism 3 exists to close. Driven through the real
         // `callTool` path, with a call that genuinely never settles.
         const client = make();
-        client.ensureClient = jest.fn(async () => ({ callTool: jest.fn(() => new Promise(() => { /* never settles */ })) }));
+        client.ensureClient = jest.fn(async () => connection(jest.fn(() => new Promise(() => { /* never settles */ }))));
         const out = await (client as any).callTool('find_referencing_symbols', {});
         expect(out).toBeNull();
         const recorded = client.getLastToolError('find_referencing_symbols');
@@ -369,13 +517,11 @@ describe('SerenaLspClient — getLastToolError (local-rag #64)', () => {
         const client = make();
         let settleFirst: ((value: any) => void) | null = null;
         let call = 0;
-        client.ensureClient = jest.fn(async () => ({
-            callTool: jest.fn(() => {
-                call += 1;
-                if (call === 1) return new Promise((resolve) => { settleFirst = resolve; });
-                return Promise.resolve({ content: [{ type: 'text', text: '[]' }] });
-            }),
-        }));
+        client.ensureClient = jest.fn(async () => connection(jest.fn(() => {
+            call += 1;
+            if (call === 1) return new Promise((resolve) => { settleFirst = resolve; });
+            return Promise.resolve({ content: [{ type: 'text', text: '[]' }] });
+        })));
         const first = (client as any).callTool('find_referencing_symbols', {});
         await expect(first).resolves.toBeNull();
         // The successor claims the slot and is answered.
@@ -394,9 +540,7 @@ describe('SerenaLspClient — getLastToolError (local-rag #64)', () => {
         // is evidence about the guard and not about a path nothing walks.
         const client = make();
         let settleFirst: ((value: any) => void) | null = null;
-        client.ensureClient = jest.fn(async () => ({
-            callTool: jest.fn(() => new Promise((resolve) => { settleFirst = resolve; })),
-        }));
+        client.ensureClient = jest.fn(async () => connection(jest.fn(() => new Promise((resolve) => { settleFirst = resolve; }))));
         const first = (client as any).callTool('find_referencing_symbols', {});
         await expect(first).resolves.toBeNull();
         expect(client.getLastToolError('find_referencing_symbols').reason).toMatch(/abandoned after \d+ms/);
@@ -419,7 +563,7 @@ describe('SerenaLspClient — getLastToolError (local-rag #64)', () => {
         let ensured = 0;
         client.ensureClient = jest.fn(async () => {
             ensured += 1;
-            if (ensured === 1) return { callTool: jest.fn(() => new Promise((_resolve, reject) => { rejectZombie = reject; })) };
+            if (ensured === 1) return connection(jest.fn(() => new Promise((_resolve, reject) => { rejectZombie = reject; })));
             // The successor's attempts: no connection, so nothing of its own is
             // ever written. On its retry the zombie's own attempt fails.
             if (ensured === 3 && rejectZombie) {
