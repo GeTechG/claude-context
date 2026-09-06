@@ -3,6 +3,7 @@
 // (mocked) Serena LSP client.
 
 import { runSymbolRefsPool } from './symbol-refs-pool';
+import { createSymbolFrequencyGate } from './symbol-frequency';
 import { Location } from './serena-lsp-client';
 
 function loc(filePath: string, startLine = 0, endLine = 100): Location {
@@ -534,6 +535,170 @@ describe('runSymbolRefsPool', () => {
             });
             expect(out.length).toBe(30);
             expect(out.map((r) => r.document.id)).not.toContain('c_extra');
+        });
+    });
+
+    // ---- local-rag #64: reference expansion bounded by corpus frequency ----
+
+    describe('corpus-derived frequency bound on reference expansion', () => {
+        const table = {
+            schema: 'local-rag-symbol-frequency-v1',
+            signature: 'sig',
+            documents: 100,
+            // 4 identifiers: 1, 2, 3 and 90 documents. The 0.999 quantile of
+            // that distribution is 90, so only `offset` is at or above it.
+            distribution: { identifiers: 4, histogram: { '1': 1, '2': 1, '3': 1, '90': 1 } },
+            frequencies: { Bytes: 3, Rare: 1, Middling: 2, offset: 90 },
+        };
+        const gate = (quantile: number | null) => createSymbolFrequencyGate(table as any, quantile);
+
+        const seedFor = (symbol: string) => ({
+            declRows: new Map([[symbol, [{ id: 'c_decl', relativePath: `std/${symbol}.hx` } as FakeRow]]]),
+            locationRows: new Map<string, FakeRow[]>([['std/Ref.hx', [{ id: 'c_ref' }]], ['std/Impl.hx', [{ id: 'c_impl' }]]]),
+            hydrations: new Map<string, FakeRow>([
+                ['c_decl', { id: 'c_decl', relativePath: `std/${symbol}.hx`, metadata: '{}' }],
+                ['c_ref', { id: 'c_ref', metadata: '{}' }],
+                ['c_impl', { id: 'c_impl', metadata: '{}' }],
+            ]),
+        });
+
+        it('skips reference expansion for a subject the corpus uses everywhere, keeping the declaration seed and implementations', async () => {
+            const lsp = makeLsp({ refs: [loc('std/Ref.hx', 1, 5)], impls: [loc('std/Impl.hx', 1, 5)] });
+            const diagnostics: any[] = [];
+            const out = await runSymbolRefsPool({
+                ...baseOpts,
+                parsed: { symbolName: 'offset' },
+                lspClient: lsp,
+                vectorDatabase: makeVectorDb(seedFor('offset')),
+                symbolFrequency: gate(0.999),
+                onDiagnostics: (d) => diagnostics.push(d),
+            });
+            expect(lsp.findReferencingSymbols).not.toHaveBeenCalled();
+            expect(lsp.findImplementations).toHaveBeenCalled();
+            expect(out.map((r) => r.document.id)).toEqual(['c_decl', 'c_impl']);
+            expect(diagnostics[0].bound_documents).toBe(90);
+            expect(diagnostics[0].skipped).toEqual([{ symbol: 'offset', document_frequency: 90, hop: 1 }]);
+        });
+
+        it('expands references for an ordinary identifier below the bound', async () => {
+            const lsp = makeLsp({ refs: [loc('std/Ref.hx', 1, 5)], impls: [] });
+            const diagnostics: any[] = [];
+            await runSymbolRefsPool({
+                ...baseOpts,
+                parsed: { symbolName: 'Bytes' },
+                lspClient: lsp,
+                vectorDatabase: makeVectorDb(seedFor('Bytes')),
+                symbolFrequency: gate(0.999),
+                onDiagnostics: (d) => diagnostics.push(d),
+            });
+            expect(lsp.findReferencingSymbols).toHaveBeenCalled();
+            expect(diagnostics[0].skipped).toEqual([]);
+        });
+
+        it('never skips an identifier the table does not carry — absence is unknown, not zero', async () => {
+            const lsp = makeLsp({ refs: [loc('std/Ref.hx', 1, 5)], impls: [] });
+            await runSymbolRefsPool({
+                ...baseOpts,
+                parsed: { symbolName: 'NeverSeen' },
+                lspClient: lsp,
+                vectorDatabase: makeVectorDb(seedFor('NeverSeen')),
+                symbolFrequency: gate(0.999),
+            });
+            expect(lsp.findReferencingSymbols).toHaveBeenCalled();
+        });
+
+        it('with no frequency artifact, expands references for every activated subject and records that no source was available', async () => {
+            const lsp = makeLsp({ refs: [loc('std/Ref.hx', 1, 5)], impls: [] });
+            const diagnostics: any[] = [];
+            await runSymbolRefsPool({
+                ...baseOpts,
+                parsed: { symbolName: 'offset' },
+                lspClient: lsp,
+                vectorDatabase: makeVectorDb(seedFor('offset')),
+                symbolFrequency: createSymbolFrequencyGate(null, 0.999),
+                onDiagnostics: (d) => diagnostics.push(d),
+            });
+            expect(lsp.findReferencingSymbols).toHaveBeenCalled();
+            expect(diagnostics[0]).toEqual({ source: 'absent', bound_documents: null, bound_quantile: null, skipped: [] });
+        });
+
+        it('with no bound configured (the inert default), behaves exactly as before the gate existed', async () => {
+            const lsp = makeLsp({ refs: [loc('std/Ref.hx', 1, 5)], impls: [] });
+            const diagnostics: any[] = [];
+            await runSymbolRefsPool({
+                ...baseOpts,
+                parsed: { symbolName: 'offset' },
+                lspClient: lsp,
+                vectorDatabase: makeVectorDb(seedFor('offset')),
+                symbolFrequency: gate(0),
+                onDiagnostics: (d) => diagnostics.push(d),
+            });
+            expect(lsp.findReferencingSymbols).toHaveBeenCalled();
+            expect(diagnostics[0].bound_documents).toBeNull();
+            expect(diagnostics[0].source).toBe('derived');
+        });
+
+        it('gates on the subject the call is actually made with, not on the top-level name', async () => {
+            // A `Class/method` parse calls `findReferencingSymbols('Class/method', ...)`.
+            // Gating on `Class` would read the wrong identifier's frequency and
+            // let the expensive call go out unbounded — the motivating defect
+            // has exactly this shape (a ubiquitous member on an ordinary class).
+            const lsp = makeLsp({ refs: [loc('std/Ref.hx', 1, 5)], impls: [] });
+            const declRows = new Map([['Rare', [{ id: 'c_decl', relativePath: 'std/Rare.hx' } as FakeRow]]]);
+            const diagnostics: any[] = [];
+            await runSymbolRefsPool({
+                ...baseOpts,
+                parsed: { className: 'Rare', methodName: 'offset', fullyQualified: 'Rare.offset' },
+                lspClient: lsp,
+                vectorDatabase: makeVectorDb({ declRows, locationRows: new Map(), hydrations: new Map([['c_decl', { id: 'c_decl', metadata: '{}' }]]) }),
+                symbolFrequency: gate(0.999),
+                onDiagnostics: (d) => diagnostics.push(d),
+            });
+            expect(lsp.findReferencingSymbols).not.toHaveBeenCalled();
+            expect(lsp.findImplementations).toHaveBeenCalledWith('Rare/offset', 'std/Rare.hx', 10);
+            expect(diagnostics[0].skipped).toEqual([{ symbol: 'Rare/offset', document_frequency: 90, hop: 1 }]);
+
+            // And the converse: an ordinary member on a ubiquitous class is not
+            // skipped, because the frequency that matters is the one of the
+            // name the enumeration is over.
+            const lsp2 = makeLsp({ refs: [loc('std/Ref.hx', 1, 5)], impls: [] });
+            await runSymbolRefsPool({
+                ...baseOpts,
+                parsed: { className: 'offset', methodName: 'Rare', fullyQualified: 'offset.Rare' },
+                lspClient: lsp2,
+                vectorDatabase: makeVectorDb({ declRows: new Map([['offset', [{ id: 'c_decl', relativePath: 'std/offset.hx' } as FakeRow]]]), locationRows: new Map(), hydrations: new Map([['c_decl', { id: 'c_decl', metadata: '{}' }]]) }),
+                symbolFrequency: gate(0.999),
+            });
+            expect(lsp2.findReferencingSymbols).toHaveBeenCalledWith('offset/Rare', 'std/offset.hx', 20);
+        });
+
+        it('applies the bound on hop 2 as well as hop 1', async () => {
+            const lsp: any = {
+                findSymbol: jest.fn(async () => []),
+                findReferencingSymbols: jest.fn(async (name: string) => (name === 'Rare' ? [loc('std/Ref.hx', 1, 5)] : [])),
+                findImplementations: jest.fn(async () => []),
+            };
+            const declRows = new Map([['Rare', [{ id: 'c_decl', relativePath: 'std/Rare.hx' } as FakeRow]]]);
+            const locationRows = new Map<string, FakeRow[]>([['std/Ref.hx', [{ id: 'c_ref' }]]]);
+            const hydrations = new Map<string, FakeRow>([
+                ['c_decl', { id: 'c_decl', relativePath: 'std/Rare.hx', metadata: '{}' }],
+                // The hop-1 chunk the seeds are picked from is named after the
+                // identifier the corpus uses everywhere.
+                ['c_ref', { id: 'c_ref', symbol_name: 'offset', relativePath: 'std/Ref.hx', metadata: '{}' }],
+            ]);
+            const diagnostics: any[] = [];
+            await runSymbolRefsPool({
+                ...baseOpts,
+                parsed: { symbolName: 'Rare' },
+                lspClient: lsp,
+                vectorDatabase: makeVectorDb({ declRows, locationRows, hydrations }),
+                maxHops: 2,
+                symbolFrequency: gate(0.999),
+                onDiagnostics: (d) => diagnostics.push(d),
+            });
+            expect(lsp.findReferencingSymbols).toHaveBeenCalledTimes(1);
+            expect(lsp.findReferencingSymbols).toHaveBeenCalledWith('Rare', 'std/Rare.hx', 20);
+            expect(diagnostics[0].skipped).toEqual([{ symbol: 'offset', document_frequency: 90, hop: 2 }]);
         });
     });
 });

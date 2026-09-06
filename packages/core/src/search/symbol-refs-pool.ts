@@ -26,6 +26,7 @@
 import * as path from 'path';
 import { ParsedQName } from './query-classifier';
 import { Location, SerenaLspClient } from './serena-lsp-client';
+import { SymbolFrequencyGate } from './symbol-frequency';
 import {
     HybridSearchResult,
     VectorDatabase,
@@ -75,6 +76,30 @@ export interface SymbolRefsPoolOptions {
      * Applies only when `maxHops >= 2`. Default 3.
      */
     maxHop2Refs?: number;
+    /**
+     * local-rag #64: the corpus-derived identifier frequency and the bound this
+     * build applies (`SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE`, a position in
+     * the corpus's own frequency distribution). Reference expansion is skipped
+     * for a subject at or above the bound, on hop 1 and on every hop after it;
+     * the declaration seed and `find_implementations` still run. Absent, or with
+     * no bound configured, or for a subject whose frequency is unknown, the pool
+     * expands references exactly as it did before this option existed.
+     */
+    symbolFrequency?: SymbolFrequencyGate;
+    /**
+     * local-rag #64: called once per activation with what the frequency gate
+     * did, so the skip is recorded by the run rather than being observable only
+     * as an absence of rows.
+     */
+    onDiagnostics?: (diagnostics: SymbolRefsFrequencyDiagnostics) => void;
+}
+
+/** What one pool activation did about the frequency bound, for the run record. */
+export interface SymbolRefsFrequencyDiagnostics {
+    source: string;
+    bound_documents: number | null;
+    bound_quantile: number | null;
+    skipped: { symbol: string; document_frequency: number; hop: number }[];
 }
 
 const DEFAULT_RRF_K = 60;
@@ -142,12 +167,55 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
         MAX_DECL_FOR_FANOUT,
     );
 
+    // local-rag #64: is this subject one the corpus itself uses everywhere? A
+    // frequency at or above the derived bound means `find_referencing_symbols`
+    // would enumerate the whole corpus, which the service refuses and the pool
+    // would truncate to an arbitrary `maxRefs` anyway. The gate is a frequency
+    // and nothing else: no list of names, no length rule, no casing rule, and a
+    // subject whose frequency is UNKNOWN is never skipped.
+    const frequency = opts.symbolFrequency || null;
+    const frequencySkips: { symbol: string; document_frequency: number; hop: number }[] = [];
+    const skipReferences = (name: string, hop: number): boolean => {
+        if (!frequency || !frequency.atOrAboveBound(name)) return false;
+        frequencySkips.push({ symbol: name, document_frequency: frequency.frequencyOf(name) as number, hop });
+        return true;
+    };
+    // Reported on every exit, including the two early ones: a run has to record
+    // that no frequency source was available rather than a bound it did not
+    // apply, and a skip has to be legible without counting missing rows.
+    const reportFrequency = (): void => {
+        if (!opts.onDiagnostics) return;
+        opts.onDiagnostics({
+            source: frequency ? frequency.source : 'absent',
+            bound_documents: frequency ? frequency.boundDocuments : null,
+            bound_quantile: frequency ? frequency.boundQuantile : null,
+            skipped: frequencySkips,
+        });
+    };
+
     let refs: Location[] = [];
     let impls: Location[] = [];
+    let refsSkipped = false;
     if (declChunks.length > 0) {
         const declRel = declChunks[0].relativePath;
+        // Gate the subject of the call that is actually made: `callPath`, which
+        // for a `Class/method` parse is the METHOD. `lspName` is the top-level
+        // name (the class), and gating on it would read the wrong identifier's
+        // frequency and let the expensive call go out unbounded — the motivating
+        // defect has exactly this shape.
+        refsSkipped = skipReferences(callPath, 1);
+        if (refsSkipped) {
+            // console.warn, not console.log: the candidate arm silences
+            // console.log for its whole prompt loop, and a skip that leaves no
+            // trace in either the log or the artifact is a decision the run
+            // cannot account for.
+            console.warn(`[Context] 🔍 symbol-refs pool: reference expansion SKIPPED for subject="${callPath}" — document frequency ${frequency!.frequencyOf(callPath)} >= bound ${frequency!.boundDocuments} (quantile ${frequency!.boundQuantile} of ${frequency!.documents} documents)`);
+        }
+        // The declaration seed and the implementations still run, so the pool
+        // keeps contributing what it can and the skip is a recorded decision
+        // rather than an absence of rows.
         const [refsResult, implsResult] = await Promise.allSettled([
-            opts.lspClient.findReferencingSymbols(callPath, declRel, opts.maxRefs),
+            refsSkipped ? Promise.resolve([] as Location[]) : opts.lspClient.findReferencingSymbols(callPath, declRel, opts.maxRefs),
             opts.lspClient.findImplementations(callPath, declRel, opts.maxImpls),
         ]);
         if (refsResult.status === 'fulfilled') refs = refsResult.value;
@@ -156,6 +224,7 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
 
     if (declChunks.length === 0 && refs.length === 0 && impls.length === 0) {
         console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=0, refs=0, impls=0, hop2=0 → 0 chunks`);
+        reportFrequency();
         return [];
     }
 
@@ -207,9 +276,14 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
             .slice(0, maxHop1Seeds);
 
         if (eligibleSeeds.length > 0) {
+            // The bound applies on every hop, by definition: a hop-2 seed the
+            // corpus uses everywhere is the same expensive enumeration one hop
+            // further out.
             const hop2Results = await Promise.allSettled(
                 eligibleSeeds.map((seed) =>
-                    opts.lspClient.findReferencingSymbols(seed.symbolName, seed.relativePath, maxHop2Refs),
+                    skipReferences(seed.symbolName, 2)
+                        ? Promise.resolve([] as Location[])
+                        : opts.lspClient.findReferencingSymbols(seed.symbolName, seed.relativePath, maxHop2Refs),
                 ),
             );
             const hop2Locations: Location[] = [];
@@ -244,6 +318,7 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
 
     if (orderedChunkIds.length === 0) {
         console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, refs=${refs.length}, impls=${impls.length}, hop2=0 → 0 chunks (no Milvus matches)`);
+        reportFrequency();
         return [];
     }
 
@@ -254,7 +329,9 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
     }));
 
     const hop2LogPart = maxHops >= 2 ? `, hop2=${hop2CountAdded}` : '';
-    console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, refs=${refs.length}, impls=${impls.length}${hop2LogPart} → ${results.length} chunks`);
+    const skipLogPart = frequencySkips.length > 0 ? `, refs-skipped-by-frequency=${frequencySkips.length}` : '';
+    console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, refs=${refs.length}, impls=${impls.length}${hop2LogPart}${skipLogPart} → ${results.length} chunks`);
+    reportFrequency();
     return results;
 }
 

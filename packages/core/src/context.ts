@@ -31,6 +31,7 @@ import { ProseGraphIndex, collectProseGraphCandidateIds } from './search/prose-g
 import { buildComparisonBridgePool } from './search/comparison-bridge';
 import { SerenaLspClient } from './search/serena-lsp-client';
 import { runSymbolRefsPool, SymbolRefsParsed } from './search/symbol-refs-pool';
+import { createSymbolFrequencyGate, loadSymbolFrequencyTable, SymbolFrequencyGate } from './search/symbol-frequency';
 import { applyRewriting, RewriteFlags, RewriteResult } from './search/query-rewrite';
 import { Reranker } from './reranker';
 import { extractCandidateSymbols } from './enrichment';
@@ -307,6 +308,22 @@ export class Context {
     // rag-symbol-refs-multi-hop: print the symbol-refs pool wiring banner
     // exactly once per process so the MCP log is grep-able for hop mode.
     private symbolRefsStartupBannerLogged = false;
+    // local-rag #64: the corpus-derived identifier frequency, loaded once per
+    // codebase. A null entry is a corpus with no table, which is a real answer
+    // (every frequency unknown, no bound, today's behaviour) and is cached as
+    // such rather than re-read per query.
+    private symbolFrequencyCache = new Map<string, SymbolFrequencyGate>();
+    // local-rag #64: what the frequency gate did across this process's pool
+    // activations, so a skip is a fact the RUN records rather than only a log
+    // line. Read by the arm drivers into the context artifact's
+    // `symbol_frequency.pool` block; a spec requirement, not diagnostics.
+    private symbolRefsFrequencyRecord: {
+        activations: number;
+        source: string | null;
+        bound_documents: number | null;
+        bound_quantile: number | null;
+        skipped: { symbol: string; document_frequency: number; hop: number }[];
+    } = { activations: 0, source: null, bound_documents: null, bound_quantile: null, skipped: [] };
 
     constructor(config: ContextConfig = {}) {
         // Initialize services
@@ -780,6 +797,14 @@ export class Context {
                 maxHops: this.getSymbolRefsMaxHops(),
                 maxHop1Seeds: this.getSymbolRefsMaxHop1Seeds(),
                 maxHop2Refs: this.getSymbolRefsMaxHop2Refs(),
+                symbolFrequency: this.getSymbolFrequencyGate(codebasePath),
+                onDiagnostics: (d) => {
+                    this.symbolRefsFrequencyRecord.activations += 1;
+                    this.symbolRefsFrequencyRecord.source = d.source;
+                    this.symbolRefsFrequencyRecord.bound_documents = d.bound_documents;
+                    this.symbolRefsFrequencyRecord.bound_quantile = d.bound_quantile;
+                    for (const skip of d.skipped) this.symbolRefsFrequencyRecord.skipped.push(skip);
+                },
             });
         } catch (err) {
             console.warn(`[Context] ⚠️ symbol-refs pool failed: ${err}`);
@@ -940,6 +965,66 @@ export class Context {
     }
 
     // ---- rag-symbol-refs-multi-hop: env getters -------------------------
+
+    /**
+     * local-rag #64: the policy position in the corpus's own document-frequency
+     * distribution above which the pool stops expanding references. A POSITION,
+     * not a count: the threshold in documents is a property of the corpus the
+     * build ran over and is derived per corpus. Unset, empty or 0 means NO
+     * BOUND — the pool expands references for every activated subject, exactly
+     * as it did before this knob existed. Stamped through the `SYMBOL_REFS_`
+     * prefix because it changes what the pool emits.
+     */
+    private getSymbolRefsMaxSymbolFrequencyQuantile(): number {
+        const raw = (envManager.get('SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE') || '').trim();
+        if (raw.length === 0) return 0;
+        const q = Number(raw);
+        if (!Number.isFinite(q) || q < 0 || q > 1) {
+            console.warn(`[Context] ⚠️ Ignoring invalid SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE=${raw}; expected a quantile in [0, 1], falling back to 0 (no bound)`);
+            return 0;
+        }
+        return q;
+    }
+
+    /**
+     * local-rag #64: the frequency gate for one codebase, cached. The table is
+     * the artifact `infra/lib/symbol-frequency.js` writes beside the symbol
+     * vocabulary; a corpus without one yields a gate whose source is `absent`,
+     * whose bound is null and whose every frequency is unknown.
+     */
+    private getSymbolFrequencyGate(codebasePath: string): SymbolFrequencyGate {
+        const cached = this.symbolFrequencyCache.get(codebasePath);
+        if (cached) return cached;
+        const quantile = this.getSymbolRefsMaxSymbolFrequencyQuantile();
+        const gate = createSymbolFrequencyGate(loadSymbolFrequencyTable(codebasePath), quantile);
+        this.symbolFrequencyCache.set(codebasePath, gate);
+        if (gate.source === 'absent') {
+            console.log('[Context] 🔢 symbol frequency: no derived table beside the corpus — reference expansion is unbounded (pre-#64 behaviour)');
+        } else {
+            console.log(`[Context] 🔢 symbol frequency: ${gate.identifiers} identifiers over ${gate.documents} documents${gate.boundDocuments === null ? ', no bound configured' : `, bound ${gate.boundDocuments} documents (quantile ${gate.boundQuantile})`}`);
+        }
+        return gate;
+    }
+
+    /**
+     * local-rag #64: what the symbol-refs pool's frequency gate did over this
+     * process — how many activations consulted it, which source they read, the
+     * bound in documents they applied, and every subject whose reference
+     * expansion was skipped. Written into the arm artifacts so the skip is
+     * recorded rather than being observable only as an absence of rows.
+     */
+    getSymbolRefsFrequencyRecord(): {
+        activations: number;
+        source: string | null;
+        bound_documents: number | null;
+        bound_quantile: number | null;
+        skipped: { symbol: string; document_frequency: number; hop: number }[];
+    } {
+        return {
+            ...this.symbolRefsFrequencyRecord,
+            skipped: this.symbolRefsFrequencyRecord.skipped.slice(),
+        };
+    }
 
     private getSymbolRefsMaxHops(): number {
         const raw = envManager.get('SYMBOL_REFS_MAX_HOPS');

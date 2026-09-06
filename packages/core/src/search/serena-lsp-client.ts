@@ -115,6 +115,12 @@ export class SerenaLspClient {
     // One call in flight per instance (#62). The chain never rejects: a
     // failed call settles the chain so the next call still runs.
     private queue: Promise<unknown> = Promise.resolve();
+    // local-rag #64: the service's own error for the last call of each tool
+    // that it did NOT answer, cleared when that tool is called again. A `null`
+    // result with an entry here is a call the service never answered; a `null`
+    // with no entry is the service answering that nothing matched.
+    private lastToolError = new Map<string, { reason: string; attempts: number; at: number }>();
+    private lastAttemptError: string | null = null;
 
     constructor(opts: SerenaLspClientOptions = {}) {
         this.opts = opts;
@@ -231,8 +237,20 @@ export class SerenaLspClient {
     }
 
     private async callToolSerial(name: string, args: Record<string, unknown>): Promise<any | null> {
+        // local-rag #64: a call that the service never answered and a call the
+        // service answered with nothing are both `null` to every caller of this
+        // method, and telling them apart from the outside by elapsed time cannot
+        // work — this method spends up to TWO budgets, and the guard's queue
+        // wait is not part of either. So the transport records the service's own
+        // error for the last call of each tool, which is the better evidence the
+        // design asks for. The RETURN CONTRACT IS UNCHANGED: nothing here alters
+        // what the retrieval pool or any existing caller receives.
+        this.lastToolError.delete(name);
+        const record = (reason: string, attempts: number): void => {
+            this.lastToolError.set(name, { reason, attempts, at: Date.now() });
+        };
         const baseUrl = await this.detectBaseUrl();
-        if (!baseUrl) return null;
+        if (!baseUrl) { record('no base URL', 0); return null; }
         const result = await this.callToolOnce(baseUrl, name, args);
         if (result !== undefined) return result;
         // Retry once against a freshly probed URL — handles the service being
@@ -240,9 +258,20 @@ export class SerenaLspClient {
         this.invalidateCache();
         await this.disposeClient();
         const refreshed = await this.detectBaseUrl(true);
-        if (!refreshed) return null;
+        if (!refreshed) { record(this.lastAttemptError || 'no base URL on retry', 1); return null; }
         const retry = await this.callToolOnce(refreshed, name, args);
-        return retry === undefined ? null : retry;
+        if (retry === undefined) { record(this.lastAttemptError || 'both attempts failed', 2); return null; }
+        return retry;
+    }
+
+    /**
+     * local-rag #64: what the service said about the last call of `name`, when
+     * it did not answer it. `undefined` means the last call of that tool was
+     * answered (including answered with nothing), which is the distinction a
+     * caller cannot otherwise make.
+     */
+    getLastToolError(name: string): { reason: string; attempts: number; at: number } | undefined {
+        return this.lastToolError.get(name);
     }
 
     private async callToolOnce(
@@ -263,6 +292,9 @@ export class SerenaLspClient {
             return response;
         } catch (err) {
             const reason = err instanceof Error ? err.message : String(err);
+            // Kept so `callToolSerial` can record what the service actually said
+            // (`MCP error -32001: Request timed out`) rather than a guess.
+            this.lastAttemptError = reason;
             console.warn(`[SerenaLspClient] ${name} failed: ${reason}`);
             return undefined;
         }
