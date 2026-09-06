@@ -337,15 +337,45 @@ describe('SerenaLspClient — getLastToolError (local-rag #64)', () => {
         expect(client.getLastToolError('find_referencing_symbols')).toBeUndefined();
     });
 
-    it('an abandoned predecessor cannot write onto its successor record', async () => {
+    it('a call the chain ABANDONS is recorded as unanswered, not left looking answered', async () => {
+        // The loudest case of the service failing to answer: the call outlived
+        // two per-call budgets plus slack, `withDeadline` gave up on it, and
+        // `callToolSerial` is still running with nothing recorded. A caller that
+        // saw `null` with no record would read it as "nothing matches" — the
+        // exact hole mechanism 3 exists to close. Driven through the real
+        // `callTool` path, with a call that genuinely never settles.
         const client = make();
-        // The successor claims the slot and answers; the predecessor settles
-        // afterwards, as an abandoned call does around two timeouts later, and
-        // must not report a failure the successor never had.
-        await (client as any).callToolSerial('find_referencing_symbols', {}, 2).catch(() => {});
-        (client as any).lastToolError.set('find_referencing_symbols', { seq: 2, error: null });
-        client.ensureClient = jest.fn(async () => null);
-        await (client as any).callToolSerial('find_referencing_symbols', {}, 1);
+        client.ensureClient = jest.fn(async () => ({ callTool: jest.fn(() => new Promise(() => { /* never settles */ })) }));
+        const out = await (client as any).callTool('find_referencing_symbols', {});
+        expect(out).toBeNull();
+        const recorded = client.getLastToolError('find_referencing_symbols');
+        expect(recorded).toBeTruthy();
+        expect(recorded.reason).toMatch(/abandoned after \d+ms without an answer/);
+    }, 20000);
+
+    it('an abandoned predecessor cannot write onto the record of a successor that overlaps it', async () => {
+        // A real overlap: the first call never settles and is abandoned, the
+        // second runs while the first is still pending and answers, and the
+        // first's own `record()` then fires late. The successor's entry must
+        // survive it.
+        const client = make();
+        let settleFirst: ((value: any) => void) | null = null;
+        let call = 0;
+        client.ensureClient = jest.fn(async () => ({
+            callTool: jest.fn(() => {
+                call += 1;
+                if (call === 1) return new Promise((resolve) => { settleFirst = resolve; });
+                return Promise.resolve({ content: [{ type: 'text', text: '[]' }] });
+            }),
+        }));
+        const first = (client as any).callTool('find_referencing_symbols', {});
+        await expect(first).resolves.toBeNull();
+        // The successor claims the slot and is answered.
+        await (client as any).callTool('find_referencing_symbols', {});
         expect(client.getLastToolError('find_referencing_symbols')).toBeUndefined();
-    });
+        // Now the zombie settles, as one does around two timeouts later.
+        if (settleFirst) (settleFirst as any)({ content: [{ type: 'text', text: '[]' }] });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(client.getLastToolError('find_referencing_symbols')).toBeUndefined();
+    }, 20000);
 });

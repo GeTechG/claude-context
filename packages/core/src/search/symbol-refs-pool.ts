@@ -98,7 +98,7 @@ export interface SymbolRefsPoolOptions {
 export interface SymbolRefsFrequencyDiagnostics {
     source: string;
     bound_documents: number | null;
-    bound_quantile: number | null;
+    policy_quantile: number | null;
     skipped: { symbol: string; document_frequency: number; hop: number }[];
 }
 
@@ -188,7 +188,7 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
         opts.onDiagnostics({
             source: frequency ? frequency.source : 'absent',
             bound_documents: frequency ? frequency.boundDocuments : null,
-            bound_quantile: frequency ? frequency.boundQuantile : null,
+            policy_quantile: frequency ? frequency.boundQuantile : null,
             skipped: frequencySkips,
         });
     };

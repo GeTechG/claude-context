@@ -619,7 +619,7 @@ describe('runSymbolRefsPool', () => {
                 onDiagnostics: (d) => diagnostics.push(d),
             });
             expect(lsp.findReferencingSymbols).toHaveBeenCalled();
-            expect(diagnostics[0]).toEqual({ source: 'absent', bound_documents: null, bound_quantile: null, skipped: [] });
+            expect(diagnostics[0]).toEqual({ source: 'absent', bound_documents: null, policy_quantile: null, skipped: [] });
         });
 
         it('with no bound configured (the inert default), behaves exactly as before the gate existed', async () => {

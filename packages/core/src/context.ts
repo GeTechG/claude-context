@@ -325,10 +325,10 @@ export class Context {
         activations: number;
         source: string | null;
         bound_documents: number | null;
-        bound_quantile: number | null;
+        policy_quantile: number | null;
         skipped: { symbol: string; document_frequency: number; hop: number }[];
         skipped_total: number;
-    } = { activations: 0, source: null, bound_documents: null, bound_quantile: null, skipped: [], skipped_total: 0 };
+    } = { activations: 0, source: null, bound_documents: null, policy_quantile: null, skipped: [], skipped_total: 0 };
 
     constructor(config: ContextConfig = {}) {
         // Initialize services
@@ -807,7 +807,7 @@ export class Context {
                     this.symbolRefsFrequencyRecord.activations += 1;
                     this.symbolRefsFrequencyRecord.source = d.source;
                     this.symbolRefsFrequencyRecord.bound_documents = d.bound_documents;
-                    this.symbolRefsFrequencyRecord.bound_quantile = d.bound_quantile;
+                    this.symbolRefsFrequencyRecord.policy_quantile = d.policy_quantile;
                     // Bounded: this record lives for the process, and a
                     // long-lived MCP server would otherwise grow it without
                     // limit. The count is what a run is read by; the list is a
@@ -1029,7 +1029,7 @@ export class Context {
         activations: number;
         source: string | null;
         bound_documents: number | null;
-        bound_quantile: number | null;
+        policy_quantile: number | null;
         skipped: { symbol: string; document_frequency: number; hop: number }[];
         skipped_total: number;
         skipped_sampled: boolean;

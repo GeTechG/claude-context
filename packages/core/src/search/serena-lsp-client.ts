@@ -237,6 +237,18 @@ export class SerenaLspClient {
         const seq = ++this.callSequence;
         const run = this.queue.then(() => withDeadline(this.callToolSerial(name, args, seq), deadline, () => {
             console.warn(`[SerenaLspClient] ${name} abandoned after ${deadline}ms; the chain moves on`);
+            // local-rag #64: the abandonment is itself the service failing to
+            // answer, and it is the LOUDEST such case — the call outlived two
+            // per-call budgets plus slack. `callToolSerial` is still running and
+            // has not recorded anything, so without this the caller sees a
+            // `null` with no error record and reads it as "the service answered
+            // that nothing matches", which is the exact hole mechanism 3 exists
+            // to close. Guarded by the same sequence rule: a later call that has
+            // already claimed the slot is not overwritten.
+            const held = this.lastToolError.get(name);
+            if (!held || held.seq <= seq) {
+                this.lastToolError.set(name, { seq, error: { reason: `abandoned after ${deadline}ms without an answer`, attempts: 0, at: Date.now() } });
+            }
             return null;
         }));
         this.queue = run.then(() => undefined, () => undefined);
@@ -278,6 +290,10 @@ export class SerenaLspClient {
         const refreshed = await this.detectBaseUrl(true);
         if (!refreshed) { record(this.lastAttemptError || 'no base URL on retry', 1); return null; }
         const retry = await this.callToolOnce(refreshed, name, args);
+        // Same rule as the first attempt: a `null` with an attempt error behind
+        // it is the service declining (an `isError` result), not an answer of
+        // nothing.
+        if (retry === null && this.lastAttemptError) { record(this.lastAttemptError, 2); return null; }
         if (retry === undefined) { record(this.lastAttemptError || 'both attempts failed', 2); return null; }
         return retry;
     }
