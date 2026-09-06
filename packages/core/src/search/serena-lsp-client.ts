@@ -7,7 +7,24 @@
 // scope-serena-to-compose: Serena runs as the `serena` service in
 // infra/docker-compose.yml on a fixed port, so there is nothing to discover —
 // the base URL is SERENA_BASE_URL (default http://127.0.0.1:18948). Any HTTP
-// response on /mcp counts as "alive"; Serena exposes no /health endpoint.
+// response from the server counts as "alive"; Serena exposes no /health
+// endpoint.
+//
+// local-rag #61 / #62 (serena-session-hygiene):
+//   - the liveness probe asks `/` (a 404 from the same server), NOT `/mcp`:
+//     Serena's streamable-HTTP manager opens a new server-side session for
+//     EVERY request to `/mcp` that carries no session id, whatever the method
+//     or the status it answers with, and nothing ever closes it — one leaked
+//     session per probe, per operation, per healthcheck (937 transports for
+//     1075 POSTs in one 59-row build);
+//   - calls on one client instance are serialised. Serena executes tool calls
+//     on a single queue anyway, so concurrency bought nothing, and the failure
+//     path below disposes the shared connection — which, with a sibling call
+//     in flight on it, rejected the sibling too (the -32001 then -32000 pair
+//     of every pre-fix build). With one call in flight per instance a dispose
+//     can only ever hit the call that failed;
+//   - a disposed connection terminates its server session (DELETE) before it
+//     closes, so the client leaks nothing either.
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -43,6 +60,26 @@ const DEFAULT_BASE_URL = 'http://127.0.0.1:18948';
 const URL_TTL_MS = 30_000;
 const DEFAULT_TIMEOUT_MS = 1500;
 const HEALTH_PROBE_TIMEOUT_MS = 500;
+// The session DELETE on dispose is best-effort and bounded: it runs inside the
+// per-instance chain, so an unbounded DELETE against a wedged server would
+// stall every later call on the client (#61 review).
+const SESSION_TERMINATE_TIMEOUT_MS = 1000;
+// A chained call that never settles — the SDK timeout did not fire — is
+// abandoned after two per-call timeouts plus slack so the chain advances; the
+// zombie keeps its connection until it settles (mirrors infra's call guard).
+const CHAIN_STEP_ATTEMPT_FACTOR = 2;
+const CHAIN_STEP_SLACK_MS = 5000;
+
+function withDeadline<T>(promise: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
+    if (!(ms > 0) || !Number.isFinite(ms)) return promise;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const deadline = new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(onTimeout()), ms);
+        if (timer && typeof (timer as any).unref === 'function') (timer as any).unref();
+    });
+    promise.catch(() => undefined);
+    return Promise.race([promise, deadline]).finally(() => { if (timer) clearTimeout(timer); });
+}
 // Sentinel "end of file" line used when Serena returns the oversized
 // reference summary without per-line positions. Picked far above any
 // realistic source-file length so the chunk-mapper's line-overlap filter
@@ -54,10 +91,11 @@ async function defaultHealthProbe(baseUrl: string): Promise<boolean> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), HEALTH_PROBE_TIMEOUT_MS);
     try {
-        // Serena answers /mcp only to a real MCP handshake, so a bare GET
-        // returns an error status — but ANY status proves the port is bound to
-        // a working server. Connection refused / abort => service down.
-        const res = await fetch(`${baseUrl}/mcp`, { method: 'GET', signal: ctrl.signal });
+        // ANY status proves the port is bound to a working server (the root
+        // answers 404). Connection refused / abort => service down. Never
+        // `/mcp`: a bare request there opens a server session nothing closes
+        // (#61).
+        const res = await fetch(`${baseUrl}/`, { method: 'GET', signal: ctrl.signal });
         return res.status > 0;
     } catch {
         return false;
@@ -73,6 +111,10 @@ export class SerenaLspClient {
     private cachedAt = 0;
     private mcpClient: any | null = null;
     private mcpClientUrl: string | null = null;
+    private mcpTransport: any | null = null;
+    // One call in flight per instance (#62). The chain never rejects: a
+    // failed call settles the chain so the next call still runs.
+    private queue: Promise<unknown> = Promise.resolve();
 
     constructor(opts: SerenaLspClientOptions = {}) {
         this.opts = opts;
@@ -120,25 +162,52 @@ export class SerenaLspClient {
             const transport = this.opts.transportFactory
                 ? this.opts.transportFactory(baseUrl)
                 : new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`));
+            // Kept BEFORE connect: a connect that fails after its initialize
+            // POST has already opened a session, and only the transport can
+            // close it (#61 review).
+            this.mcpTransport = transport;
             await client.connect(transport as any);
             this.mcpClient = client;
             this.mcpClientUrl = baseUrl;
             return client;
         } catch (err) {
             console.warn(`[SerenaLspClient] connect failed: ${err instanceof Error ? err.message : err}`);
+            await this.terminateTransport(this.mcpTransport);
+            this.mcpTransport = null;
             return null;
+        }
+    }
+
+    private async terminateTransport(transport: any | null): Promise<void> {
+        if (!transport) return;
+        try {
+            if (typeof transport.terminateSession === 'function') {
+                await withDeadline(Promise.resolve(transport.terminateSession()), SESSION_TERMINATE_TIMEOUT_MS, () => undefined);
+            }
+        } catch {
+            /* swallow — best effort */
         }
     }
 
     private async disposeClient(): Promise<void> {
         if (!this.mcpClient) return;
-        try {
-            await this.mcpClient.close();
-        } catch {
-            /* swallow — best effort */
-        }
+        const client = this.mcpClient;
+        const transport = this.mcpTransport;
         this.mcpClient = null;
         this.mcpClientUrl = null;
+        this.mcpTransport = null;
+        // Close the server session before the socket (#61): `close()` alone
+        // aborts the stream and leaves the session alive on the server. The
+        // DELETE is bounded, and the close runs whatever it did.
+        try {
+            await this.terminateTransport(transport);
+        } finally {
+            try {
+                await client.close();
+            } catch {
+                /* swallow — best effort */
+            }
+        }
     }
 
     /** Tear down any cached MCP connection. Idempotent. */
@@ -146,7 +215,22 @@ export class SerenaLspClient {
         await this.disposeClient();
     }
 
-    private async callTool(name: string, args: Record<string, unknown>): Promise<any | null> {
+    private callTool(name: string, args: Record<string, unknown>): Promise<any | null> {
+        // Serialised per instance (#62): the retry path below disposes the
+        // shared connection, which must never happen under a sibling call.
+        // Each step is bounded so a call that never settles cannot hold the
+        // chain: the step yields null, the chain advances, and the zombie is
+        // left to settle on its own (the outer guard defers the close).
+        const deadline = this.timeoutMs * CHAIN_STEP_ATTEMPT_FACTOR + CHAIN_STEP_SLACK_MS;
+        const run = this.queue.then(() => withDeadline(this.callToolSerial(name, args), deadline, () => {
+            console.warn(`[SerenaLspClient] ${name} abandoned after ${deadline}ms; the chain moves on`);
+            return null;
+        }));
+        this.queue = run.then(() => undefined, () => undefined);
+        return run;
+    }
+
+    private async callToolSerial(name: string, args: Record<string, unknown>): Promise<any | null> {
         const baseUrl = await this.detectBaseUrl();
         if (!baseUrl) return null;
         const result = await this.callToolOnce(baseUrl, name, args);

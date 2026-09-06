@@ -164,6 +164,128 @@ describe('SerenaLspClient.findSymbol / findReferencingSymbols / findImplementati
     });
 });
 
+// local-rag #61 / #62: session hygiene.
+describe('SerenaLspClient session hygiene', () => {
+    const ENV_KEY = 'SERENA_BASE_URL';
+    const savedEnv = process.env[ENV_KEY];
+    const savedFetch = (globalThis as any).fetch;
+    afterEach(() => {
+        if (savedEnv === undefined) delete process.env[ENV_KEY];
+        else process.env[ENV_KEY] = savedEnv;
+        (globalThis as any).fetch = savedFetch;
+    });
+
+    it('the default liveness probe asks the server root, never /mcp, and any status counts as alive', async () => {
+        delete process.env[ENV_KEY];
+        const asked: string[] = [];
+        (globalThis as any).fetch = jest.fn(async (url: string) => { asked.push(String(url)); return { status: 404 }; });
+        const client = new SerenaLspClient();
+        await expect(client.detectBaseUrl(true)).resolves.toBe('http://127.0.0.1:18948');
+        expect(asked).toEqual(['http://127.0.0.1:18948/']);
+        expect(asked.some((url) => url.endsWith('/mcp'))).toBe(false);
+    });
+
+    it('serialises calls on one instance: a sibling never overlaps, and a failing call cannot dispose the connection under it', async () => {
+        let inFlight = 0;
+        let peak = 0;
+        const order: string[] = [];
+        let connects = 0;
+        const fake = fakeClient({
+            callTool: async (req: any) => {
+                inFlight += 1; peak = Math.max(peak, inFlight);
+                order.push(`start:${req.name}`);
+                await new Promise((resolve) => setTimeout(resolve, 5));
+                inFlight -= 1;
+                order.push(`end:${req.name}`);
+                if (req.name === 'find_implementations') throw new Error('request timed out');
+                return { content: [{ type: 'text', text: 'References without surrounding lines: ' + JSON.stringify({ 'a.hx': { Method: [{ name_path: 'X/foo', reference_line: 10 }] } }) }] };
+            },
+        });
+        const client = new SerenaLspClient({
+            baseUrlOverride: 'http://stub',
+            clientFactory: () => { connects += 1; return fake; },
+            transportFactory: () => ({ terminateSession: jest.fn(), close: jest.fn() }),
+        });
+        const [refs, impls] = await Promise.all([
+            client.findReferencingSymbols('X/y', 'a.hx', 5),
+            client.findImplementations('X/y', 'a.hx', 5),
+        ]);
+        expect(peak).toBe(1);
+        // refs ran to completion before impls started, and impls' failure
+        // (dispose + one retry on a fresh connection) touched only itself.
+        expect(order.slice(0, 2)).toEqual(['start:find_referencing_symbols', 'end:find_referencing_symbols']);
+        expect(refs).toHaveLength(1);
+        expect(impls).toEqual([]);
+        expect(connects).toBe(2);
+        expect(fake.close).toHaveBeenCalledTimes(1);
+    });
+
+    it('a session DELETE that hangs is bounded, and the socket is closed regardless', async () => {
+        jest.useFakeTimers();
+        try {
+            const transport = { terminateSession: jest.fn(() => new Promise(() => undefined)), close: jest.fn() };
+            const fake = fakeClient({ callTool: async () => ({ content: [{ type: 'text', text: '[]' }] }) });
+            const client = new SerenaLspClient({ baseUrlOverride: 'http://stub', clientFactory: () => fake, transportFactory: () => transport });
+            await client.findSymbol('X');
+            const closing = client.close();
+            await jest.advanceTimersByTimeAsync(1100);
+            await closing;
+            expect(transport.terminateSession).toHaveBeenCalledTimes(1);
+            expect(fake.close).toHaveBeenCalledTimes(1);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it('a connect that fails after opening a session terminates that session', async () => {
+        const transport = { terminateSession: jest.fn(async () => undefined), close: jest.fn() };
+        const fake = { connect: jest.fn().mockRejectedValue(new Error('initialize failed')), callTool: jest.fn(), close: jest.fn() };
+        const client = new SerenaLspClient({ baseUrlOverride: 'http://stub', clientFactory: () => fake, transportFactory: () => transport });
+        await expect(client.findSymbol('X')).resolves.toEqual([]);
+        // connect is attempted, then retried once on a fresh transport: both
+        // failed sessions are terminated, none leaks.
+        expect(fake.connect).toHaveBeenCalledTimes(2);
+        expect(transport.terminateSession).toHaveBeenCalledTimes(2);
+    });
+
+    it('a call that never settles is abandoned by the chain, and the next call still runs', async () => {
+        jest.useFakeTimers();
+        try {
+            let calls = 0;
+            const fake = fakeClient({
+                callTool: async (req: any) => {
+                    calls += 1;
+                    if (req.name === 'find_implementations') return new Promise(() => undefined);
+                    return { content: [{ type: 'text', text: 'References without surrounding lines: ' + JSON.stringify({ 'a.hx': { Method: [{ name_path: 'X/foo', reference_line: 10 }] } }) }] };
+                },
+            });
+            const client = new SerenaLspClient({ baseUrlOverride: 'http://stub', timeoutMs: 100, clientFactory: () => fake, transportFactory: () => ({ terminateSession: jest.fn(), close: jest.fn() }) });
+            const stuck = client.findImplementations('X/y', 'a.hx', 5);
+            const next = client.findReferencingSymbols('X/y', 'a.hx', 5);
+            await jest.advanceTimersByTimeAsync(100 * 2 + 5000 + 10);
+            await expect(stuck).resolves.toEqual([]);
+            await expect(next).resolves.toHaveLength(1);
+            expect(calls).toBe(2);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it('terminates the server session before closing a disposed connection', async () => {
+        const transport = { terminateSession: jest.fn(async () => undefined), close: jest.fn() };
+        const fake = fakeClient({ callTool: async () => ({ content: [{ type: 'text', text: '[]' }] }) });
+        const client = new SerenaLspClient({ baseUrlOverride: 'http://stub', clientFactory: () => fake, transportFactory: () => transport });
+        await client.findSymbol('X');
+        await client.close();
+        expect(transport.terminateSession).toHaveBeenCalledTimes(1);
+        expect(fake.close).toHaveBeenCalledTimes(1);
+        expect(transport.terminateSession.mock.invocationCallOrder[0]).toBeLessThan(fake.close.mock.invocationCallOrder[0]);
+        // Idempotent, and a transport without the method is closed as before.
+        await client.close();
+        expect(fake.close).toHaveBeenCalledTimes(1);
+    });
+});
+
 describe('parser primitives', () => {
     it('parseFindSymbolResponse returns [] on garbage', () => {
         expect(parseFindSymbolResponse(null)).toEqual([]);
