@@ -317,13 +317,18 @@ export class Context {
     // activations, so a skip is a fact the RUN records rather than only a log
     // line. Read by the arm drivers into the context artifact's
     // `symbol_frequency.pool` block; a spec requirement, not diagnostics.
+    // How many skipped subjects the process-lifetime record keeps by name. The
+    // count is unbounded and is what a run is read by; the list is a sample, so
+    // a long-lived MCP server cannot grow it without limit.
+    private static readonly SYMBOL_REFS_SKIP_SAMPLE_CAP = 200;
     private symbolRefsFrequencyRecord: {
         activations: number;
         source: string | null;
         bound_documents: number | null;
         bound_quantile: number | null;
         skipped: { symbol: string; document_frequency: number; hop: number }[];
-    } = { activations: 0, source: null, bound_documents: null, bound_quantile: null, skipped: [] };
+        skipped_total: number;
+    } = { activations: 0, source: null, bound_documents: null, bound_quantile: null, skipped: [], skipped_total: 0 };
 
     constructor(config: ContextConfig = {}) {
         // Initialize services
@@ -803,7 +808,14 @@ export class Context {
                     this.symbolRefsFrequencyRecord.source = d.source;
                     this.symbolRefsFrequencyRecord.bound_documents = d.bound_documents;
                     this.symbolRefsFrequencyRecord.bound_quantile = d.bound_quantile;
-                    for (const skip of d.skipped) this.symbolRefsFrequencyRecord.skipped.push(skip);
+                    // Bounded: this record lives for the process, and a
+                    // long-lived MCP server would otherwise grow it without
+                    // limit. The count is what a run is read by; the list is a
+                    // sample, and says so when it is one.
+                    for (const skip of d.skipped) {
+                        this.symbolRefsFrequencyRecord.skipped_total += 1;
+                        if (this.symbolRefsFrequencyRecord.skipped.length < Context.SYMBOL_REFS_SKIP_SAMPLE_CAP) this.symbolRefsFrequencyRecord.skipped.push(skip);
+                    }
                 },
             });
         } catch (err) {
@@ -1019,10 +1031,13 @@ export class Context {
         bound_documents: number | null;
         bound_quantile: number | null;
         skipped: { symbol: string; document_frequency: number; hop: number }[];
+        skipped_total: number;
+        skipped_sampled: boolean;
     } {
         return {
             ...this.symbolRefsFrequencyRecord,
             skipped: this.symbolRefsFrequencyRecord.skipped.slice(),
+            skipped_sampled: this.symbolRefsFrequencyRecord.skipped_total > this.symbolRefsFrequencyRecord.skipped.length,
         };
     }
 

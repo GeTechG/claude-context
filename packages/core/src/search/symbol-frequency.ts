@@ -24,9 +24,16 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 
 export const SYMBOL_FREQUENCY_SCHEMA = 'local-rag-symbol-frequency-v1';
 export const SYMBOL_FREQUENCY_RELPATH = path.join('.local-rag', 'symbol-frequency.json');
+// The provenance the harness writes beside the table: when it was derived, how
+// long it took, and the sha256 of the table's own bytes. The pool cannot walk
+// the corpus to re-check the signature, but it CAN refuse a table the report
+// beside it does not describe — a half-written file, a hand-edited one, or one
+// left behind by another corpus.
+export const SYMBOL_FREQUENCY_REPORT_RELPATH = path.join('.local-rag', 'symbol-frequency-report.json');
 
 export interface SymbolFrequencyDistribution {
     identifiers: number;
@@ -102,17 +109,44 @@ export function boundForQuantile(distribution: SymbolFrequencyDistribution | nul
     return quantileFromHistogram(distribution, q);
 }
 
-/** Read the table written beside the corpus. Null when there is none. */
+/**
+ * Read the table written beside the corpus, and only accept it when the report
+ * beside it describes exactly these bytes. Null when there is none, when it is
+ * malformed, or when the two disagree — in every one of those cases the pool
+ * expands references for every activated subject, which is the behaviour that
+ * predates the bound.
+ */
 export function loadSymbolFrequencyTable(codebasePath: string): SymbolFrequencyTable | null {
+    let raw: string;
     try {
-        const raw = fs.readFileSync(path.join(codebasePath, SYMBOL_FREQUENCY_RELPATH), 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (!parsed || parsed.schema !== SYMBOL_FREQUENCY_SCHEMA) return null;
-        if (!parsed.frequencies || !parsed.distribution || !parsed.distribution.histogram) return null;
-        return parsed as SymbolFrequencyTable;
+        raw = fs.readFileSync(path.join(codebasePath, SYMBOL_FREQUENCY_RELPATH), 'utf-8');
     } catch {
         return null;
     }
+    let parsed: any;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        return null;
+    }
+    if (!parsed || parsed.schema !== SYMBOL_FREQUENCY_SCHEMA) return null;
+    if (!parsed.frequencies || !parsed.distribution || !parsed.distribution.histogram) return null;
+    // The table has to be the one its own report describes. A table with no
+    // report, or one whose bytes have moved under it, is not applied: the gate
+    // would otherwise bound references by a table nothing in the run vouches for
+    // and no artifact describes.
+    try {
+        const report = JSON.parse(fs.readFileSync(path.join(codebasePath, SYMBOL_FREQUENCY_REPORT_RELPATH), 'utf-8'));
+        const digest = crypto.createHash('sha256').update(raw).digest('hex');
+        if (!report || report.sha256 !== digest || report.signature !== parsed.signature) {
+            console.warn('[Context] 🔢 symbol frequency: the table and the report beside it disagree — not applying a bound');
+            return null;
+        }
+    } catch {
+        console.warn('[Context] 🔢 symbol frequency: no report beside the table — not applying a bound');
+        return null;
+    }
+    return parsed as SymbolFrequencyTable;
 }
 
 /**

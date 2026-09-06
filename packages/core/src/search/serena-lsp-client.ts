@@ -119,8 +119,14 @@ export class SerenaLspClient {
     // that it did NOT answer, cleared when that tool is called again. A `null`
     // result with an entry here is a call the service never answered; a `null`
     // with no entry is the service answering that nothing matched.
-    private lastToolError = new Map<string, { reason: string; attempts: number; at: number }>();
+    // Keyed to the CALL, not to the tool name: a predecessor the chain abandoned
+    // settles on its own around two timeouts later — while its successor is
+    // running — and a write from it would otherwise land on the successor's
+    // entry and report a failure that call never had. Each call takes a
+    // monotonic sequence and may only write while it is still the latest.
+    private lastToolError = new Map<string, { seq: number; error: { reason: string; attempts: number; at: number } | null }>();
     private lastAttemptError: string | null = null;
+    private callSequence = 0;
 
     constructor(opts: SerenaLspClientOptions = {}) {
         this.opts = opts;
@@ -228,7 +234,8 @@ export class SerenaLspClient {
         // chain: the step yields null, the chain advances, and the zombie is
         // left to settle on its own (the outer guard defers the close).
         const deadline = this.timeoutMs * CHAIN_STEP_ATTEMPT_FACTOR + CHAIN_STEP_SLACK_MS;
-        const run = this.queue.then(() => withDeadline(this.callToolSerial(name, args), deadline, () => {
+        const seq = ++this.callSequence;
+        const run = this.queue.then(() => withDeadline(this.callToolSerial(name, args, seq), deadline, () => {
             console.warn(`[SerenaLspClient] ${name} abandoned after ${deadline}ms; the chain moves on`);
             return null;
         }));
@@ -236,7 +243,7 @@ export class SerenaLspClient {
         return run;
     }
 
-    private async callToolSerial(name: string, args: Record<string, unknown>): Promise<any | null> {
+    private async callToolSerial(name: string, args: Record<string, unknown>, seq = ++this.callSequence): Promise<any | null> {
         // local-rag #64: a call that the service never answered and a call the
         // service answered with nothing are both `null` to every caller of this
         // method, and telling them apart from the outside by elapsed time cannot
@@ -245,13 +252,24 @@ export class SerenaLspClient {
         // error for the last call of each tool, which is the better evidence the
         // design asks for. The RETURN CONTRACT IS UNCHANGED: nothing here alters
         // what the retrieval pool or any existing caller receives.
-        this.lastToolError.delete(name);
+        // This call claims the slot; an older, abandoned one can no longer write.
+        const current = this.lastToolError.get(name);
+        if (!current || current.seq <= seq) this.lastToolError.set(name, { seq, error: null });
+        this.lastAttemptError = null;
         const record = (reason: string, attempts: number): void => {
-            this.lastToolError.set(name, { reason, attempts, at: Date.now() });
+            const held = this.lastToolError.get(name);
+            if (held && held.seq > seq) return;
+            this.lastToolError.set(name, { seq, error: { reason, attempts, at: Date.now() } });
         };
         const baseUrl = await this.detectBaseUrl();
         if (!baseUrl) { record('no base URL', 0); return null; }
         const result = await this.callToolOnce(baseUrl, name, args);
+        // A tool RESULT flagged `isError` is the service declining to answer —
+        // Serena's refusal of an over-long reference enumeration arrives this
+        // way, as a result and not as an exception, and that refusal is the
+        // 487 048-character case this whole change exists for. It is not an
+        // answer of "nothing references this" and must not be recorded as one.
+        if (result === null && this.lastAttemptError) { record(this.lastAttemptError, 1); return null; }
         if (result !== undefined) return result;
         // Retry once against a freshly probed URL — handles the service being
         // restarted between cache load and call.
@@ -271,7 +289,7 @@ export class SerenaLspClient {
      * caller cannot otherwise make.
      */
     getLastToolError(name: string): { reason: string; attempts: number; at: number } | undefined {
-        return this.lastToolError.get(name);
+        return this.lastToolError.get(name)?.error ?? undefined;
     }
 
     private async callToolOnce(
@@ -286,6 +304,10 @@ export class SerenaLspClient {
                 timeout: this.timeoutMs,
             });
             if (response?.isError) {
+                // Surfaced to `callToolSerial` so it is recorded as a call the
+                // service did not answer, rather than swallowed into the same
+                // `null` an unreferenced symbol returns.
+                this.lastAttemptError = `${name} returned isError`;
                 console.warn(`[SerenaLspClient] ${name} returned isError`);
                 return null;
             }

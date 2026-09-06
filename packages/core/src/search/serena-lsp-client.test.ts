@@ -315,3 +315,37 @@ describe('parser primitives', () => {
         expect(got[0].filePath).toBe('y.hx');
     });
 });
+
+// local-rag #64: a call the service did not answer, told from a call it answered
+// with nothing, by what the service itself said.
+describe('SerenaLspClient — getLastToolError (local-rag #64)', () => {
+    const make = (): any => new (SerenaLspClient as any)({ baseUrlOverride: 'http://serena:1', timeoutMs: 50 });
+
+    it('records a tool result flagged isError — the service declining an over-long answer is not "no references"', async () => {
+        const client = make();
+        client.ensureClient = jest.fn(async () => ({ callTool: jest.fn(async () => ({ isError: true, content: [] })) }));
+        const out = await (client as any).callTool('find_referencing_symbols', {});
+        expect(out).toBeNull();
+        expect(client.getLastToolError('find_referencing_symbols')).toBeTruthy();
+        expect(client.getLastToolError('find_referencing_symbols').reason).toMatch(/isError/);
+    });
+
+    it('records nothing when the service answered, even with an empty result', async () => {
+        const client = make();
+        client.ensureClient = jest.fn(async () => ({ callTool: jest.fn(async () => ({ content: [{ type: 'text', text: '[]' }] })) }));
+        await (client as any).callTool('find_referencing_symbols', {});
+        expect(client.getLastToolError('find_referencing_symbols')).toBeUndefined();
+    });
+
+    it('an abandoned predecessor cannot write onto its successor record', async () => {
+        const client = make();
+        // The successor claims the slot and answers; the predecessor settles
+        // afterwards, as an abandoned call does around two timeouts later, and
+        // must not report a failure the successor never had.
+        await (client as any).callToolSerial('find_referencing_symbols', {}, 2).catch(() => {});
+        (client as any).lastToolError.set('find_referencing_symbols', { seq: 2, error: null });
+        client.ensureClient = jest.fn(async () => null);
+        await (client as any).callToolSerial('find_referencing_symbols', {}, 1);
+        expect(client.getLastToolError('find_referencing_symbols')).toBeUndefined();
+    });
+});
