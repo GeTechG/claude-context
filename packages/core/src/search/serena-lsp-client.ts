@@ -247,6 +247,19 @@ export class SerenaLspClient {
         // base URLs, since the same-URL return above catches the rest.
         const epoch = ++this.connectionSequence;
         await this.disposeConnection();
+        // local-rag #95 (review): and the latch is re-read HERE, because the
+        // disposal above is itself an unbounded wait — the same suspension the
+        // epoch rule above exists for. An establishment suspended in it has not
+        // joined the pending set yet, so a `close()` that ran while it waited
+        // snapshotted a set this one was not in, cleared it, and returned saying
+        // everything was released; this establishment then resumed and opened a
+        // socket AFTER the disposal resolved, registered in a set nobody reads
+        // again. Nothing awaits between this check and the `add` below, so no new
+        // window opens. Registering earlier instead would NOT fix it: `close()`
+        // would drain an entry whose halves are still null, and this
+        // establishment would then see its entry gone, skip its own teardown and
+        // leak what it went on to build.
+        if (this.closed) return null;
         // Built into LOCALS, never into the shared fields (#81). A connect is
         // unbounded, so an establishment can complete long after the client has
         // moved on; publishing the transport first is what let the two halves of
@@ -279,7 +292,15 @@ export class SerenaLspClient {
             console.warn(`[SerenaLspClient] connect failed: ${err instanceof Error ? err.message : err}`);
             // A `close()` that already drained this entry has torn it down; doing
             // it again would send a second session DELETE for one attempt.
-            if (!drained) await this.terminateTransport(transport);
+            //
+            // local-rag #95 (review): the SAME release the drain performs, not a
+            // narrower one. The failure caught here is not only a rejected
+            // `connect()` — a `transportFactory` that throws (a malformed base URL
+            // reaches `new URL`) leaves `transport` null with the client already
+            // built, and terminating a null transport released nothing while the
+            // client stayed open. Two paths that release one establishment must
+            // release the same things.
+            if (!drained) await this.tearDown(client, transport);
             return null;
         }
         const drained = !this.pendingEstablishments.delete(pending);
@@ -381,14 +402,21 @@ export class SerenaLspClient {
         this.closed = true;
         // local-rag #95: the establishments in flight first. Each is released by
         // whoever takes it out of the set, so an establishment that settles after
-        // this is not torn down twice, and one that never settles is torn down
-        // here rather than never — `connect()` is unbounded, and a disposal that
-        // waited for it would be a disposal that hangs.
+        // this is not torn down twice, and one that never settles is released
+        // here rather than never.
+        //
+        // What this does NOT do is wait for the `connect()` itself: that is
+        // unbounded, and a disposal that waited for it would never return. What
+        // it does not CLAIM (review) is that the release is bounded: `tearDown`
+        // bounds the session DELETE and then calls `client.close()`, which the
+        // SDK does not bound, on a client whose connect has not settled. So the
+        // entries are released CONCURRENTLY — they are separate sockets and
+        // nothing orders them — because serialising them let one slow client
+        // delay the release of every establishment behind it, and the release of
+        // a leaked socket is exactly the thing that must not queue.
         const pending = Array.from(this.pendingEstablishments);
         this.pendingEstablishments.clear();
-        for (const entry of pending) {
-            await this.tearDown(entry.client, entry.transport);
-        }
+        await Promise.all(pending.map((entry) => this.tearDown(entry.client, entry.transport)));
         await this.disposeConnection();
     }
 
