@@ -4,73 +4,100 @@
 // loose identifier fallback stored the RETURN TYPE instead. Measured against
 // clangd on Godot/cocos sources: 0.02 name recall before, 1.00 after.
 //
-// Stub nodes rather than a real parse: node-tree-sitter hands out malformed
-// trees when a second suite parses with another grammar in the same
-// `jest --runInBand` process (see the `findFirst` note in
-// ast-splitter.imports.test.ts), and the shapes below are exactly what
-// tree-sitter-cpp produces for these sources.
+// These cases parse real C++ with the deployed `tree-sitter-cpp` (#123). They
+// used to be hand-built stub nodes, written that way while #75 was live —
+// `tree-sitter/index.js` is not idempotent, and a second execution of it in one
+// jest process left `tree.rootNode` undefined for every parse, so only one test
+// file per worker could parse at all. `tree-sitter-registry-guard.ts` (wired as
+// jest `setupFiles`) reinstalls the first execution's prototype patches before
+// every test file, so a real parse is deterministic again. A stub asserts the
+// author's belief about a third-party grammar; only a real parse notices when
+// the next `tree-sitter-cpp` bump changes the chain.
 
+import Parser from 'tree-sitter';
 import { declaratorName } from './ast-splitter';
 
-type Stub = { type: string; text?: string; declarator?: Stub };
+const Cpp = require('tree-sitter-cpp');
 
-/** Minimal SyntaxNode surface: declaratorName only uses type/text/declarator. */
-function node(stub: Stub): any {
-    return {
-        type: stub.type,
-        text: stub.text ?? '',
-        childForFieldName: (field: string) =>
-            field === 'declarator' && stub.declarator ? node(stub.declarator) : null,
-    };
+// One translation unit holding every shape, so the fixtures stay readable as
+// C++ rather than as a list of node types.
+const SOURCE = `
+StringName _global_enums(int p_index) { return StringName(); }
+int CoreConstants::get_global_constant_count() { return 0; }
+char *make_buffer(int n) { return nullptr; }
+class C { public: bool is_global_constant(const String &n); };
+`;
+
+let _parser: Parser | null = null;
+function cppParser(): Parser {
+    if (_parser) return _parser;
+    const p = new Parser();
+    p.setLanguage(Cpp);
+    _parser = p;
+    return p;
 }
 
-describe('declaratorName — C/C++ declarator chain', () => {
+function parsed(): Parser.SyntaxNode {
+    const tree = cppParser().parse(SOURCE);
+    expect(tree.rootNode).toBeDefined();
+    expect(tree.rootNode.hasError).toBe(false);
+    return tree.rootNode;
+}
+
+/** Every node of one of `types`, depth-first, in source order. */
+function collect(node: Parser.SyntaxNode, types: string[], acc: Parser.SyntaxNode[] = []): Parser.SyntaxNode[] {
+    if (types.includes(node.type)) acc.push(node);
+    for (const child of node.children) collect(child, types, acc);
+    return acc;
+}
+
+/** The declaration whose text starts with `prefix`. */
+function declaration(prefix: string): Parser.SyntaxNode {
+    const found = collect(parsed(), ['function_definition', 'field_declaration', 'class_specifier'])
+        .find(n => n.text.startsWith(prefix));
+    if (!found) throw new Error(`no declaration starting with ${JSON.stringify(prefix)}`);
+    return found;
+}
+
+describe('declaratorName — C/C++ declarator chain, real tree-sitter-cpp parse', () => {
     it('reaches the identifier through function_declarator', () => {
-        // StringName _global_enums(int p_index) { … }
-        expect(declaratorName(node({
-            type: 'function_definition',
-            declarator: { type: 'function_declarator', declarator: { type: 'identifier', text: '_global_enums' } },
-        }))).toBe('_global_enums');
+        const node = declaration('StringName _global_enums');
+        // function_definition → function_declarator → identifier
+        expect(node.childForFieldName('declarator')!.type).toBe('function_declarator');
+        expect(declaratorName(node)).toBe('_global_enums');
     });
 
     it('keeps the qualifier of an out-of-line definition', () => {
-        // int CoreConstants::get_global_constant_count() { … }
-        expect(declaratorName(node({
-            type: 'function_definition',
-            declarator: {
-                type: 'function_declarator',
-                declarator: { type: 'qualified_identifier', text: 'CoreConstants::get_global_constant_count' },
-            },
-        }))).toBe('CoreConstants::get_global_constant_count');
+        const node = declaration('int CoreConstants::');
+        // function_definition → function_declarator → qualified_identifier,
+        // whose own text carries the whole `A::b`.
+        expect(declaratorName(node)).toBe('CoreConstants::get_global_constant_count');
     });
 
     it('walks nested pointer declarators', () => {
-        // char *make_buffer(int n) { … }
-        expect(declaratorName(node({
-            type: 'function_definition',
-            declarator: {
-                type: 'pointer_declarator',
-                declarator: { type: 'function_declarator', declarator: { type: 'identifier', text: 'make_buffer' } },
-            },
-        }))).toBe('make_buffer');
+        const node = declaration('char *make_buffer');
+        // function_definition → pointer_declarator → function_declarator → identifier
+        expect(node.childForFieldName('declarator')!.type).toBe('pointer_declarator');
+        expect(declaratorName(node)).toBe('make_buffer');
     });
 
     it('names a member declaration via field_identifier', () => {
-        // class C { public: bool is_global_constant(const String &n); };
-        expect(declaratorName(node({
-            type: 'field_declaration',
-            declarator: {
-                type: 'function_declarator',
-                declarator: { type: 'field_identifier', text: 'is_global_constant' },
-            },
-        }))).toBe('is_global_constant');
+        const node = declaration('bool is_global_constant');
+        expect(node.type).toBe('field_declaration');
+        expect(declaratorName(node)).toBe('is_global_constant');
     });
 
     it('returns undefined when the node has no declarator', () => {
-        expect(declaratorName(node({ type: 'class_specifier', text: 'class C { int x; };' }))).toBeUndefined();
+        const node = declaration('class C {');
+        expect(node.type).toBe('class_specifier');
+        expect(node.childForFieldName('declarator')).toBeNull();
+        expect(declaratorName(node)).toBeUndefined();
     });
 
     it('gives up instead of looping on a cyclic declarator chain', () => {
+        // Stays a hand-built node deliberately: a real parse cannot produce a
+        // cycle, and the depth bound in declaratorName exists precisely for a
+        // node that did not come from one.
         const cyclic: any = { type: 'pointer_declarator', text: '' };
         cyclic.childForFieldName = (f: string) => (f === 'declarator' ? cyclic : null);
         expect(declaratorName(cyclic)).toBeUndefined();

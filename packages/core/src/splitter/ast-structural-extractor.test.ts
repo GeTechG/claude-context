@@ -4,10 +4,12 @@
 // ERROR-parse with #if/#elseif, and a heritageless class — plus unit tests
 // for `normalizeTypeName` covering the spec's strip / reject rules.
 //
-// AST-walk tests build minimal mock nodes mirroring the deployed
-// `tree-sitter-haxe@0.4.6` ClassType emission shape (verified by direct probe
-// 2026-05-12; see infra/eval-summary.md preflight section). The regex-fallback
-// tests parse real files through tree-sitter to confirm end-to-end behaviour.
+// Three layers, deliberately: mock nodes exercise the AST walk over shapes that
+// are cheap to write down; childless nodes carrying fixture text exercise the
+// regex fallback (that is what a chunk node looks like when the walk yields
+// nothing); and the end-to-end block at the bottom parses the fixtures with the
+// real `tree-sitter-haxe@0.4.6` grammar and asserts the values, so the mocks
+// cannot drift away from what the grammar actually emits.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -23,9 +25,9 @@ function readFixture(name: string): string {
 }
 
 // Build a minimal node satisfying the parts of `Parser.SyntaxNode` our extractor
-// reads (`type`, `text`, `children`). Sufficient for the AST-walk unit tests
-// without depending on tree-sitter native-binding state (which jest --runInBand
-// can corrupt across test files that also load tree-sitter grammars).
+// reads (`type`, `text`, `children`) — enough to state an AST-walk case without
+// writing out a whole parse. The real-grammar block at the bottom of this file
+// is what keeps these shapes honest.
 type FakeNode = {
     type: string;
     text: string;
@@ -35,9 +37,6 @@ function fakeNode(type: string, text: string, children: FakeNode[] = []): FakeNo
     return { type, text, children };
 }
 
-// Lazily create a single real Haxe parser for the end-to-end sanity test —
-// allocating at module-load time can race with other test files' tree-sitter
-// initialization when jest --runInBand pre-loads multiple test modules.
 let _haxeParser: Parser | null = null;
 function haxeParser(): Parser {
     if (_haxeParser) return _haxeParser;
@@ -45,6 +44,16 @@ function haxeParser(): Parser {
     p.setLanguage(Haxe);
     _haxeParser = p;
     return p;
+}
+
+/** First node of `type` in a real parse, depth-first. */
+function findFirstByType(node: Parser.SyntaxNode, type: string): Parser.SyntaxNode | null {
+    if (node.type === type) return node;
+    for (const child of node.children) {
+        const found = findFirstByType(child, type);
+        if (found) return found;
+    }
+    return null;
 }
 
 describe('extractClassStructural — Haxe AST walk (rag-graph-supertype-extraction-fix)', () => {
@@ -146,26 +155,208 @@ describe('extractClassStructural — Haxe regex fallback (rag-graph-supertype-ex
         expect(out.implements).toEqual(['IMap', 'Foo']);
     });
 
-    it('end-to-end parse via tree-sitter-haxe is non-throwing', () => {
-        // Sanity-check the production wiring against the deployed grammar:
-        // parse a real fixture, hand whichever node we can find (ClassType if
-        // available, root otherwise) to the dispatcher, and assert nothing
-        // throws. Strict extraction assertions live in the mock-based tests
-        // above — when this suite runs alongside other tree-sitter consumers
-        // in the same jest worker, native-binding state can transiently nul
-        // out `node.children[i]`, which is a test-only fragility.
-        const src = readFixture('class-clean-heritage.hx');
-        const tree = haxeParser().parse(src);
+});
+
+// The end-to-end block. Until #75 these assertions could not be written: a
+// second execution of `tree-sitter/index.js` in one jest process permanently
+// captured `undefined` for `Tree.prototype.rootNode`, so exactly one test file
+// per worker got a usable parse and file order decided which. The setup file
+// `tree-sitter-registry-guard.ts` reinstalls the first execution's prototype
+// patches before every test file, which makes a real parse deterministic again.
+describe('extractClassStructural — real tree-sitter-haxe parse (#123)', () => {
+    it('the deployed grammar emits bare `extends` / `implements` keyword tokens', () => {
+        // This is the shape the whole AST walk is built on, so assert it
+        // directly rather than only through the extractor's output: a grammar
+        // bump that starts wrapping the heritage in ExtendsClause /
+        // ImplementsClause nodes has to fail here.
+        const tree = haxeParser().parse(readFixture('class-clean-heritage.hx'));
+        expect(tree.rootNode).toBeDefined();
+        expect(tree.rootNode.hasError).toBe(false);
+        const classType = findFirstByType(tree.rootNode, 'ClassType');
+        expect(classType).not.toBeNull();
+        const kinds = classType!.children.map(c => c.type);
+        expect(kinds).toContain('extends');
+        expect(kinds.filter(k => k === 'implements')).toHaveLength(2);
+        // `haxe.Constraints.IMap<K, V>` comes out as a TypePath whose own
+        // children are package_name / type_name / identifier, NOT a single
+        // type_name — which is why normalization runs off TypePath.text.
+        const firstTypePath = classType!.children.find(c => c.type === 'TypePath');
+        expect(firstTypePath!.text).toBe('haxe.ds.BalancedTree<K, V>');
+    });
+
+    it('heritage is extracted from the real ClassType node', () => {
+        const tree = haxeParser().parse(readFixture('class-clean-heritage.hx'));
+        const classType = findFirstByType(tree.rootNode, 'ClassType')!;
+        const out = extractClassStructural(classType, 'haxe');
+        expect(out.extends).toBe('BalancedTree');
+        expect(out.implements).toEqual(['IMap', 'Foo']);
+    });
+
+    it('the real ClassType carries the heritage as named fields as well', () => {
+        // The extractor reads these fields BEFORE walking siblings, so record
+        // what the grammar puts in them. Which route produced a given answer is
+        // pinned separately, in the routing suite below — on a real node all
+        // three routes agree, so no real-node test can tell them apart.
+        const tree = haxeParser().parse(readFixture('class-clean-heritage.hx'));
+        const classType = findFirstByType(tree.rootNode, 'ClassType')!;
+        expect(classType.childrenForFieldName('extends').map(c => c.text))
+            .toEqual(['haxe.ds.BalancedTree<K, V>']);
+        expect(classType.childrenForFieldName('implements').map(c => c.text))
+            .toEqual(['haxe.Constraints.IMap<K, V>', 'Foo']);
+    });
+
+    it('from the module root the heritage comes from the regex, not the walk', () => {
+        // Worth stating exactly, because it is easy to assume otherwise: the
+        // module root has no heritage fields, its own children are `package` and
+        // `ClassType`, and the sibling walk is NOT recursive — so neither AST
+        // route sees anything here, and `extractClassHaxe` falls through to the
+        // source-text regex. The values are right; the path is the fallback.
+        const tree = haxeParser().parse(readFixture('class-clean-heritage.hx'));
         const root = tree.rootNode;
-        expect(() => extractClassStructural(root, 'haxe')).not.toThrow();
-        // The real-grammar heritage CONTRACT (ClassType `extends:` field +
-        // repeated `implements:` fields, which `extractHaxeHeritageFromFields`
-        // reads) is locked by a tree-sitter corpus test in the grammar submodule
-        // — test/corpus/type_decl.txt «class declaration extends + multi-implements»,
-        // run via `tree-sitter test`. A hard-asserting correctness check cannot
-        // live here: under `jest --runInBand` a second real-grammar parse in this
-        // worker corrupts the shared native binding (`tree.rootNode` goes
-        // undefined), cascading failures into every other grammar-loading suite.
+        expect(root.childrenForFieldName('extends')).toEqual([]);
+        expect(root.childrenForFieldName('implements')).toEqual([]);
+        expect(root.children.map(c => c.type)).toEqual(['package', 'ClassType']);
+
+        const out = extractClassStructural(root, 'haxe');
+        expect(out.extends).toBe('BalancedTree');
+        expect(out.implements).toEqual(['IMap', 'Foo']);
+
+        // Same node with its source text removed: if either AST route had
+        // produced that answer this would still return it. It does not.
+        const withoutText = {
+            type: root.type,
+            text: '',
+            children: root.children,
+            childrenForFieldName: (field: string) => root.childrenForFieldName(field),
+        };
+        expect(extractClassStructural(withoutText as unknown as Parser.SyntaxNode, 'haxe')).toEqual({});
+    });
+
+    it('a real heritageless class yields nothing — not a spurious edge', () => {
+        const tree = haxeParser().parse(readFixture('class-no-heritage.hx'));
+        expect(tree.rootNode.hasError).toBe(false);
+        const out = extractClassStructural(findFirstByType(tree.rootNode, 'ClassType')!, 'haxe');
+        expect(out.extends).toBeUndefined();
+        expect(out.implements ?? []).toEqual([]);
+    });
+
+    it('a `#if` / `#elseif` class parses cleanly and the AST walk handles it', () => {
+        // The fixture is named for an ERROR parse and this file used to say the
+        // grammar could not cope with conditional compilation. It can:
+        // `tree-sitter-haxe@0.4.6` parses this with hasError=false and folds the
+        // `#if` body into a `conditional` child of an otherwise ordinary
+        // ClassType, so the heritage is on the AST path and the regex fallback
+        // is never reached for it. The fallback is exercised by the childless
+        // node in the suite above, which is what actually triggers it.
+        const tree = haxeParser().parse(readFixture('class-error-parse-with-conditional.hx'));
+        expect(tree.rootNode.hasError).toBe(false);
+        const classType = findFirstByType(tree.rootNode, 'ClassType')!;
+        expect(classType.children.map(c => c.type)).toContain('conditional');
+        const out = extractClassStructural(classType, 'haxe');
+        expect(out.extends).toBe('BaseBuffer');
+        expect(out.implements).toEqual(['IBuffer']);
+    });
+});
+
+// Haxe heritage extraction has THREE routes, tried in this order:
+//
+//   1. the named fields — `childrenForFieldName('extends' | 'implements')`
+//   2. the sibling walk — bare `extends` / `implements` keyword tokens among
+//      `node.children`, each followed by its TypePath
+//   3. the source-text regex, when neither AST route yields anything
+//
+// On any real node all three agree, which is exactly why none of the tests above
+// can tell them apart: forcing route 1 off a real ClassType still returns the
+// right answer through route 2, so route 1 — the one production actually takes —
+// would go unprotected. The nodes below make the three routes disagree on
+// purpose, so removing any one of them reddens exactly one test.
+type RouteNode = {
+    type: string;
+    text: string;
+    children: FakeNode[];
+    childrenForFieldName?: (field: string) => { text: string }[];
+};
+
+const SIBLING_HERITAGE: FakeNode[] = [
+    fakeNode('class', 'class'),
+    fakeNode('type_name', 'Discriminator'),
+    fakeNode('extends', 'extends'),
+    fakeNode('TypePath', 'SiblingBase'),
+    fakeNode('implements', 'implements'),
+    fakeNode('TypePath', 'ISibling'),
+    fakeNode('{', '{'),
+];
+const NO_SIBLING_HERITAGE: FakeNode[] = [
+    fakeNode('class', 'class'),
+    fakeNode('type_name', 'Discriminator'),
+    fakeNode('{', '{'),
+];
+// Route 3's input. Deliberately a third pair of names.
+const REGEX_SOURCE = 'class Discriminator extends TextBase implements IText {\n}\n';
+
+function routeNode(opts: {
+    fields?: { extends?: string[]; implements?: string[] };
+    children: FakeNode[];
+    text: string;
+}): Parser.SyntaxNode {
+    const node: RouteNode = { type: 'ClassType', text: opts.text, children: opts.children };
+    if (opts.fields) {
+        const { extends: ext = [], implements: impl = [] } = opts.fields;
+        node.childrenForFieldName = (field: string) =>
+            (field === 'extends' ? ext : field === 'implements' ? impl : []).map(text => ({ text }));
+    }
+    return node as unknown as Parser.SyntaxNode;
+}
+
+describe('extractClassStructural — the three heritage routes, pinned separately (#123)', () => {
+    it('route 1: the named fields win over both the siblings and the text', () => {
+        const out = extractClassStructural(routeNode({
+            fields: { extends: ['pkg.FieldBase<T>'], implements: ['pkg.IFieldOne', 'IFieldTwo'] },
+            children: SIBLING_HERITAGE,
+            text: REGEX_SOURCE,
+        }), 'haxe');
+        expect(out.extends).toBe('FieldBase');
+        expect(out.implements).toEqual(['IFieldOne', 'IFieldTwo']);
+    });
+
+    it('route 2: with the fields empty, the sibling walk wins over the text', () => {
+        const out = extractClassStructural(routeNode({
+            fields: { extends: [], implements: [] },
+            children: SIBLING_HERITAGE,
+            text: REGEX_SOURCE,
+        }), 'haxe');
+        expect(out.extends).toBe('SiblingBase');
+        expect(out.implements).toEqual(['ISibling']);
+    });
+
+    it('route 2 is also taken when the node has no field accessor at all', () => {
+        // Chunk nodes reaching the extractor are not always full SyntaxNodes.
+        const out = extractClassStructural(routeNode({
+            children: SIBLING_HERITAGE,
+            text: REGEX_SOURCE,
+        }), 'haxe');
+        expect(out.extends).toBe('SiblingBase');
+        expect(out.implements).toEqual(['ISibling']);
+    });
+
+    it('route 3: with both AST routes empty, the source-text regex answers', () => {
+        const out = extractClassStructural(routeNode({
+            fields: { extends: [], implements: [] },
+            children: NO_SIBLING_HERITAGE,
+            text: REGEX_SOURCE,
+        }), 'haxe');
+        expect(out.extends).toBe('TextBase');
+        expect(out.implements).toEqual(['IText']);
+    });
+
+    it('no route yields anything when the node declares no heritage anywhere', () => {
+        const out = extractClassStructural(routeNode({
+            fields: { extends: [], implements: [] },
+            children: NO_SIBLING_HERITAGE,
+            text: 'class Discriminator {\n}\n',
+        }), 'haxe');
+        expect(out.extends).toBeUndefined();
+        expect(out.implements ?? []).toEqual([]);
     });
 });
 

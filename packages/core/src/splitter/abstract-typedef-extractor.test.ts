@@ -1,9 +1,14 @@
-// rag-graph-abstract-typedef-edges: dedicated tests for the new Haxe
+// rag-graph-abstract-typedef-edges: dedicated tests for the Haxe
 // `abstract` / `typedef` relation extractors. Mirrors the structure of
-// ast-structural-extractor.test.ts: mock-node AST-walk tests for the
-// happy paths, regex-fallback tests for the bare-form abstracts whose
-// tree-sitter-haxe@0.4.6 emission is broken by `@:meta` prefixes
-// (verified by direct probe 2026-05-12).
+// ast-structural-extractor.test.ts: mock-node AST-walk tests for the happy
+// paths, childless-node tests for the regex fallback (that is what a chunk node
+// looks like when the walk yields nothing), and a real-grammar block at the
+// bottom that pins the mocks to what `tree-sitter-haxe@0.4.6` actually emits.
+//
+// This file used to say the grammar's emission was "broken by `@:meta`
+// prefixes". It is not (#123): meta entries come out as MetaDataEntry siblings
+// and the AbstractType beside them is intact — see the real-parse test for
+// abstract-bare-meta-form.hx.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -40,13 +45,12 @@ function haxeParser(): Parser {
     return p;
 }
 
-function findFirstByType(node: Parser.SyntaxNode | undefined | null, type: string): Parser.SyntaxNode | null {
-    if (!node) return null;
+/** First node of `type` in a real parse, depth-first. */
+function findFirstByType(node: Parser.SyntaxNode, type: string): Parser.SyntaxNode | null {
     if (node.type === type) return node;
-    // tree-sitter native bindings can transiently nul out `children[i]` when
-    // multiple jest workers share the same grammar — guard accordingly.
+    // No falsy-child guard here on purpose: children are never null, and
+    // skipping falsy ones would hide exactly the regression #75 was about.
     for (const child of node.children) {
-        if (!child) continue;
         const found = findFirstByType(child, type);
         if (found) return found;
     }
@@ -255,31 +259,67 @@ describe('extractTypeRelations dispatch', () => {
     });
 });
 
-describe('extractAbstractHaxe / extractTypedefHaxe — end-to-end via tree-sitter-haxe', () => {
-    // Mirror the caveat from ast-structural-extractor.test.ts: when jest
-    // --runInBand executes multiple tree-sitter consumers, native-binding
-    // state can transiently nul out `node.children[i]`. Strict value
-    // assertions live in the mock-based suites above; this pair only
-    // verifies the production wiring against the deployed grammar does
-    // not throw and — when the parse succeeds — produces the expected
-    // bare-name relations / alias target.
-    it('parsing a real abstract fixture is non-throwing', () => {
-        const src = readFixture('abstract-clean-parens-form.hx');
-        const tree = haxeParser().parse(src);
-        const abstractNode = findFirstByType(tree.rootNode, 'AbstractType');
-        expect(() => {
-            if (abstractNode) extractAbstractHaxe(abstractNode);
-            else extractAbstractHaxe(tree.rootNode);
-        }).not.toThrow();
+// Real-grammar assertions. These could not be written while #75 was live: a
+// second execution of `tree-sitter/index.js` in one jest process left
+// `tree.rootNode` undefined for every parse, so only one test file per worker
+// could parse at all. `tree-sitter-registry-guard.ts` (jest `setupFiles`)
+// reinstalls the first execution's prototype patches per test file.
+describe('extractAbstractHaxe / extractTypedefHaxe — real tree-sitter-haxe parse (#123)', () => {
+    it('parens-form abstract: underlying + from + to, deduplicated', () => {
+        // abstract Bytes(BytesData) from Array<UInt8> to BytesData
+        // — `BytesData` is both the underlying type and the `to` target, and
+        // collapses to a single entry.
+        const tree = haxeParser().parse(readFixture('abstract-clean-parens-form.hx'));
+        expect(tree.rootNode.hasError).toBe(false);
+        const node = findFirstByType(tree.rootNode, 'AbstractType');
+        expect(node).not.toBeNull();
+        expect(extractAbstractHaxe(node!).abstract_underlying).toEqual(['BytesData', 'Array']);
     });
 
-    it('parsing a real typedef fixture is non-throwing', () => {
-        const src = readFixture('typedef-name-alias.hx');
-        const tree = haxeParser().parse(src);
-        const defNode = findFirstByType(tree.rootNode, 'DefType');
-        expect(() => {
-            if (defNode) extractTypedefHaxe(defNode);
-            else extractTypedefHaxe(tree.rootNode);
-        }).not.toThrow();
+    it('the real grammar wraps from/to targets in ComplexType > TypePath', () => {
+        // The mock suite above hangs a bare TypePath off `from` / `to`. The
+        // deployed grammar puts a ComplexType in between; assert the real shape
+        // so the mocks cannot quietly stop describing the grammar.
+        const tree = haxeParser().parse(readFixture('abstract-clean-parens-form.hx'));
+        const node = findFirstByType(tree.rootNode, 'AbstractType')!;
+        const kinds = node.children.map(c => c.type);
+        expect(kinds).toContain('from');
+        expect(kinds).toContain('to');
+        const fromTarget = node.children[kinds.indexOf('from') + 1];
+        expect(fromTarget.type).toBe('ComplexType');
+        expect(fromTarget.children[0].type).toBe('TypePath');
+        expect(fromTarget.text).toBe('Array<UInt8>');
+    });
+
+    it('bare `@:meta` abstract parses cleanly — the meta prefixes are siblings', () => {
+        // `@:coreType @:notNull @:runtimeValue abstract Single to Float from Float {}`.
+        // The old comment in this file claimed the grammar's emission was broken
+        // by `@:meta` prefixes. It is not: they are MetaDataEntry siblings of an
+        // intact AbstractType, and the AST walk extracts from it.
+        const tree = haxeParser().parse(readFixture('abstract-bare-meta-form.hx'));
+        expect(tree.rootNode.hasError).toBe(false);
+        expect(tree.rootNode.children.map(c => c.type)).toEqual([
+            'MetaDataEntry', 'MetaDataEntry', 'MetaDataEntry', 'AbstractType',
+        ]);
+        const node = findFirstByType(tree.rootNode, 'AbstractType')!;
+        expect(extractAbstractHaxe(node).abstract_underlying).toEqual(['Float']);
+    });
+
+    it('typedef alias: the bare name of the aliased type', () => {
+        // typedef KeyValueIterator<K, V> = Iterator<{key:K, value:V}>;
+        const tree = haxeParser().parse(readFixture('typedef-name-alias.hx'));
+        expect(tree.rootNode.hasError).toBe(false);
+        const node = findFirstByType(tree.rootNode, 'DefType');
+        expect(node).not.toBeNull();
+        expect(extractTypedefHaxe(node!).typedef_alias).toBe('Iterator');
+    });
+
+    it('a real self-referential typedef yields no alias', () => {
+        // typedef Foo<T> = Foo<T>; — a self edge would make the alias index
+        // point a symbol at itself, so it must be dropped on the AST path too.
+        const tree = haxeParser().parse(readFixture('typedef-self-reference.hx'));
+        expect(tree.rootNode.hasError).toBe(false);
+        const node = findFirstByType(tree.rootNode, 'DefType')!;
+        expect(extractTypedefHaxe(node).typedef_alias).toBeUndefined();
     });
 });
