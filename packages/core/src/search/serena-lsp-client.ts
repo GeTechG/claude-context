@@ -26,6 +26,15 @@
 //   - a disposed connection terminates its server session (DELETE) before it
 //     closes, so the client leaks nothing either.
 //
+// local-rag #95: an establishment owns its identity from the moment it enters,
+// and a disposal owns the establishments in flight. The epoch that orders
+// establishments is taken before the teardown of the connection being replaced,
+// so a suspended establishment can never resume with a higher number than the
+// successor that overtook it and overwrite that successor's connection; and the
+// establishments that have begun but installed nothing are registered, so
+// `close()` releases them instead of returning with a socket open that no field
+// of this client names.
+//
 // local-rag #78: what one call knows is that call's own. The connection an
 // attempt ran on and the error the service reported for it are held per call, so
 // a predecessor the chain abandoned — one settles around two budgets later,
@@ -110,6 +119,15 @@ interface Connection {
     url: string;
 }
 
+// local-rag #95: an establishment that has begun and not yet installed anything.
+// The halves are filled in as they are built, so a disposal that runs between
+// them releases whichever of the two exists — a transport with no client behind
+// it is still a socket, and a client with no transport still has to be closed.
+interface PendingEstablishment {
+    client: any;
+    transport: any;
+}
+
 function withDeadline<T>(promise: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
     if (!(ms > 0) || !Number.isFinite(ms)) return promise;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -151,6 +169,10 @@ export class SerenaLspClient {
     private cachedAt = 0;
     private connection: Connection | null = null;
     private connectionSequence = 0;
+    // local-rag #95: the establishments that are in flight. `this.connection` is
+    // null for the whole of one, so a disposal that reads only that field
+    // releases nothing while a socket is being opened.
+    private pendingEstablishments = new Set<PendingEstablishment>();
     // local-rag #85: `close()` is a latch, not only a teardown. A call in flight
     // when it ran is NOT abandoned, so it takes the ordinary retry path — and
     // that path would establish a fresh transport, whose standalone SSE `GET`
@@ -214,8 +236,17 @@ export class SerenaLspClient {
         if (this.connection && this.connection.url === baseUrl) {
             return this.connection;
         }
-        await this.disposeConnection();
+        // local-rag #95: the epoch is taken BEFORE anything is awaited, so it
+        // orders establishments by when they ENTERED. Taken after the teardown
+        // below, an establishment that suspended inside a real disposal — a
+        // bounded session DELETE plus an unbounded `client.close()` — resumed
+        // holding a HIGHER epoch than the successor that ran while it waited,
+        // passed the guard at the bottom of this method and overwrote that
+        // successor's connection with no teardown, leaking its transport and its
+        // server session. Reachable whenever two establishments name different
+        // base URLs, since the same-URL return above catches the rest.
         const epoch = ++this.connectionSequence;
+        await this.disposeConnection();
         // Built into LOCALS, never into the shared fields (#81). A connect is
         // unbounded, so an establishment can complete long after the client has
         // moved on; publishing the transport first is what let the two halves of
@@ -224,25 +255,40 @@ export class SerenaLspClient {
         // close it (#61 review) — and it is terminated from the local.
         let client: any = null;
         let transport: any = null;
+        // local-rag #95: and a local is exactly what `close()` cannot reach. The
+        // latch (#85) disposed `this.connection`, which is null for the whole of
+        // an establishment, so a `close()` that landed here released nothing and
+        // the transport this connect is opening was owned by nobody — #63's
+        // shape, arrived at through the method that fixed it. An establishment in
+        // flight is registered so the latch can drain it; the entry is what
+        // `close()` tears down, and whoever takes it out of the set owns it.
+        const pending: PendingEstablishment = { client: null, transport: null };
+        this.pendingEstablishments.add(pending);
         try {
             client = this.opts.clientFactory
                 ? (this.opts.clientFactory() as any)
                 : new Client({ name: 'symbol-refs-lsp-pool', version: '0.1.0' }, { capabilities: {} });
+            pending.client = client;
             transport = this.opts.transportFactory
                 ? this.opts.transportFactory(baseUrl)
                 : new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`));
+            pending.transport = transport;
             await client.connect(transport as any);
         } catch (err) {
+            const drained = !this.pendingEstablishments.delete(pending);
             console.warn(`[SerenaLspClient] connect failed: ${err instanceof Error ? err.message : err}`);
-            await this.terminateTransport(transport);
+            // A `close()` that already drained this entry has torn it down; doing
+            // it again would send a second session DELETE for one attempt.
+            if (!drained) await this.terminateTransport(transport);
             return null;
         }
+        const drained = !this.pendingEstablishments.delete(pending);
         // Still the newest establishment, and the client still open? Otherwise
         // this one belongs to nobody: a successor has installed its own
         // connection, or the client was closed while this one was connecting, and
         // installing here would leak whichever of the two nothing then holds.
-        if (this.connectionSequence !== epoch || this.closed) {
-            await this.tearDown(client, transport);
+        if (drained || this.connectionSequence !== epoch || this.closed) {
+            if (!drained) await this.tearDown(client, transport);
             return null;
         }
         this.connection = { epoch, client, transport, url: baseUrl };
@@ -333,6 +379,16 @@ export class SerenaLspClient {
      */
     async close(): Promise<void> {
         this.closed = true;
+        // local-rag #95: the establishments in flight first. Each is released by
+        // whoever takes it out of the set, so an establishment that settles after
+        // this is not torn down twice, and one that never settles is torn down
+        // here rather than never — `connect()` is unbounded, and a disposal that
+        // waited for it would be a disposal that hangs.
+        const pending = Array.from(this.pendingEstablishments);
+        this.pendingEstablishments.clear();
+        for (const entry of pending) {
+            await this.tearDown(entry.client, entry.transport);
+        }
         await this.disposeConnection();
     }
 
