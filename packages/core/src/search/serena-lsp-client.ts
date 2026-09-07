@@ -81,6 +81,19 @@ const HEALTH_PROBE_TIMEOUT_MS = 500;
 // per-instance chain, so an unbounded DELETE against a wedged server would
 // stall every later call on the client (#61 review).
 const SESSION_TERMINATE_TIMEOUT_MS = 1000;
+// local-rag #111: the socket close is bounded by the SAME number, deliberately not by a
+// second one. `tearDown` bounded the session DELETE and then awaited `client.close()`,
+// which the MCP SDK does not bound — on a client whose own `connect()` may not have
+// settled, which is precisely the state that can hang. Every teardown in this file goes
+// through it: a connection being replaced, an establishment that failed, the drain
+// `close()` performs, and the shutdown an arm driver runs after it has written its
+// artifact. #95 made that drain CONCURRENT, so one stuck release no longer delays the
+// others; a caller awaiting the drain still awaited the stuck one.
+//
+// The two halves release ONE establishment, so the release gets ONE budget. A larger
+// number here would be a bound nobody measured, sitting beside one that is already
+// argued for; an alias is the whole of the change.
+const CLIENT_CLOSE_TIMEOUT_MS = SESSION_TERMINATE_TIMEOUT_MS;
 // A chained call that never settles — the SDK timeout did not fire — is
 // abandoned after two per-call timeouts plus slack so the chain advances; the
 // zombie keeps its connection until it settles (mirrors infra's call guard).
@@ -300,6 +313,16 @@ export class SerenaLspClient {
             // built, and terminating a null transport released nothing while the
             // client stayed open. Two paths that release one establishment must
             // release the same things.
+            //
+            // local-rag #108: and that symmetry does NOT rest on the SDK disposing a
+            // client whose `connect()` it failed. Whether it does is a property of the
+            // version pinned today (`@modelcontextprotocol/sdk ^1.12.1`) and this pin
+            // has moved three times in three days, so the release is performed here and
+            // a test asserts that both halves happen — the session terminated AND the
+            // client closed — on this path as on every other. If a bump ever makes the
+            // second close redundant it stays harmless (`close()` is idempotent on a
+            // client that has none); if a bump ever makes it necessary, nothing here
+            // changes.
             if (!drained) await this.tearDown(client, transport);
             return null;
         }
@@ -328,14 +351,41 @@ export class SerenaLspClient {
     }
 
     // Close the server session before the socket (#61): `close()` alone aborts
-    // the stream and leaves the session alive on the server. The DELETE is
-    // bounded, and the close runs whatever it did.
+    // the stream and leaves the session alive on the server. BOTH halves are
+    // bounded (#111), by the same number, and the close runs whatever the DELETE did.
+    //
+    // What the bound does NOT do is change any release DECISION. It stops this method
+    // WAITING; it cancels nothing, and by the time a client reaches here its caller has
+    // already decided to let it go — `disposeConnection` nulls `this.connection` first,
+    // `close()` removes the entry from `pendingEstablishments` first, and
+    // `ensureClient`'s failure paths hold the client in a local no caller can reach. So
+    // nothing that was released before this bound existed is released any earlier now,
+    // and nothing that was not is released at all.
+    //
+    // local-rag #111 (review): that is the whole of the claim, deliberately. WHETHER a
+    // given path may release while a call is in flight is a different question, settled
+    // elsewhere and untouched here: the LATCH (`close()`) may and must — see the comment
+    // there and local-rag #85 — while the deferred teardown the call guard aims must not,
+    // which is what `closeConnectionEpoch` and #78 are for. A bound on the wait decides
+    // neither.
+    //
+    // A close that does not settle inside the bound leaves a socket this process no
+    // longer waits for. That is worse than a clean release and far better than a
+    // shutdown that never returns, and it is SAID rather than swallowed: a release that
+    // timed out must not be readable as one that completed.
     private async tearDown(client: any, transport: any): Promise<void> {
         try {
             await this.terminateTransport(transport);
         } finally {
             try {
-                if (client) await client.close();
+                if (client) {
+                    const closed = await withDeadline(
+                        Promise.resolve(client.close()).then(() => true),
+                        CLIENT_CLOSE_TIMEOUT_MS,
+                        () => false,
+                    );
+                    if (!closed) console.warn(`[SerenaLspClient] client.close() did not settle within ${CLIENT_CLOSE_TIMEOUT_MS}ms; the socket is abandoned rather than waited on (local-rag #111)`);
+                }
             } catch {
                 /* swallow — best effort */
             }
@@ -397,6 +447,22 @@ export class SerenaLspClient {
      * local-rag #85: this is a LATCH. A call in flight when it runs ends in a
      * recorded error rather than in a fresh transport nobody owns — its caller
      * has already dropped the reference that could have closed one.
+     *
+     * local-rag #111 (review): so this method DOES release a connection a call is
+     * still running on, deliberately, and the call ends in a recorded error and its
+     * caller gets the empty answer this client degrades to. That is the published
+     * contract, not an oversight: whoever calls `close()` has already let the client
+     * go, and awaiting the call instead would make the disposal unbounded — a Serena
+     * call can hang for two of its own budgets plus slack, which is the exact failure
+     * #111 exists to remove. Refusing to close while a call is in flight would be
+     * worse still: the caller has no reference left with which to try again.
+     *
+     * The rule this must not break is about the OTHER paths. A teardown that merely
+     * replaces or resets a connection — `disposeConnection` behind `ensureClient`, and
+     * the deferred `closeConnectionEpoch` the call guard aims at an abandoned call —
+     * must not take a connection out from under a live call; that is #78's rule and it
+     * is unchanged. Bounding the socket close (above) decides none of this: it changes
+     * how long a release WAITS, never which releases happen.
      */
     async close(): Promise<void> {
         this.closed = true;
@@ -406,14 +472,18 @@ export class SerenaLspClient {
         // here rather than never.
         //
         // What this does NOT do is wait for the `connect()` itself: that is
-        // unbounded, and a disposal that waited for it would never return. What
-        // it does not CLAIM (review) is that the release is bounded: `tearDown`
-        // bounds the session DELETE and then calls `client.close()`, which the
-        // SDK does not bound, on a client whose connect has not settled. So the
-        // entries are released CONCURRENTLY — they are separate sockets and
-        // nothing orders them — because serialising them let one slow client
-        // delay the release of every establishment behind it, and the release of
-        // a leaked socket is exactly the thing that must not queue.
+        // unbounded, and a disposal that waited for it would never return.
+        //
+        // local-rag #111: what it used to be unable to claim, it now claims. The
+        // review of #95 corrected this comment to say that the release itself was
+        // NOT bounded — `tearDown` bounded the session DELETE and then called
+        // `client.close()`, which the SDK does not bound, on a client whose connect
+        // had not settled. `tearDown` bounds both halves now, so this method returns
+        // within that bound whatever the sockets do. The entries are still released
+        // CONCURRENTLY — they are separate sockets and nothing orders them — because
+        // serialising them let one slow client delay the release of every
+        // establishment behind it, and the release of a leaked socket is exactly the
+        // thing that must not queue.
         const pending = Array.from(this.pendingEstablishments);
         this.pendingEstablishments.clear();
         await Promise.all(pending.map((entry) => this.tearDown(entry.client, entry.transport)));

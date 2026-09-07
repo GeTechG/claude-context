@@ -20,9 +20,17 @@ function parseAs(grammar: any, code: string): Parser.SyntaxNode {
 }
 
 function findFirst(node: Parser.SyntaxNode, types: string[]): Parser.SyntaxNode | null {
-    // Defensive walk via numbered indices: tree-sitter's `node.children`
-    // accessor can transiently return holes when multiple grammars share a
-    // process (jest --runInBand across test files).
+    // Defensive walk via numbered indices. The note that used to sit here
+    // blamed `node.children` for "transiently returning holes when multiple
+    // grammars share a process" — that diagnosis was wrong, and this file was
+    // the one that paid for it (issue #75: 8 failures here, `Received:
+    // undefined` / `null`, whenever another test file happened to load
+    // `tree-sitter` first). The tree was never holed; `tree.rootNode` itself
+    // came back `undefined`, because `tree-sitter/index.js` is not idempotent
+    // and jest re-executes it in every test file's fresh module registry. The
+    // fix is `tree-sitter-registry-guard.ts`, wired in as `setupFiles`; see
+    // `tree-sitter-registry-guard.test.ts` for the full write-up. The index
+    // walk is kept because it is correct either way.
     if (!node) return null;
     if (types.includes(node.type)) return node;
     const count = node.childCount;

@@ -237,7 +237,7 @@ describe('SerenaLspClient session hygiene', () => {
         }
     });
 
-    it('a connect that fails after opening a session terminates that session', async () => {
+    it('a connect that fails after opening a session terminates that session AND closes the client', async () => {
         const transport = { terminateSession: jest.fn(async () => undefined), close: jest.fn() };
         const fake = { connect: jest.fn().mockRejectedValue(new Error('initialize failed')), callTool: jest.fn(), close: jest.fn() };
         const client = new SerenaLspClient({ baseUrlOverride: 'http://stub', clientFactory: () => fake, transportFactory: () => transport });
@@ -246,6 +246,96 @@ describe('SerenaLspClient session hygiene', () => {
         // failed sessions are terminated, none leaks.
         expect(fake.connect).toHaveBeenCalledTimes(2);
         expect(transport.terminateSession).toHaveBeenCalledTimes(2);
+        // local-rag #108: and the CLIENT is released too, which this test used not to
+        // look at — the half that was actually missing. The ordinary teardown terminates
+        // and closes; a failure path that only terminated left the client open, and
+        // whether the SDK disposes a client whose connect it failed is a property of the
+        // pinned version. Both halves, on this path as on every other.
+        expect(fake.close).toHaveBeenCalledTimes(2);
+        expect(transport.terminateSession.mock.invocationCallOrder[0]).toBeLessThan(fake.close.mock.invocationCallOrder[0]);
+    });
+
+    it('local-rag #108: a transport that cannot even be built still releases the client that was', async () => {
+        // The other shape of the same asymmetry: `transportFactory` throws (a malformed
+        // base URL reaches `new URL`), so `transport` is null with the client already
+        // built. Terminating a null transport releases nothing; the client still has to
+        // be closed, or an establishment that failed before it had two halves leaks the
+        // half it had.
+        const fake = { connect: jest.fn().mockResolvedValue(undefined), callTool: jest.fn(), close: jest.fn() };
+        const client = new SerenaLspClient({
+            baseUrlOverride: 'http://stub',
+            clientFactory: () => fake,
+            transportFactory: () => { throw new Error('Invalid URL'); },
+        });
+        await expect(client.findSymbol('X')).resolves.toEqual([]);
+        expect(fake.close).toHaveBeenCalled();
+    });
+
+    it('local-rag #111: a client.close() that never settles does not wedge the teardown', async () => {
+        jest.useFakeTimers();
+        try {
+            const transport = { terminateSession: jest.fn(async () => undefined), close: jest.fn() };
+            const warned = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+            const fake = fakeClient({ callTool: async () => ({ content: [{ type: 'text', text: '[]' }] }), close: () => new Promise(() => undefined) });
+            const client = new SerenaLspClient({ baseUrlOverride: 'http://stub', clientFactory: () => fake, transportFactory: () => transport });
+            await client.findSymbol('X');
+            // `close()` awaits the drain and then the installed connection's teardown,
+            // and the teardown awaits a socket close that never resolves. Before #111
+            // this promise never settled.
+            const closing = client.close();
+            let settled = false;
+            closing.then(() => { settled = true; });
+            await jest.advanceTimersByTimeAsync(0);
+            expect(settled).toBe(false);
+            await jest.advanceTimersByTimeAsync(1100);
+            await closing;
+            // The session DELETE still ran, and ran FIRST: the bound covers the socket,
+            // it does not skip the server session.
+            expect(transport.terminateSession).toHaveBeenCalledTimes(1);
+            expect(fake.close).toHaveBeenCalledTimes(1);
+            // And the abandonment is SAID. A release that timed out must not be readable
+            // as one that completed.
+            expect(warned.mock.calls.some((call) => /did not settle/.test(String(call[0])))).toBe(true);
+            warned.mockRestore();
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it('local-rag #111: a call in flight still gets its answer while an EARLIER connection\'s close is hung', async () => {
+        // Scoped deliberately to the teardown paths, which are the ones #111 changes.
+        // The client is on its second connection; the first one's close never settles.
+        // Nothing about that may reach the call running on the second — a bound on the
+        // wait must not turn one connection's slow release into another's lost answer.
+        //
+        // This does NOT claim that no path ever releases a live call: `close()` does,
+        // deliberately, and the test named for it in the block above pins that.
+        jest.useFakeTimers();
+        try {
+            const warned = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+            const hung = { connect: jest.fn().mockResolvedValue(undefined), callTool: jest.fn(async () => ({ content: [{ type: 'text', text: '[]' }] })), close: jest.fn(() => new Promise(() => undefined)) };
+            const live = fakeClient({ callTool: async () => ({ content: [{ type: 'text', text: 'References without surrounding lines: ' + JSON.stringify({ 'a.hx': { Method: [{ name_path: 'X/foo', reference_line: 10 }] } }) }] }) });
+            const clients = [hung, live];
+            const client = new SerenaLspClient({
+                clientFactory: () => clients.shift() as any,
+                transportFactory: () => ({ terminateSession: jest.fn(async () => undefined), close: jest.fn() }),
+                healthProbe: async () => true,
+            });
+            // First connection, at one base URL; then a second at another, which disposes
+            // the first — that disposal is the teardown whose close never settles.
+            (client as any).cachedBaseUrl = 'http://one';
+            (client as any).cachedAt = Date.now();
+            await client.findSymbol('X');
+            (client as any).cachedBaseUrl = 'http://two';
+            (client as any).cachedAt = Date.now();
+            const answer = client.findReferencingSymbols('X/y', 'a.hx', 5);
+            await jest.advanceTimersByTimeAsync(1100);
+            await expect(answer).resolves.toHaveLength(1);
+            expect(live.close).not.toHaveBeenCalled();
+            warned.mockRestore();
+        } finally {
+            jest.useRealTimers();
+        }
     });
 
     it('a call that never settles is abandoned by the chain, and the next call still runs', async () => {
@@ -375,11 +465,22 @@ describe('SerenaLspClient connection ownership (local-rag #81, #85)', () => {
         expect(client.isClosed()).toBe(false);
     });
 
-    it('a call in flight when close() runs ends in a recorded error and opens no new transport', async () => {
+    it('close() DELIBERATELY releases the connection a live call is on: the call ends in a recorded error and gets the empty answer, and no new transport is opened', async () => {
         // local-rag #85. The in-flight call is not abandoned, so it takes the
         // ordinary retry path — and that path used to establish a fresh MCP
         // transport, whose standalone SSE GET never settles, on a client whose
         // owner has already dropped the reference. Nothing could ever close it.
+        //
+        // local-rag #111 (review): the NAME of this test now says what it pins, because
+        // a neutral one hid it. `close()` is the one path that releases a connection a
+        // call is still running on, and the caller of that call gets `[]`. That is the
+        // published contract — "degrade to a no-op when the service is unavailable"
+        // applied to a released engine — and it is required, not tolerated: awaiting the
+        // call would make the disposal unbounded (a Serena call can hang for two of its
+        // own budgets plus slack), and refusing to close would strand a client whose
+        // owner has already dropped its reference. #111's bound on the socket close
+        // changes none of this; the teardown paths that must NOT do it are pinned
+        // separately, in the session-hygiene block above.
         let transports = 0;
         let rejectInFlight: ((error: any) => void) | null = null;
         const transport = { terminateSession: jest.fn(async () => undefined), close: jest.fn() };
@@ -407,6 +508,9 @@ describe('SerenaLspClient connection ownership (local-rag #81, #85)', () => {
         expect(transports).toBe(1);
         expect(client.currentConnectionEpoch()).toBe(0);
         expect(client.isClosed()).toBe(true);
+        // Said out loud: the client the call was using WAS closed, while the call was
+        // still in flight. If this ever has to change, it changes here first.
+        expect(inner.close).toHaveBeenCalledTimes(1);
     }, 20000);
 
     it('a closed client establishes nothing, whatever asks it to', async () => {
