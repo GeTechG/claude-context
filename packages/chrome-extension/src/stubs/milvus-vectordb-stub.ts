@@ -111,7 +111,7 @@ export class MilvusRestfulVectorDatabase {
         }
     }
 
-    async createCollection(collectionName: string, dimension: number, description?: string): Promise<void> {
+    async createCollection(collectionName: string, dimension: number, _description?: string): Promise<void> {
         try {
             const collectionSchema = {
                 collectionName,

@@ -159,8 +159,6 @@ async function checkIndexStatus() {
     const [owner, repo] = window.location.pathname.slice(1).split('/');
     if (!owner || !repo) return;
 
-    const repoId = `${owner}/${repo}`;
-
     const statusEl = document.getElementById('indexing-status');
     if (statusEl) statusEl.textContent = 'Checking repository index status...';
 
@@ -413,8 +411,6 @@ function escapeHtml(unsafe: string) {
 
 function clearIndex() {
     const [owner, repo] = window.location.pathname.slice(1).split('/');
-    const repoId = `${owner}/${repo}`;
-
     const clearBtn = document.getElementById('clear-index-btn') as HTMLButtonElement;
     if (clearBtn) clearBtn.disabled = true;
 
@@ -554,7 +550,7 @@ function displayRecentRepos(repos: any[]) {
 }
 
 // Listen for messages from background script
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
     const statusEl = document.getElementById('indexing-status');
 
     if (message.action === 'indexProgress') {
@@ -591,7 +587,7 @@ if (document.readyState === 'loading') {
 
 // Handle dynamic page loads in GitHub (SPA navigation)
 let lastUrl = window.location.href;
-new MutationObserver((mutations, observer) => {
+new MutationObserver((_mutations, _observer) => {
     const currentUrl = window.location.href;
     if (currentUrl !== lastUrl) {
         lastUrl = currentUrl;

@@ -1,9 +1,9 @@
 // Import core types and implementation
-import { MilvusConfig, MilvusConfigManager } from '../config/milvusConfig';
+import { MilvusConfigManager } from '../config/milvusConfig';
 
 // We'll create a simplified version that works in Chrome extension environment
 // Import types from a stub file instead of the core package
-import { VectorDocument, VectorSearchResult, SearchOptions } from '../stubs/milvus-vectordb-stub';
+import { SearchOptions } from '../stubs/milvus-vectordb-stub';
 import { MilvusRestfulVectorDatabase } from '../stubs/milvus-vectordb-stub';
 
 export interface CodeChunk {

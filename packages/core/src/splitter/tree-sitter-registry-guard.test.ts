@@ -42,6 +42,14 @@
 import Parser from 'tree-sitter';
 import { guardTreeSitterModuleRegistry } from './tree-sitter-registry-guard';
 
+// tree-sitter grammar packages declare their own structural `Language` type,
+// which is not assignable to the `Language` that `tree-sitter`'s `setLanguage`
+// takes, and this file hands the grammar STRAIGHT to `setLanguage`, so an
+// `import` here only compiles behind an `as any`. `require` is typed `any` by
+// @types/node, which is why this file builds. (`ast-splitter.imports.test.ts`
+// passes its grammars through a helper typed `any`, where the two types are
+// never compared — so it imports them and this file cannot.) See #129.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 const TypeScript = require('tree-sitter-typescript').typescript;
 
 const SOURCE = "import { foo } from 'lodash';\nclass A extends B {}\n";
@@ -72,7 +80,9 @@ function parseFirstStatementOnly(): any {
 /** Re-execute `tree-sitter/index.js` the way a fresh jest test file does. */
 function reExecuteTreeSitterWrapper(): void {
     jest.resetModules();
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    // Stays a `require`, and must: an import is hoisted to module evaluation and
+    // would run BEFORE the reset, which is the second execution this reproduces.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     require('tree-sitter');
 }
 
@@ -144,7 +154,8 @@ describe('tree-sitter module-registry guard (#75)', () => {
         // removes while refactoring the config; the guard module would still be here,
         // still unit-tested, still green, and `ast-splitter.imports.test.ts` would go
         // back to failing under load. So the wiring is asserted too.
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        // A CommonJS config file outside rootDir, read as data.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
         const config = require('../../jest.config.cjs');
         expect(config.setupFiles || []).toEqual(
             expect.arrayContaining([expect.stringContaining('tree-sitter-registry-guard')]),

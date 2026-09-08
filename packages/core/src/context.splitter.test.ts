@@ -14,7 +14,7 @@ class TestEmbedding extends Embedding {
         return 3;
     }
 
-    async embed(text: string): Promise<EmbeddingVector> {
+    async embed(_text: string): Promise<EmbeddingVector> {
         return { vector: [1, 0, 0], dimension: 3 };
     }
 

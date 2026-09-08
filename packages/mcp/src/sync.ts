@@ -135,7 +135,7 @@ export class SyncManager {
         console.log(`[SYNC-DEBUG] Starting index sync for all ${indexedCodebases.length} codebases...`);
 
         try {
-            let totalStats = { added: 0, removed: 0, modified: 0 };
+            const totalStats = { added: 0, removed: 0, modified: 0 };
 
             for (let i = 0; i < indexedCodebases.length; i++) {
                 const codebasePath = indexedCodebases[i];

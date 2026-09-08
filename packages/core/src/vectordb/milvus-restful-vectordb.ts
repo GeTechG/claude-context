@@ -91,7 +91,7 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
      * Common logic for both gRPC and REST implementations
      */
     protected async resolveAddress(): Promise<string> {
-        let finalConfig = { ...this.config };
+        const finalConfig = { ...this.config };
 
         // If address is not provided, get it using token
         if (!finalConfig.address && finalConfig.token) {

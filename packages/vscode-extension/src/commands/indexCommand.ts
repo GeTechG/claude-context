@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
 import { Context } from '@zilliz/claude-context-core';
-import * as path from 'path';
 
 export class IndexCommand {
     private context: Context;

@@ -406,7 +406,7 @@ function extractHaxeHeritageFromAst(node: Parser.SyntaxNode): ClassStructural {
 function extractClassHaxeViaRegex(source: string, className: string | undefined): ClassStructural {
     if (!source) return {};
     const namePat = className
-        ? className.replace(/[\\^$.|?*+(){}\[\]]/g, '\\$&')
+        ? className.replace(/[\\^$.|?*+(){}[\]]/g, '\\$&')
         : '\\w+';
     const headerRe = new RegExp(
         `^\\s*(?:@:?\\w+(?:\\([^)]*\\))?\\s+)*(?:extern\\s+|abstract\\s+|final\\s+|private\\s+|public\\s+)*class\\s+${namePat}\\b([^{]{0,500})`,
@@ -644,7 +644,7 @@ function extractHaxeDeclarationName(node: Parser.SyntaxNode): string | undefined
 function extractAbstractRelationsViaRegex(source: string, declName: string | undefined): TypeRelations {
     if (!source) return {};
     const namePat = declName
-        ? declName.replace(/[\\^$.|?*+(){}\[\]]/g, '\\$&')
+        ? declName.replace(/[\\^$.|?*+(){}[\]]/g, '\\$&')
         : '\\w+';
     const headerRe = new RegExp(
         `^\\s*(?:@:?\\w+(?:\\([^)]*\\))?\\s+)*(?:extern\\s+|private\\s+|public\\s+|final\\s+)*abstract\\s+${namePat}(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?\\s*([^{]{0,500})`,

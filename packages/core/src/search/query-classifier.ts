@@ -65,14 +65,16 @@ const CODE_REGEXES: RegExp[] = [
 
 // Words shorter than this are filtered out of the natural-language token
 // count so single-letter typos and acronyms in code-only queries do not
-// trip the doc signal.
+// trip the doc signal. NL_WORD below is built from it, so the number lives
+// in exactly one place: at 3 the constructed source is `\b[A-Za-z]{3,}\b`,
+// the literal it replaced.
 const MIN_WORD_LEN = 3;
 const MIN_WORDS_FOR_DOC = 3;
 
-const NL_WORD = /\b[A-Za-z]{3,}\b/g;
+const NL_WORD = new RegExp(`\\b[A-Za-z]{${MIN_WORD_LEN},}\\b`, 'g');
 
 // Count natural-language words of length >= MIN_WORD_LEN. PascalCase /
-// camelCase tokens still match \b[A-Za-z]{3,}\b so we subtract anything
+// camelCase tokens still match NL_WORD so we subtract anything
 // that looks code-shaped. Shared by docSignal (classifyQuery) and the
 // lexical-form axis (classifyLexicalForm) so the two stay calibrated to
 // the same notion of "natural-language word".

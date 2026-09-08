@@ -124,24 +124,27 @@ export function getDefaultModelForProvider(provider: string): string {
 // Helper function to get embedding model with provider-specific environment variable priority
 export function getEmbeddingModelForProvider(provider: string): string {
     switch (provider) {
-        case 'Ollama':
+        case 'Ollama': {
             // For Ollama, prioritize OLLAMA_MODEL over EMBEDDING_MODEL for backward compatibility
             const ollamaModel = envManager.get('OLLAMA_MODEL') || envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
             console.log(`[DEBUG] 🎯 Ollama model selection: OLLAMA_MODEL=${envManager.get('OLLAMA_MODEL') || 'NOT SET'}, EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${ollamaModel}`);
             return ollamaModel;
-        case 'Infinity':
+        }
+        case 'Infinity': {
             const infinityModel = envManager.get('INFINITY_DENSE_MODEL') || envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
             console.log(`[DEBUG] 🎯 Infinity model selection: INFINITY_DENSE_MODEL=${envManager.get('INFINITY_DENSE_MODEL') || 'NOT SET'}, EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${infinityModel}`);
             return infinityModel;
+        }
         case 'OpenAI':
         case 'VoyageAI':
         case 'Gemini':
         case 'OpenRouter':
-        default:
+        default: {
             // For all other providers, use EMBEDDING_MODEL or default
             const selectedModel = envManager.get('EMBEDDING_MODEL') || getDefaultModelForProvider(provider);
             console.log(`[DEBUG] 🎯 ${provider} model selection: EMBEDDING_MODEL=${envManager.get('EMBEDDING_MODEL') || 'NOT SET'}, selected=${selectedModel}`);
             return selectedModel;
+        }
     }
 }
 

@@ -99,7 +99,6 @@ export class SnapshotManager {
         console.log('[SNAPSHOT-DEBUG] Loading v2 format snapshot');
 
         const validIndexedCodebases: string[] = [];
-        const validIndexingCodebases = new Map<string, number>();
         const validFileCount = new Map<string, number>();
         const validCodebaseInfoMap = new Map<string, CodebaseInfo>();
 

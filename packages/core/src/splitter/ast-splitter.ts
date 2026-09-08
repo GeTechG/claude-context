@@ -49,7 +49,12 @@ export class AstCodeSplitter implements Splitter {
         if (chunkOverlap) this.chunkOverlap = chunkOverlap;
         this.parser = new Parser();
 
-        // Initialize fallback splitter
+        // Initialize fallback splitter.
+        // Stays a `require`: as an import it would emit at module load, moving the
+        // evaluation of `langchain/text_splitter` from "an AstCodeSplitter is
+        // constructed" to "ast-splitter is loaded" — a different load order and a
+        // different failure mode if langchain cannot load. #129.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
         const { LangChainCodeSplitter } = require('./langchain-splitter');
         this.langchainFallback = new LangChainCodeSplitter(chunkSize, chunkOverlap);
         this.markdownSplitter = new MarkdownSplitter(chunkSize, chunkOverlap);
@@ -294,7 +299,7 @@ export class AstCodeSplitter implements Splitter {
         return this.addOverlap(refinedChunks);
     }
 
-    private splitLargeChunk(chunk: CodeChunk, originalCode: string): CodeChunk[] {
+    private splitLargeChunk(chunk: CodeChunk, _originalCode: string): CodeChunk[] {
         const lines = chunk.content.split('\n');
         const subChunks: CodeChunk[] = [];
         let currentChunk = '';

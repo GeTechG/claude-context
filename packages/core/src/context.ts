@@ -16,14 +16,13 @@ import {
     VectorDocument,
     VectorSearchResult,
     HybridSearchRequest,
-    HybridSearchOptions,
     HybridSearchResult,
     RerankStrategy,
     InsertResult
 } from './vectordb';
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
-import { classifyQuery, weightsForIntent, DomainWeights, parseQualifiedName, parseSingleSymbol, isComparisonShape } from './search/query-classifier';
+import { classifyQuery, weightsForIntent, parseQualifiedName, parseSingleSymbol, isComparisonShape } from './search/query-classifier';
 import { routeQuery, ChannelWeights, QueryShape } from './search/query-router';
 import { buildSymbolFilter } from './search/symbol-routing';
 import { GraphIndex, collectGraphCandidateIds, derivePackageFromPath } from './search/graph-expansion';
@@ -1777,7 +1776,7 @@ export class Context {
         if (isHybrid === true) {
             try {
                 // Check collection stats to see if it has data
-                const stats = await this.vectorDatabase.query(collectionName, '', ['id'], 1);
+                await this.vectorDatabase.query(collectionName, '', ['id'], 1);
                 console.log(`[Context] 🔍 Collection '${collectionName}' exists and appears to have data`);
             } catch (error) {
                 console.log(`[Context] ⚠️  Collection '${collectionName}' exists but may be empty or not properly indexed:`, error);
@@ -3649,6 +3648,7 @@ export class Context {
                 const relativePath = path.relative(codebasePath, chunk.metadata.filePath);
                 const fileExtension = path.extname(chunk.metadata.filePath);
                 const {
+                    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- destructured only to keep these three out of `...restMetadata`, which is spread into the document below; deleting them adds three columns to every row
                     filePath, startLine, endLine,
                     content_type, symbol_kind, symbol_name, parent_symbol, heading_path,
                     imports, extends: extendsName, implements: implementsList, mentioned_symbols,
@@ -3725,6 +3725,7 @@ export class Context {
                 const relativePath = path.relative(codebasePath, chunk.metadata.filePath);
                 const fileExtension = path.extname(chunk.metadata.filePath);
                 const {
+                    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- destructured only to keep these three out of `...restMetadata`, which is spread into the document below; deleting them adds three columns to every row
                     filePath, startLine, endLine,
                     content_type, symbol_kind, symbol_name, parent_symbol, heading_path,
                     imports, extends: extendsName, implements: implementsList, mentioned_symbols,
@@ -3868,7 +3869,7 @@ export class Context {
      */
     private async loadIgnorePatterns(codebasePath: string, additionalIgnorePatterns: string[] = []): Promise<string[]> {
         try {
-            let fileBasedPatterns: string[] = [];
+            const fileBasedPatterns: string[] = [];
 
             // Load all .xxxignore files in codebase directory
             const ignoreFiles = await this.findIgnoreFiles(codebasePath);
@@ -3945,10 +3946,20 @@ export class Context {
      */
     private async loadGlobalIgnoreFile(): Promise<string[]> {
         try {
+            // Stays a `require`, for the same reason as the lazy load in
+            // AstCodeSplitter's constructor: as `import * as os` at the top of the
+            // file, resolution and namespace capture move from this call to module
+            // evaluation. In production that is invisible — `os` is a side-effect-free
+            // builtin — but a registry substitution installed after `Context` is
+            // imported and before ignore patterns load (jest.doMock('os'),
+            // Module._load) is honoured by this form and not by the hoisted one, and
+            // would resolve a different ~/.context/.contextignore. #129, cross-model
+            // review.
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
             const homeDir = require('os').homedir();
             const globalIgnorePath = path.join(homeDir, '.context', '.contextignore');
             return await this.loadIgnoreFile(globalIgnorePath, 'global .contextignore');
-        } catch (error) {
+        } catch {
             // Global ignore file is optional, don't log warnings
             return [];
         }
@@ -3974,7 +3985,7 @@ export class Context {
                 console.log(`📄 ${fileName} file found but no valid patterns detected`);
                 return [];
             }
-        } catch (error) {
+        } catch {
             if (fileName.includes('global')) {
                 console.log(`📄 No ${fileName} file found`);
             }
@@ -4169,6 +4180,16 @@ export class Context {
         const splitterName = this.codeSplitter.constructor.name;
 
         if (splitterName === 'AstCodeSplitter') {
+            // Stays a `require`, unlike its two siblings below. `AstCodeSplitter` is
+            // already imported at the top of this file, but binding it here through
+            // the typed import turns the next line into a compile error:
+            //   TS2339: Property 'getSupportedLanguages' does not exist on type
+            //   'typeof AstCodeSplitter'
+            // — the static does not exist, so this method throws at runtime today.
+            // `require` returns `any`, which is what has been hiding that. Making the
+            // call correct is a behaviour change and belongs in its own issue, not in
+            // a lint pass. #129.
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
             const { AstCodeSplitter } = require('./splitter/ast-splitter');
             return {
                 type: 'ast',
@@ -4191,7 +4212,6 @@ export class Context {
         const splitterName = this.codeSplitter.constructor.name;
 
         if (splitterName === 'AstCodeSplitter') {
-            const { AstCodeSplitter } = require('./splitter/ast-splitter');
             return AstCodeSplitter.isLanguageSupported(language);
         }
 
@@ -4207,7 +4227,6 @@ export class Context {
         const splitterName = this.codeSplitter.constructor.name;
 
         if (splitterName === 'AstCodeSplitter') {
-            const { AstCodeSplitter } = require('./splitter/ast-splitter');
             const isSupported = AstCodeSplitter.isLanguageSupported(language);
 
             return {

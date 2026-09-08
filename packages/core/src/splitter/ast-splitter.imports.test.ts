@@ -7,11 +7,19 @@
 import Parser from 'tree-sitter';
 import { extractStructural, extractClassStructural } from './ast-structural-extractor';
 
-const TypeScript = require('tree-sitter-typescript').typescript;
-const JavaScript = require('tree-sitter-javascript');
-const Python = require('tree-sitter-python');
-const Java = require('tree-sitter-java');
-const Haxe = require('tree-sitter-haxe');
+// Static imports, unlike the grammar loads in the sibling splitter tests. Those
+// hand the grammar straight to `Parser.setLanguage`, where the package's own
+// `Language` type is not assignable to `tree-sitter`'s and an import only
+// compiles behind an `as any`. Here every grammar goes through
+// `parseAs(grammar: any, …)`, so the two types are never compared and no cast is
+// needed — which is why these five convert and the other four do not. #129.
+import TypeScriptGrammars from 'tree-sitter-typescript';
+import JavaScript from 'tree-sitter-javascript';
+import Python from 'tree-sitter-python';
+import Java from 'tree-sitter-java';
+import Haxe from 'tree-sitter-haxe';
+
+const TypeScript = TypeScriptGrammars.typescript;
 
 function parseAs(grammar: any, code: string): Parser.SyntaxNode {
     const parser = new Parser();

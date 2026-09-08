@@ -1,6 +1,5 @@
 import * as fs from "fs";
 import * as path from "path";
-import * as crypto from "crypto";
 import { createRequire } from "module";
 import { fileURLToPath } from "url";
 import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer } from "@zilliz/claude-context-core";
@@ -847,7 +846,7 @@ export class ToolHandlers {
                 // Category names are directory paths under the root — reject
                 // anything that could break the Milvus expression or escape the
                 // prefix (quotes, %, whitespace, etc.).
-                const invalidCats = cleanedCats.filter((c: string) => !/^[A-Za-z0-9._\/-]+$/.test(c));
+                const invalidCats = cleanedCats.filter((c: string) => !/^[A-Za-z0-9._/-]+$/.test(c));
                 if (invalidCats.length > 0) {
                     return {
                         content: [{ type: 'text', text: `Error: Invalid category names in categories: ${JSON.stringify(invalidCats)}. Use plain directory names from list_categories (letters, digits, '.', '_', '-', '/').` }],

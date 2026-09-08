@@ -1,7 +1,7 @@
 import { Context } from './context';
 import { Embedding, EmbeddingVector } from './embedding';
 import { VectorDatabase } from './vectordb';
-import { Reranker, RerankResult } from './reranker';
+import { Reranker } from './reranker';
 
 class TestEmbedding extends Embedding {
     protected maxTokens = 8192;
@@ -14,15 +14,6 @@ class TestEmbedding extends Embedding {
     }
     getDimension(): number { return 3; }
     getProvider(): string { return 'test'; }
-}
-
-class StubReranker implements Reranker {
-    public calls: Array<{ query: string; documents: string[] }> = [];
-    async rerank(query: string, documents: string[]): Promise<RerankResult[]> {
-        this.calls.push({ query, documents });
-        return documents.map((_d, i) => ({ index: i, score: 1.0 - i / 100 }));
-    }
-    getProvider(): string { return 'stub'; }
 }
 
 const createVectorDatabase = (): jest.Mocked<VectorDatabase> => ({

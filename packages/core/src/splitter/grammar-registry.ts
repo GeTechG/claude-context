@@ -15,8 +15,13 @@
  */
 
 // A real dynamic import that survives tsc's commonjs down-levelling.
+//
+// The `Function` constructor is deliberate — see the header. Nothing in the
+// shipped rule set objects to it: `@typescript-eslint/no-implied-eval` would
+// (it reports a FunctionConstructor callee), but that rule is type-aware and
+// the shipped set is `recommended`, not `recommended-type-checked`, so it is
+// not enabled and a disable comment naming it suppressed nothing. #129.
 const dynamicImport: (specifier: string) => Promise<any> =
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval
     new Function('specifier', 'return import(specifier)') as any;
 
 export interface NodeKindSpec {

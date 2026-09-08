@@ -96,7 +96,7 @@ export class SearchCommand {
                 console.log('🔍 Using semantic search...');
                 progress.report({ increment: 50, message: 'Executing semantic search...' });
 
-                let results = await this.context.semanticSearch(
+                const results = await this.context.semanticSearch(
                     codebasePath,
                     query.term,
                     query.limit || 20,
@@ -193,7 +193,7 @@ export class SearchCommand {
             filterExpr = `fileExtension in [${quoted}]`;
         }
 
-        let results = await this.context.semanticSearch(
+        const results = await this.context.semanticSearch(
             codebasePath,
             searchTerm,
             limit,
@@ -218,9 +218,9 @@ export class SearchCommand {
     /**
      * Generate quick pick items for VS Code
      */
-    private generateQuickPickItems(results: SemanticSearchResult[], searchTerm: string, workspaceRoot?: string) {
+    private generateQuickPickItems(results: SemanticSearchResult[], _searchTerm: string, _workspaceRoot?: string) {
         return results.slice(0, 20).map((result, index) => {
-            let displayPath = result.relativePath;
+            const displayPath = result.relativePath;
             // Truncate content for display
             const truncatedContent = result.content.length <= 150
                 ? result.content
