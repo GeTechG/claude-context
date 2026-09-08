@@ -2123,9 +2123,7 @@ export class Context {
                 console.log(`[comparison-bridge-bypass] reserved=${reservedBridge.length} rerank_input=${rerankInput.length} final=${topK}`);
             }
             const rerankerSlots = Math.max(topK - reservedBridge.length, 0);
-            const rerankedRest = this.hasReranker() && !rerankerBypassed
-                ? await this.applyReranker(query, rerankInput, rerankerSlots)
-                : rerankInput.slice(0, rerankerSlots);
+            const rerankedRest = await this.rerankForFinalResults(query, rerankInput, rerankerSlots, rerankerBypassed);
             const finalResults = [...reservedBridge, ...rerankedRest].slice(0, topK);
             if (rerankerBypassed) {
                 console.log(`[Context] ⏭️  reranker bypassed for qualified-name code query "${query}"`);
@@ -2447,6 +2445,26 @@ export class Context {
         const reservedSet = new Set<SemanticSearchResult>(reserved);
         const rerankInput = candidates.filter((r) => !reservedSet.has(r));
         return { reserved, rerankInput };
+    }
+
+    /**
+     * The skip-or-rerank decision the final results pass through (#131).
+     * Extracted so the vendored suite can pin it with a reranker attached:
+     * with a reranker present, an engaged qualified-name bypass skips the
+     * cross-encoder entirely — the merged-RRF order passes through as the
+     * final order — and a bypass that does not engage hands the sliced input
+     * to `applyReranker`. Behaviour-preserving extraction; the search
+     * pipeline's call site is the single consumer.
+     */
+    private async rerankForFinalResults(
+        query: string,
+        rerankInput: SemanticSearchResult[],
+        rerankerSlots: number,
+        rerankerBypassed: boolean,
+    ): Promise<SemanticSearchResult[]> {
+        return this.hasReranker() && !rerankerBypassed
+            ? await this.applyReranker(query, rerankInput, rerankerSlots)
+            : rerankInput.slice(0, rerankerSlots);
     }
 
     private async applyReranker(
@@ -4180,17 +4198,10 @@ export class Context {
         const splitterName = this.codeSplitter.constructor.name;
 
         if (splitterName === 'AstCodeSplitter') {
-            // Stays a `require`, unlike its two siblings below. `AstCodeSplitter` is
-            // already imported at the top of this file, but binding it here through
-            // the typed import turns the next line into a compile error:
-            //   TS2339: Property 'getSupportedLanguages' does not exist on type
-            //   'typeof AstCodeSplitter'
-            // — the static does not exist, so this method throws at runtime today.
-            // `require` returns `any`, which is what has been hiding that. Making the
-            // call correct is a behaviour change and belongs in its own issue, not in
-            // a lint pass. #129.
-            // eslint-disable-next-line @typescript-eslint/no-require-imports
-            const { AstCodeSplitter } = require('./splitter/ast-splitter');
+            // Typed import: #130 — this call went through `require` (untyped
+            // `any`), which is how a call to a method that did not exist hid a
+            // runtime `TypeError` from the compiler. The static exists now, and
+            // the binding is typed, so the checker holds the seam.
             return {
                 type: 'ast',
                 hasBuiltinFallback: true,

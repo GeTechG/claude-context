@@ -379,11 +379,24 @@ export class AstCodeSplitter implements Splitter {
      * Check if AST splitting is supported for the given language
      */
     static isLanguageSupported(language: string): boolean {
-        const supportedLanguages = [
-            'javascript', 'js', 'typescript', 'ts', 'python', 'py',
-            'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala',
-            'haxe', 'hx', 'hxml'
-        ];
-        return supportedLanguages.includes(language.toLowerCase());
+        return AstCodeSplitter.SUPPORTED_LANGUAGES.includes(language.toLowerCase());
     }
+
+    /**
+     * The languages this splitter actually supports. #130: this static was
+     * called by `Context.getSplitterInfo()` through an untyped `require`, so a
+     * call to a method that did not exist surfaced as a runtime `TypeError`
+     * instead of a compile error. The list is the one `isLanguageSupported`
+     * reads — one list, two readers — and the caller now binds this class
+     * through a typed import, so the type checker holds the seam.
+     */
+    static getSupportedLanguages(): string[] {
+        return [...AstCodeSplitter.SUPPORTED_LANGUAGES];
+    }
+
+    private static readonly SUPPORTED_LANGUAGES: string[] = [
+        'javascript', 'js', 'typescript', 'ts', 'python', 'py',
+        'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala',
+        'haxe', 'hx', 'hxml'
+    ];
 }

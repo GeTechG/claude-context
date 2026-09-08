@@ -4,6 +4,7 @@ import * as path from 'path';
 import { Context } from './context';
 import { Embedding, EmbeddingVector } from './embedding';
 import { Splitter, CodeChunk } from './splitter';
+import { AstCodeSplitter } from './splitter/ast-splitter';
 import { FileSynchronizer } from './sync/synchronizer';
 import { VectorDatabase } from './vectordb';
 
@@ -164,5 +165,41 @@ describe('Context request-scoped splitters', () => {
         } finally {
             await FileSynchronizer.deleteSnapshot(project);
         }
+    });
+});
+
+// #130: `getSplitterInfo()` called a static that did not exist, through an
+// untyped `require` that hid the TypeError from the compiler. These pin the
+// repaired surface: the static exists, the introspection returns it through
+// the typed binding, and the two readers of the language list read one list.
+describe('splitter introspection reports what the splitter supports (#130)', () => {
+    it('getSplitterInfo on the default (AST) splitter returns the actual language list', () => {
+        const context = new Context({
+            embedding: new TestEmbedding(),
+            vectorDatabase: createVectorDatabase(),
+        });
+        const info = context.getSplitterInfo();
+        expect(info.type).toBe('ast');
+        expect(info.hasBuiltinFallback).toBe(true);
+        expect(Array.isArray(info.supportedLanguages)).toBe(true);
+        for (const language of ['typescript', 'ts', 'haxe', 'hx', 'hxml']) {
+            expect(info.supportedLanguages).toContain(language);
+        }
+    });
+
+    it('the language list agrees with the splitter support predicate, both ways', () => {
+        const supported = AstCodeSplitter.getSupportedLanguages();
+        for (const language of supported) {
+            expect(AstCodeSplitter.isLanguageSupported(language)).toBe(true);
+        }
+        expect(AstCodeSplitter.isLanguageSupported('fortran')).toBe(false);
+    });
+
+    it('getSupportedLanguages returns a copy, so callers cannot move the splitter list', () => {
+        const list = AstCodeSplitter.getSupportedLanguages();
+        const length = list.length;
+        list.push('fortran');
+        expect(AstCodeSplitter.getSupportedLanguages()).not.toContain('fortran');
+        expect(AstCodeSplitter.getSupportedLanguages()).toHaveLength(length);
     });
 });
