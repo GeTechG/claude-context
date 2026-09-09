@@ -1648,7 +1648,7 @@ export class Context {
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
         requestSplitter?: Splitter
-    ): Promise<{ added: number, removed: number, modified: number, droppedChunks: number }> {
+    ): Promise<{ added: number, removed: number, modified: number, droppedChunks: number, status: 'completed' | 'limit_reached', processedFiles: number }> {
         const collectionName = this.getCollectionName(codebasePath);
         // code-collection-split: deletion set spans both v6 collections in
         // split mode. The synchronizer key stays single (`collectionName`,
@@ -1680,7 +1680,7 @@ export class Context {
         if (totalChanges === 0) {
             progressCallback?.({ phase: 'No changes detected', current: 100, total: 100, percentage: 100 });
             console.log('[Context] ✅ No file changes detected.');
-            return { added: 0, removed: 0, modified: 0, droppedChunks: 0 };
+            return { added: 0, removed: 0, modified: 0, droppedChunks: 0, status: 'completed', processedFiles: 0 };
         }
 
         console.log(`[Context] 🔄 Found changes: ${added.length} added, ${removed.length} removed, ${modified.length} modified.`);
@@ -1708,6 +1708,8 @@ export class Context {
         const filesToIndex = [...added, ...modified].map(f => path.join(codebasePath, f));
 
         let droppedChunks = 0;
+        let scanStatus: 'completed' | 'limit_reached' = 'completed';
+        let processedFiles = 0;
         if (filesToIndex.length > 0) {
             const listResult = await this.processFileList(
                 filesToIndex,
@@ -1718,9 +1720,20 @@ export class Context {
                 splitter
             );
             droppedChunks = listResult.droppedChunks;
+            scanStatus = listResult.status;
+            processedFiles = listResult.processedFiles;
         }
 
         console.log(`[Context] ✅ Re-indexing complete. Added: ${added.length}, Removed: ${removed.length}, Modified: ${modified.length}`);
+        // #138: the detected change set is not the processed set. The chunk
+        // scan can stop at CHUNK_LIMIT part-way through it with zero rejected
+        // batches — files past the cutoff were never embedded, so the #19 tap
+        // sees nothing. Print what was actually processed against what was
+        // detected, and hand the status to the caller so the run can fail.
+        if (scanStatus === 'limit_reached') {
+            console.log(`[Context] ⚠️  Processed: ${processedFiles} of ${filesToIndex.length} detected file(s) — the chunk limit stopped the scan`);
+            console.error(`[Context] ❌ The index is INCOMPLETE: the chunk limit was reached before every detected file was processed`);
+        }
         // #19: "Re-indexing complete! 100%" used to print even when whole
         // batches had been rejected. Say what was lost, and hand the count to
         // the caller so the run can fail.
@@ -1729,7 +1742,7 @@ export class Context {
         }
         progressCallback?.({ phase: 'Re-indexing complete!', current: totalChanges, total: totalChanges, percentage: 100 });
 
-        return { added: added.length, removed: removed.length, modified: modified.length, droppedChunks };
+        return { added: added.length, removed: removed.length, modified: modified.length, droppedChunks, status: scanStatus, processedFiles };
     }
 
     /**
