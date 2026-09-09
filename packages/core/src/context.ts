@@ -3440,6 +3440,20 @@ export class Context {
         for (let i = 0; i < filePaths.length; i++) {
             const filePath = filePaths[i];
 
+            // #138: the limit is file-atomic and checked BEFORE a file's chunks
+            // are computed, so a file is either fully indexed or not started. A
+            // prefix of a file's chunks in the vector database is the worst
+            // state the limit could leave: the reseed path derives a file's
+            // visibility from its Milvus rows, so a partially-inserted file
+            // would read as current and never be re-indexed. The total may
+            // overshoot CHUNK_LIMIT by at most the last file's chunk count —
+            // the honest alternative to a half-written file.
+            if (totalChunks >= CHUNK_LIMIT) {
+                console.warn(`[Context] ⚠️  Chunk limit of ${CHUNK_LIMIT} reached. Stopping indexing before ${filePath}.`);
+                limitReached = true;
+                break;
+            }
+
             try {
                 let content = await fs.promises.readFile(filePath, 'utf-8');
                 let language = this.getLanguageFromExtension(path.extname(filePath));
@@ -3505,21 +3519,10 @@ export class Context {
                             chunkBuffer = []; // Always clear buffer, even on failure
                         }
                     }
-
-                    // Check if chunk limit is reached
-                    if (totalChunks >= CHUNK_LIMIT) {
-                        console.warn(`[Context] ⚠️  Chunk limit of ${CHUNK_LIMIT} reached. Stopping indexing.`);
-                        limitReached = true;
-                        break; // Exit the inner loop (over chunks)
-                    }
                 }
 
                 processedFiles++;
                 onFileProcessed?.(filePath, i + 1, filePaths.length);
-
-                if (limitReached) {
-                    break; // Exit the outer loop (over files)
-                }
 
             } catch (error) {
                 console.warn(`[Context] ⚠️  Skipping file ${filePath}: ${error}`);
