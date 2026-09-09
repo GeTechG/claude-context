@@ -47,7 +47,7 @@ export class SyncCommand {
         this.isSyncing = true;
 
         try {
-            let syncStats: { added: number; removed: number; modified: number } | undefined;
+            let syncStats: { added: number; removed: number; modified: number; status?: 'completed' | 'limit_reached'; processedFiles?: number } | undefined;
 
             await vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
@@ -76,7 +76,18 @@ export class SyncCommand {
             if (syncStats) {
                 const totalChanges = syncStats.added + syncStats.removed + syncStats.modified;
 
-                if (totalChanges > 0) {
+                // vendored-sync-limit-status (#139): the chunk limit stopping the
+                // scan is not a successful sync — files past the cutoff were
+                // never embedded. Say so; never mutate saved sync state for it
+                // (recovery is the re-seeding resume with an explicit CHUNK_LIMIT).
+                if (syncStats.status === 'limit_reached') {
+                    // The snapshot covers files the scan never reached, so a
+                    // plain re-run no-ops: the resume must re-seed (#139).
+                    vscode.window.showWarningMessage(
+                        `⚠️ Sync incomplete!\n\nThe chunk limit stopped the scan after ${syncStats.processedFiles ?? '?'} of ${(syncStats.added || 0) + (syncStats.modified || 0)} detected added/modified file(s). Resume with: CHUNK_LIMIT=<n> node infra/with-retrieval-env.js node infra/reindex-resume.js --reseed (#139)`
+                    );
+                    console.warn(`[SYNC] Sync INCOMPLETE for '${codebasePath}': the chunk limit stopped the scan after ${syncStats.processedFiles ?? '?'} of ${(syncStats.added || 0) + (syncStats.modified || 0)} detected added/modified file(s) (#139)`);
+                } else if (totalChanges > 0) {
                     vscode.window.showInformationMessage(
                         `✅ Sync complete!\n\nAdded: ${syncStats.added}, Removed: ${syncStats.removed}, Modified: ${syncStats.modified} files.`
                     );
@@ -152,7 +163,14 @@ export class SyncCommand {
 
             const totalChanges = syncStats.added + syncStats.removed + syncStats.modified;
 
-            if (totalChanges > 0) {
+            // #139: a limited run reports incompleteness instead of quiet success.
+            if (syncStats.status === 'limit_reached') {
+                console.warn(`[AUTO-SYNC] Silent sync INCOMPLETE for '${codebasePath}': the chunk limit stopped the scan after ${syncStats.processedFiles ?? '?'} of ${(syncStats.added || 0) + (syncStats.modified || 0)} detected added/modified file(s) (#139) — Resume with: CHUNK_LIMIT=<n> node infra/with-retrieval-env.js node infra/reindex-resume.js --reseed`);
+                vscode.window.showWarningMessage(
+                    `⚠️ Index auto-update incomplete: the chunk limit stopped the sync (#139)`,
+                    { modal: false }
+                );
+            } else if (totalChanges > 0) {
                 console.log(`[AUTO-SYNC] Silent sync complete for '${codebasePath}'. Added: ${syncStats.added}, Removed: ${syncStats.removed}, Modified: ${syncStats.modified}`);
 
                 // Show a subtle notification for auto-sync changes

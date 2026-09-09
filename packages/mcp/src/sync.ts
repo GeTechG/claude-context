@@ -136,6 +136,14 @@ export class SyncManager {
 
         try {
             const totalStats = { added: 0, removed: 0, modified: 0 };
+            // vendored-sync-limit-status (#139): reindexByChange reports
+            // `status: 'limit_reached'` when the chunk limit stopped the scan —
+            // files past the cutoff were never embedded, so the counts alone
+            // read as a complete sync. Report the incompleteness; never mutate
+            // saved sync state for it (the snapshot already covers files the
+            // scan never reached — recovery is the re-seeding resume, and
+            // deleting the snapshot would re-embed everything on every cycle).
+            let limitedCodebases = 0;
 
             for (let i = 0; i < indexedCodebases.length; i++) {
                 const codebasePath = indexedCodebases[i];
@@ -173,14 +181,21 @@ export class SyncManager {
                     const codebaseElapsed = Date.now() - codebaseStartTime;
 
                     console.log(`[SYNC-DEBUG] Reindex stats for '${codebasePath}':`, stats);
-                    console.log(`[SYNC-DEBUG] Codebase sync completed in ${codebaseElapsed}ms`);
+                    console.log(`[SYNC-DEBUG] Codebase sync finished in ${codebaseElapsed}ms`);
 
                     // Accumulate total stats
                     totalStats.added += stats.added;
                     totalStats.removed += stats.removed;
                     totalStats.modified += stats.modified;
 
-                    if (stats.added > 0 || stats.removed > 0 || stats.modified > 0) {
+                    if (stats.status === 'limit_reached') {
+                        limitedCodebases++;
+                        // The snapshot was hashed over the whole detected set
+                        // before the scan stopped, so a plain re-run sees no
+                        // changes: the resume must re-seed from what the index
+                        // holds, with the limit set explicitly (#139).
+                        console.error(`[SYNC] ⚠️  Sync INCOMPLETE for '${codebasePath}': the chunk limit stopped the scan after ${stats.processedFiles ?? '?'} of ${(stats.added || 0) + (stats.modified || 0)} detected added/modified file(s) — the index is missing files past the cutoff (#139). Resume with: CHUNK_LIMIT=<n> node infra/with-retrieval-env.js node infra/reindex-resume.js --reseed`);
+                    } else if (stats.added > 0 || stats.removed > 0 || stats.modified > 0) {
                         console.log(`[SYNC] Sync complete for '${codebasePath}'. Added: ${stats.added}, Removed: ${stats.removed}, Modified: ${stats.modified} (${codebaseElapsed}ms)`);
                     } else {
                         console.log(`[SYNC] No changes detected for '${codebasePath}' (${codebaseElapsed}ms)`);
@@ -209,8 +224,14 @@ export class SyncManager {
 
             const totalElapsed = Date.now() - syncStartTime;
             console.log(`[SYNC-DEBUG] Total sync stats across all codebases: Added: ${totalStats.added}, Removed: ${totalStats.removed}, Modified: ${totalStats.modified}`);
-            console.log(`[SYNC-DEBUG] Index sync completed for all codebases in ${totalElapsed}ms`);
-            console.log(`[SYNC] Index sync completed for all codebases. Total changes - Added: ${totalStats.added}, Removed: ${totalStats.removed}, Modified: ${totalStats.modified}`);
+            console.log(`[SYNC-DEBUG] Index sync finished for all codebases in ${totalElapsed}ms`);
+            // #139: a summary that says "completed for all codebases" would read
+            // a limited codebase as synced. The summary carries the limitation.
+            if (limitedCodebases > 0) {
+                console.error(`[SYNC] ⚠️  Index sync finished but INCOMPLETE for ${limitedCodebases} of ${indexedCodebases.length} codebase(s) — the chunk limit stopped those scans (#139). Resume with: CHUNK_LIMIT=<n> node infra/with-retrieval-env.js node infra/reindex-resume.js --reseed. Total changes - Added: ${totalStats.added}, Removed: ${totalStats.removed}, Modified: ${totalStats.modified}`);
+            } else {
+                console.log(`[SYNC] Index sync completed for all codebases. Total changes - Added: ${totalStats.added}, Removed: ${totalStats.removed}, Modified: ${totalStats.modified}`);
+            }
         } catch (error: any) {
             const totalElapsed = Date.now() - syncStartTime;
             console.error(`[SYNC-DEBUG] Error during index sync after ${totalElapsed}ms:`, error);
