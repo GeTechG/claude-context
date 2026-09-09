@@ -324,6 +324,18 @@ export class Context {
     // count is unbounded and is what a run is read by; the list is a sample, so
     // a long-lived MCP server cannot grow it without limit.
     private static readonly SYMBOL_REFS_SKIP_SAMPLE_CAP = 200;
+    // ship-the-reference-expansion-bound: the shipped policy position the pool
+    // bounds its reference expansion at. Measured, not chosen: the position
+    // #72 nominated and the 7-row probe fired on, priced at $0 in
+    // `infra/cross-corpus-runs/symbol-frequency-bound-2026-09-08/` (the skip
+    // changed no emitted context on either slice while cutting Σ wall 16.3 %
+    // and Serena calls 31 %) and priced for answer quality in
+    // `infra/cross-corpus-runs/symbol-frequency-bound-knob-pair-2026-09-08/`
+    // (whose negative finding is the ORDERING's, now a separate switch). infra
+    // states the same number beside its own resolution
+    // (`infra/lib/symbol-frequency.js`); a test reads both and asserts they
+    // agree, because the two halves cannot import each other.
+    static readonly DEFAULT_SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE = 0.995;
     private symbolRefsFrequencyRecord: {
         activations: number;
         source: string | null;
@@ -1035,21 +1047,26 @@ export class Context {
     // ---- rag-symbol-refs-multi-hop: env getters -------------------------
 
     /**
-     * local-rag #64: the policy position in the corpus's own document-frequency
-     * distribution above which the pool stops expanding references. A POSITION,
-     * not a count: the threshold in documents is a property of the corpus the
-     * build ran over and is derived per corpus. Unset, empty or 0 means NO
-     * BOUND — the pool expands references for every activated subject, exactly
-     * as it did before this knob existed. Stamped through the `SYMBOL_REFS_`
-     * prefix because it changes what the pool emits.
+     * local-rag #64, shipped by ship-the-reference-expansion-bound: the policy
+     * position in the corpus's own document-frequency distribution above which
+     * the pool stops expanding references. A POSITION, not a count: the
+     * threshold in documents is a property of the corpus the build ran over
+     * and is derived per corpus. Unset or empty means the SHIPPED DEFAULT —
+     * the bound is on, at the position priced in
+     * `infra/cross-corpus-runs/symbol-frequency-bound-2026-09-08/` (the skip
+     * changed no emitted context on either slice while cutting Σ wall 16.3 %
+     * and Serena calls 31 %). An invalid value warns and takes the default
+     * too: garbage must not fail open to unbounded expansion. Explicitly `0`
+     * is the pre-#64 behaviour, by decision. Stamped through the
+     * `SYMBOL_REFS_` prefix because it changes what the pool emits.
      */
     private getSymbolRefsMaxSymbolFrequencyQuantile(): number {
         const raw = (envManager.get('SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE') || '').trim();
-        if (raw.length === 0) return 0;
+        if (raw.length === 0) return Context.DEFAULT_SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE;
         const q = Number(raw);
         if (!Number.isFinite(q) || q < 0 || q > 1) {
-            console.warn(`[Context] ⚠️ Ignoring invalid SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE=${raw}; expected a quantile in [0, 1], falling back to 0 (no bound)`);
-            return 0;
+            console.warn(`[Context] ⚠️ Ignoring invalid SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE=${raw}; expected a quantile in [0, 1], falling back to the shipped default ${Context.DEFAULT_SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE}`);
+            return Context.DEFAULT_SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE;
         }
         return q;
     }

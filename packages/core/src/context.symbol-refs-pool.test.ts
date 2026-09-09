@@ -90,21 +90,26 @@ describe('Context — symbol-refs-pool env getters', () => {
         expect(ctx.getSymbolRefsPoolWeight()).toBe(1.0);
     });
 
-    // local-rag #64: the frequency policy is a POSITION in the corpus's own
-    // document-frequency distribution. Unset, empty, out of range or 0 all mean
-    // NO BOUND — the pool expands references for every activated subject, which
-    // is the behaviour that predates the knob.
-    it('reads SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE and treats unset/invalid as no bound', () => {
+    // local-rag #64, shipped by ship-the-reference-expansion-bound: the
+    // frequency policy is a POSITION in the corpus's own document-frequency
+    // distribution. Unset and empty resolve to the SHIPPED default — the bound
+    // is on — and an invalid value warns and resolves to the default too:
+    // garbage must not fail open to unbounded expansion. Explicit `0` stays
+    // the pre-#64 behaviour, by decision.
+    it('reads SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE: unset/invalid fall to the shipped default, 0 disables', () => {
         const ctx = makeCtx() as any;
-        expect(ctx.getSymbolRefsMaxSymbolFrequencyQuantile()).toBe(0);
+        expect(ctx.getSymbolRefsMaxSymbolFrequencyQuantile()).toBe(Context.DEFAULT_SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE);
+        expect(Context.DEFAULT_SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE).toBe(0.995);
         process.env.SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE = '0.999';
         expect(ctx.getSymbolRefsMaxSymbolFrequencyQuantile()).toBe(0.999);
+        process.env.SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE = '';
+        expect(ctx.getSymbolRefsMaxSymbolFrequencyQuantile()).toBe(0.995);
         process.env.SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE = '0';
         expect(ctx.getSymbolRefsMaxSymbolFrequencyQuantile()).toBe(0);
         process.env.SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE = '7';
-        expect(ctx.getSymbolRefsMaxSymbolFrequencyQuantile()).toBe(0);
+        expect(ctx.getSymbolRefsMaxSymbolFrequencyQuantile()).toBe(0.995);
         process.env.SYMBOL_REFS_MAX_SYMBOL_FREQUENCY_QUANTILE = 'nonsense';
-        expect(ctx.getSymbolRefsMaxSymbolFrequencyQuantile()).toBe(0);
+        expect(ctx.getSymbolRefsMaxSymbolFrequencyQuantile()).toBe(0.995);
     });
 
     it('a corpus with no frequency artifact yields an absent gate: no bound, every frequency unknown', () => {
