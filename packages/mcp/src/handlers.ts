@@ -28,6 +28,12 @@ import {
 // usable from this ESM build in both src/ and dist/ (same directory depth).
 const localRequire = createRequire(import.meta.url);
 const sourceRegistry: any = localRequire("../../../../../infra/lib/source-registry.js");
+// panel-answer-mode: the search-path helpers (scope validation, limit clamp,
+// retrieval threshold, structured shaping, provenance context) are ONE shared
+// module the panel HTTP search also loads — infra/lib/search-shared.js. The
+// smoke test infra/test/search-shared-path.smoke.js fails if either surface
+// grows a private copy of that logic again.
+const searchShared: any = localRequire("../../../../../infra/lib/search-shared.js");
 const defaultRegistryPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../../local-rag.sources.json");
 
 function loadProvenanceContext(knowledgeRoot: string): { registry: any; state: any; diagnostic: string | null } {
@@ -37,12 +43,6 @@ function loadProvenanceContext(knowledgeRoot: string): { registry: any; state: a
     } catch (error: any) {
         return { registry: { version: 1, sources: [] }, state: { version: 1, sources: {} }, diagnostic: error?.message || String(error) };
     }
-}
-
-function resultProvenance(relativePath: string, knowledgeRoot: string, context?: { registry: any; state: any }) {
-    const pctx = context || loadProvenanceContext(knowledgeRoot);
-    try { return sourceRegistry.resolveProvenance(relativePath, pctx.registry, pctx.state); }
-    catch (error: any) { return { source_id: null, status: "unregistered", freshness: { aggregate: "unregistered", reasons: [{ code: "PROVENANCE_RESOLUTION_FAILED" }] }, diagnostic: error?.message || String(error) }; }
 }
 
 // retrieval-confidence-band: map a reranker relevance score (cross-encoder
@@ -686,7 +686,9 @@ export class ToolHandlers {
 
     public async handleSearchCode(args: any) {
         const { path: codebasePath, query, limit = 10, extensionFilter, shapeHint, categories } = args;
-        const resultLimit = limit || 10;
+        // Shared clamp (infra/lib/search-shared.js): a positive integer capped
+        // at the shared maximum, anything else the default 10.
+        const resultLimit = searchShared.clampSearchLimit(limit);
 
         // agentic-reference-context-assembler: optional query_shape hint.
         // Validate against the router's QueryShape set; any other value
@@ -832,21 +834,13 @@ export class ToolHandlers {
             // counts on). Multiple categories OR together; the agent picks them
             // per query, so there is no server- or config-side hard restriction.
             // Omitted/empty → no category filter → search every category.
+            // Cleaning and the validity decision come from the SHARED module the
+            // panel loads (infra/lib/search-shared.js) — only the error text is
+            // this tool's own.
             let categoryExpr: string | undefined = undefined;
             let scopedCategories: string[] | undefined = undefined;
             if (Array.isArray(categories) && categories.length > 0) {
-                const cleanedCats = Array.from(new Set(
-                    categories
-                        .filter((v: any) => typeof v === 'string')
-                        // tolerate "haxe/", "/haxe", "haxe/io" → leading/trailing
-                        // slashes stripped; an inner path keeps its prefix.
-                        .map((v: string) => v.trim().replace(/^\/+|\/+$/g, ''))
-                        .filter((v: string) => v.length > 0)
-                ));
-                // Category names are directory paths under the root — reject
-                // anything that could break the Milvus expression or escape the
-                // prefix (quotes, %, whitespace, etc.).
-                const invalidCats = cleanedCats.filter((c: string) => !/^[A-Za-z0-9._/-]+$/.test(c));
+                const { cleaned: cleanedCats, invalid: invalidCats } = searchShared.cleanCategories(categories);
                 if (invalidCats.length > 0) {
                     return {
                         content: [{ type: 'text', text: `Error: Invalid category names in categories: ${JSON.stringify(invalidCats)}. Use plain directory names from list_categories (letters, digits, '.', '_', '-', '/').` }],
@@ -855,20 +849,21 @@ export class ToolHandlers {
                 }
                 if (cleanedCats.length > 0) {
                     scopedCategories = cleanedCats;
-                    const clauses = cleanedCats.map((c: string) => `relativePath like "${c}/%"`);
-                    categoryExpr = clauses.length > 1 ? `(${clauses.join(' or ')})` : clauses[0];
+                    categoryExpr = searchShared.categoryExprFor(cleanedCats);
                 }
             }
 
             // Combine category + extension scopes (AND); either may be absent.
             const combinedFilter = [categoryExpr, filterExpr].filter(Boolean).join(' and ') || undefined;
 
-            // Search in the specified codebase
+            // Search in the specified codebase — through the shared limit clamp
+            // and the shared retrieval threshold, the parameters the panel
+            // search uses too.
             const searchResults = await this.context.semanticSearch(
                 searchCodebasePath,
                 query,
-                Math.min(resultLimit, 50),
-                0.3,
+                resultLimit,
+                searchShared.SEARCH_SCORE_THRESHOLD,
                 combinedFilter,
                 queryShape
             );
@@ -906,23 +901,11 @@ export class ToolHandlers {
                 };
             }
 
-            // Format results
-            const provenanceContext = loadProvenanceContext(searchCodebasePath);
-            const structuredResults = searchResults.map((result: any, index: number) => {
-                const provenance = resultProvenance(result.relativePath, searchCodebasePath, provenanceContext);
-                return {
-                    rank: index + 1,
-                    relativePath: result.relativePath,
-                    startLine: result.startLine,
-                    endLine: result.endLine,
-                    content_type: result.content_type || result.contentType || null,
-                    language: result.language || null,
-                    score: typeof result.score === "number" ? result.score : null,
-                    chunk_id: result.chunk_id || null,
-                    candidate_symbols: Array.isArray(result.candidateSymbols) ? result.candidateSymbols : [],
-                    provenance,
-                };
-            });
+            // Format results — shaped by the shared shaper (`excerptChars: 0`
+            // keeps structuredContent exactly the pre-sharing field set); the
+            // markdown rendering below stays this tool's own and byte-identical.
+            const provenanceContext = searchShared.provenanceContextFor(searchCodebasePath);
+            const structuredResults = searchShared.shapeSearchResults(searchResults, provenanceContext, { excerptChars: 0 });
             const formattedResults = searchResults.map((result: any, index: number) => {
                 const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
                 const context = truncateContent(result.content, 5000);
