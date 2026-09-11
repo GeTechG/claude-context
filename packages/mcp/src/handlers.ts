@@ -34,6 +34,15 @@ const sourceRegistry: any = localRequire("../../../../../infra/lib/source-regist
 // smoke test infra/test/search-shared-path.smoke.js fails if either surface
 // grows a private copy of that logic again.
 const searchShared: any = localRequire("../../../../../infra/lib/search-shared.js");
+// auto-update-generations: the retrieval ROOT itself is resolved through the
+// ONE shared active-generation resolver the panel loads too
+// (infra/lib/serving-root.js). A present, resolvable pointer names the active
+// generation's corpus tree (whose path hash gives the switched collection
+// names); an absent pointer names the knowledge root; an unresolvable pointer
+// is a named error, never a silent fallback. The pointer lives on the shared
+// knowledge-root filesystem, so the host stdio server reads the same flip the
+// container panel does with no environment changes.
+const servingRoot: any = localRequire("../../../../../infra/lib/serving-root.js");
 const defaultRegistryPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../../local-rag.sources.json");
 
 function loadProvenanceContext(knowledgeRoot: string): { registry: any; state: any; diagnostic: string | null } {
@@ -750,13 +759,39 @@ export class ToolHandlers {
 
             trackCodebasePath(absolutePath);
 
+            // auto-update-generations: resolve the retrieval root ONCE, before
+            // any other read — the request holds this generation reference for
+            // retrieval AND provenance, so a pointer flip mid-request cannot
+            // mix generations in one response. The knowledge root AND ANY PATH
+            // UNDER IT (codex review finding 10) resolve into the active
+            // generation — a child-path request must not bypass it and search
+            // the base collections; the pointer lives on the shared
+            // knowledge-root filesystem, so the host stdio server reads the
+            // same flip the container panel does with no environment changes.
+            // An unresolvable pointer throws the resolver's named error, never
+            // a silent fallback. With no pointer, the mapping resolves to the
+            // knowledge root itself — today's behavior, byte for byte.
+            const knowledgeRootPath = resolveKnowledgeRoot();
+            const mapped = knowledgeRootPath
+                ? servingRoot.mapPathIntoServingRoot(knowledgeRootPath, absolutePath)
+                : null;
+            const usingGeneration = !!mapped && !!mapped.generation;
+            const searchRoot = mapped ? mapped.servingRoot : absolutePath;
+            // The provenance STATE is read from the shared state file under the
+            // knowledge root (codex review B9) — never from the request path,
+            // which a generation remap would otherwise redirect into the
+            // generation tree.
+            const provenanceStateRoot = knowledgeRootPath
+                ? servingRoot.knowledgeRootFor(knowledgeRootPath, absolutePath)
+                : absolutePath;
+
             // Check if this codebase is indexed or being indexed
             const indexedCodebasePath = this.snapshotManager.findIndexedCodebasePath(absolutePath);
             const indexingCodebasePath = this.snapshotManager.findIndexingCodebasePath(absolutePath);
             const matchedCodebase = [indexedCodebasePath, indexingCodebasePath]
                 .filter((codebase): codebase is string => codebase !== undefined)
                 .sort((a, b) => b.length - a.length)[0];
-            let searchCodebasePath = matchedCodebase || absolutePath;
+            let searchCodebasePath = usingGeneration ? searchRoot : (matchedCodebase || searchRoot);
             let isIndexed = indexedCodebasePath === searchCodebasePath;
             const isIndexing = indexingCodebasePath === searchCodebasePath;
 
@@ -765,14 +800,14 @@ export class ToolHandlers {
                 // Only recover the snapshot when we can confirm a real row count —
                 // writing 0/0+completed for an unverifiable collection poisons the
                 // client into a force-reindex loop (Issue #295).
-                const hasVectorIndex = await this.context.hasIndex(absolutePath);
+                const hasVectorIndex = await this.context.hasIndex(searchRoot);
                 if (hasVectorIndex) {
-                    const stats = await this.queryCollectionStats(absolutePath);
+                    const stats = await this.queryCollectionStats(searchRoot);
                     if (stats) {
-                        console.warn(`[SEARCH] Snapshot missing but VectorDB has index for '${absolutePath}', recovering snapshot (rows=${stats.totalChunks})`);
-                        this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
+                        console.warn(`[SEARCH] Snapshot missing but VectorDB has index for '${searchRoot}', recovering snapshot (rows=${stats.totalChunks})`);
+                        this.snapshotManager.setCodebaseIndexed(searchRoot, { ...stats, status: 'completed' as const });
                         this.snapshotManager.saveCodebaseSnapshot();
-                        searchCodebasePath = absolutePath;
+                        searchCodebasePath = searchRoot;
                         isIndexed = true;
                         // Continue with search (don't return error)
                     } else {
@@ -856,6 +891,13 @@ export class ToolHandlers {
             // Combine category + extension scopes (AND); either may be absent.
             const combinedFilter = [categoryExpr, filterExpr].filter(Boolean).join(' and ') || undefined;
 
+            // The provenance context is read TOGETHER with the generation
+            // reference, BEFORE retrieval (spec rag-search «Provenance reflects
+            // active index state»): the results are shaped against the context
+            // this request captured, never against whatever the pointer names
+            // by the time the rows have come back.
+            const provenanceContext = searchShared.provenanceContextFor(provenanceStateRoot);
+
             // Search in the specified codebase — through the shared limit clamp
             // and the shared retrieval threshold, the parameters the panel
             // search uses too.
@@ -887,7 +929,7 @@ export class ToolHandlers {
                 if (scopedCategories) {
                     noResultsMessage += `\nScoped to categories: ${scopedCategories.join(', ')}. If a category is wrong or not indexed, check list_categories or widen the scope.`;
                 }
-                if (searchCodebasePath !== absolutePath) {
+                if (searchCodebasePath !== absolutePath && !usingGeneration) {
                     noResultsMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
                 }
                 if (isIndexing) {
@@ -904,7 +946,6 @@ export class ToolHandlers {
             // Format results — shaped by the shared shaper (`excerptChars: 0`
             // keeps structuredContent exactly the pre-sharing field set); the
             // markdown rendering below stays this tool's own and byte-identical.
-            const provenanceContext = searchShared.provenanceContextFor(searchCodebasePath);
             const structuredResults = searchShared.shapeSearchResults(searchResults, provenanceContext, { excerptChars: 0 });
             const formattedResults = searchResults.map((result: any, index: number) => {
                 const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
@@ -942,7 +983,7 @@ export class ToolHandlers {
             }).join('\n');
 
             let resultMessage = `Found ${searchResults.length} results for query: "${query}" in codebase '${searchCodebasePath}'${indexingStatusMessage}`;
-            if (searchCodebasePath !== absolutePath) {
+            if (searchCodebasePath !== absolutePath && !usingGeneration) {
                 resultMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
             }
             // confidence-gated-second-hop: surface a single subquery-level
@@ -1609,7 +1650,11 @@ export class ToolHandlers {
 
             const indexed = rows.filter(r => r.total > 0);
             const pending = rows.filter(r => r.total === 0);
-            const provenanceContext = loadProvenanceContext(absRoot);
+            // The state comes from the shared file under the knowledge root
+            // (codex review B9), even when the categories were listed under a
+            // child path.
+            const krPath = resolveKnowledgeRoot();
+            const provenanceContext = loadProvenanceContext(krPath ? servingRoot.knowledgeRootFor(krPath, absRoot) : absRoot);
             const categoryMetadata = rows.map((row) => ({
                 category: row.cat,
                 counts: row.counts,
