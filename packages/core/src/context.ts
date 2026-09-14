@@ -688,6 +688,20 @@ export class Context {
     }
 
     /**
+     * ablate-learned-sparse-channel: whether this query's learned-sparse vector
+     * enters the hybrid request. `HYBRID_LEARNED_SPARSE=off` drops the
+     * `sparse_learned` channel for every pool (query-side only — indexing never
+     * reads it); unset/`on` keeps the channel whenever the vector is present.
+     */
+    private queriesLearnedSparse(queryEmbedding: EmbeddingVector): boolean {
+        const mode = (envManager.get('HYBRID_LEARNED_SPARSE') || 'on').trim().toLowerCase();
+        if (mode !== 'on' && mode !== 'off') {
+            throw new Error(`HYBRID_LEARNED_SPARSE must be on or off, got ${JSON.stringify(mode)}`);
+        }
+        return mode === 'on' && !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0);
+    }
+
+    /**
      * Build the per-channel hybrid-search requests for a single subject.
      * Dense and learned-sparse channels use the original `query` (rewriters
      * never touch them — see design D3); the BM25 sparse channel receives
@@ -707,7 +721,7 @@ export class Context {
             { data: queryEmbedding.vector, anns_field: 'vector', param: { nprobe: 10 }, limit },
             { data: sparseData, anns_field: 'sparse_vector', param: { drop_ratio_search: 0.2 }, limit },
         ];
-        if (queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0) {
+        if (queryEmbedding.sparse && this.queriesLearnedSparse(queryEmbedding)) {
             const sparseDict: Record<string, number> = {};
             const { indices, values } = queryEmbedding.sparse;
             const len = Math.min(indices.length, values.length);
@@ -797,7 +811,7 @@ export class Context {
         const symbolCollection = addr.isSplit ? addr.code : collectionName;
 
         const innerRerank = this.buildInnerRerankStrategy(
-            !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0),
+            this.queriesLearnedSparse(queryEmbedding),
             channelWeights,
         );
 
@@ -2184,7 +2198,7 @@ export class Context {
                 const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
                 console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
                 const innerRerank = this.buildInnerRerankStrategy(
-                    !!(queryEmbedding.sparse && queryEmbedding.sparse.indices.length > 0),
+                    this.queriesLearnedSparse(queryEmbedding),
                     routedChannelWeights,
                 );
                 const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
