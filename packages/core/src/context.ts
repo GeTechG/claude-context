@@ -22,6 +22,19 @@ import {
 } from './vectordb';
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
+import {
+    ChunkContextHeaderMode,
+    ChunkContextFile,
+    INDEX_TEXT_MAX_BYTES,
+    resolveChunkContextHeaderMode,
+    describeWithHeaderMode,
+    headerModeFromDescription,
+    buildChunkContextHeader,
+    withChunkContextHeader,
+    truncateUtf8,
+    loadChunkContextFile,
+    assertChunkContextCoverage,
+} from './utils/chunk-context-header';
 import { classifyQuery, weightsForIntent, parseQualifiedName, parseSingleSymbol, isComparisonShape } from './search/query-classifier';
 import { routeQuery, ChannelWeights, QueryShape } from './search/query-router';
 import { buildSymbolFilter } from './search/symbol-routing';
@@ -344,6 +357,12 @@ export class Context {
         skipped: { symbol: string; document_frequency: number; hop: number }[];
         skipped_total: number;
     } = { activations: 0, source: null, bound_documents: null, policy_quantile: null, skipped: [], skipped_total: 0 };
+    // pilot-chunk-context-headers: the context file of a `generated` build,
+    // loaded once; the header counters of the current indexing run; and the
+    // header mode each searched collection records, for the retrieval stamp.
+    private chunkContextFile: ChunkContextFile | null = null;
+    private chunkContextReport = { missing_contexts: 0, header_truncated_embedding: 0, header_truncated_index_text: 0 };
+    private searchedHeaderModes = new Map<string, string>();
 
     constructor(config: ContextConfig = {}) {
         // Initialize services
@@ -475,6 +494,49 @@ export class Context {
     private embeddingForPool(pool: 'code' | 'prose'): Embedding {
         if (pool === 'prose' && this.proseEmbedding) return this.proseEmbedding;
         return this.embedding;
+    }
+
+    /** pilot-chunk-context-headers: CHUNK_CONTEXT_HEADER, refused when unreadable. */
+    private getChunkContextHeaderMode(): ChunkContextHeaderMode {
+        return resolveChunkContextHeaderMode(envManager.get('CHUNK_CONTEXT_HEADER'));
+    }
+
+    private getChunkContexts(): ChunkContextFile {
+        if (!this.chunkContextFile) this.chunkContextFile = loadChunkContextFile(envManager.get('CHUNK_CONTEXT_FILE'));
+        return this.chunkContextFile;
+    }
+
+    /**
+     * Refuse to write into a collection built under another header mode: its
+     * rows would mix two indexed texts (and the BM25 input field would be
+     * missing on one side).
+     */
+    private async assertCollectionHeaderMode(collectionName: string, mode: ChunkContextHeaderMode): Promise<void> {
+        const recorded = headerModeFromDescription(await this.vectorDatabase.getCollectionDescription(collectionName));
+        if (recorded !== mode) {
+            throw new Error(`[Context] collection ${collectionName} was built with CHUNK_CONTEXT_HEADER=${recorded}; this run indexes with ${mode}`);
+        }
+    }
+
+    /**
+     * The header mode recorded on each collection a search read, keyed by
+     * collection name. Read from the collections, never from the environment,
+     * so an artifact states what its index was built with.
+     */
+    getChunkContextHeaderModes(): Record<string, string> {
+        return Object.fromEntries([...this.searchedHeaderModes.entries()].sort(([a], [b]) => a.localeCompare(b)));
+    }
+
+    private async noteSearchedHeaderModes(codebasePath: string): Promise<void> {
+        const addr = this.getCollectionAddress(codebasePath);
+        for (const name of new Set([addr.code, addr.prose])) {
+            if (this.searchedHeaderModes.has(name)) continue;
+            try {
+                this.searchedHeaderModes.set(name, headerModeFromDescription(await this.vectorDatabase.getCollectionDescription(name)));
+            } catch (error) {
+                console.warn(`[Context] ⚠️ could not read the header mode of ${name}: ${error}`);
+            }
+        }
     }
 
     /**
@@ -1530,11 +1592,14 @@ export class Context {
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
         requestSplitter?: Splitter
-    ): Promise<{ indexedFiles: number; totalChunks: number; droppedChunks: number; status: 'completed' | 'limit_reached' }> {
+    ): Promise<{ indexedFiles: number; totalChunks: number; droppedChunks: number; status: 'completed' | 'limit_reached'; chunkContextHeader?: { mode: ChunkContextHeaderMode; missing_contexts: number; header_truncated_embedding: number; header_truncated_index_text: number } }> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🚀 Starting to index codebase with ${searchType}: ${codebasePath}`);
         const splitter = requestSplitter || this.codeSplitter;
+        // pilot-chunk-context-headers: an unreadable mode is refused before anything runs.
+        const headerMode = this.getChunkContextHeaderMode();
+        this.chunkContextReport = { missing_contexts: 0, header_truncated_embedding: 0, header_truncated_index_text: 0 };
 
         // 1. Compute ignore patterns for this codebase/request without
         // retaining file-based patterns from previous codebases.
@@ -1558,6 +1623,10 @@ export class Context {
             (splitter as any).setMentionedVocabProvider?.(vocabProvider);
         } catch {
             // Vocab is best-effort; never block indexing on its absence.
+        }
+
+        if (headerMode === 'generated') {
+            await this.checkChunkContextFile(codebasePath, await this.getCodeFiles(codebasePath, ignorePatterns, this.getEffectiveSupportedExtensions(additionalSupportedExtensions)), splitter);
         }
 
         // 2. Check and prepare vector collection
@@ -1634,7 +1703,13 @@ export class Context {
             percentage: 100
         });
 
+        if (headerMode !== 'off') {
+            const r = this.chunkContextReport;
+            console.log(`[Context] 🏷️  CHUNK_CONTEXT_HEADER=${headerMode}: ${r.missing_contexts} chunk(s) without a context, ${r.header_truncated_embedding} embedding input(s) and ${r.header_truncated_index_text} index_text value(s) truncated because of the header`);
+        }
+
         return {
+            ...(headerMode !== 'off' ? { chunkContextHeader: { mode: headerMode, ...this.chunkContextReport } } : {}),
             indexedFiles: result.processedFiles,
             totalChunks: result.totalChunks,
             droppedChunks: result.droppedChunks,
@@ -1658,6 +1733,12 @@ export class Context {
         const deletionTargets = addr.isSplit ? [addr.prose, addr.code] : [collectionName];
         const synchronizer = this.synchronizers.get(collectionName);
         const splitter = requestSplitter || this.codeSplitter;
+        // pilot-chunk-context-headers: before any chunk is deleted, refuse to
+        // update a collection built under another header mode.
+        const headerMode = this.getChunkContextHeaderMode();
+        for (const target of deletionTargets) {
+            if (await this.vectorDatabase.hasCollection(target)) await this.assertCollectionHeaderMode(target, headerMode);
+        }
 
         if (!synchronizer) {
             // Recreate the synchronizer with the same request-scoped options that
@@ -1802,6 +1883,7 @@ export class Context {
             console.log(`[Context] ⚠️  Collection '${collectionName}' does not exist. Please index the codebase first.`);
             return [];
         }
+        await this.noteSearchedHeaderModes(codebasePath);
 
         if (isHybrid === true) {
             try {
@@ -3321,10 +3403,12 @@ export class Context {
             return d;
         };
 
+        const headerMode = this.getChunkContextHeaderMode();
         for (const { name: collectionName, label } of targets) {
             const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
 
             if (collectionExists && !forceReindex) {
+                await this.assertCollectionHeaderMode(collectionName, headerMode);
                 console.log(`📋 Collection ${collectionName} (${label}) already exists, skipping creation`);
                 continue;
             }
@@ -3346,9 +3430,11 @@ export class Context {
             // (prose-embedding-swap task 2.4). Only added in split mode so the
             // legacy single-collection description stays byte-stable.
             const denseModelLabel = (collectionEmbedding as any).getModel?.() ?? collectionEmbedding.getProvider();
-            const description = addr.isSplit
+            // pilot-chunk-context-headers: the header mode is appended only
+            // when it is not `off`, so an `off` description is unchanged.
+            const description = describeWithHeaderMode(addr.isSplit
                 ? `codebasePath:${codebasePath};dense_model:${denseModelLabel};dense_dim:${dimension}`
-                : `codebasePath:${codebasePath}`;
+                : `codebasePath:${codebasePath}`, headerMode);
 
             if (isHybrid === true) {
                 const enableLearnedSparse = this.embedding.hasSparse();
@@ -3356,7 +3442,7 @@ export class Context {
                     collectionName,
                     dimension,
                     description,
-                    { enableLearnedSparse },
+                    headerMode === 'off' ? { enableLearnedSparse } : { enableLearnedSparse, indexText: true },
                 );
             } else {
                 await this.vectorDatabase.createCollection(collectionName, dimension, description);
@@ -3455,36 +3541,13 @@ export class Context {
             }
 
             try {
-                let content = await fs.promises.readFile(filePath, 'utf-8');
-                let language = this.getLanguageFromExtension(path.extname(filePath));
-
-                // Class-reference XML (Godot's `doc/classes/*.xml`) carries the
-                // API prose and the GDScript/C# examples that exist nowhere in
-                // the C++ sources. Rewrite it to Markdown so it lands in the
-                // prose pool with a heading path; any other XML is metadata and
-                // is skipped rather than indexed as markup.
-                if (language === 'xml') {
-                    const markdown = classDocXmlToMarkdown(content);
-                    if (markdown === null) {
-                        processedFiles++;
-                        onFileProcessed?.(filePath, i + 1, filePaths.length);
-                        continue;
-                    }
-                    content = markdown;
-                    language = 'markdown';
+                const split = await this.splitFileForIndex(filePath, splitter, CHUNK_MAX_BYTES, true);
+                if (split === null) {
+                    processedFiles++;
+                    onFileProcessed?.(filePath, i + 1, filePaths.length);
+                    continue;
                 }
-
-                const rawChunks = await splitter.split(content, language, filePath);
-                const chunks = enforceChunkByteLimit(rawChunks, {
-                    maxBytes: CHUNK_MAX_BYTES,
-                    onOversized: (info) => {
-                        console.warn(
-                            `[Context] ✂️  Oversized chunk in ${info.filePath || filePath} at line ${info.startLine}: ` +
-                            `${info.bytes}B > ${CHUNK_MAX_BYTES}B → split into ${info.parts} part(s)` +
-                            (info.truncatedBytes > 0 ? `, ${info.truncatedBytes}B truncated` : ''),
-                        );
-                    },
-                });
+                const { content, chunks } = split;
 
                 // Log files with many chunks or large content
                 if (chunks.length > 50) {
@@ -3554,6 +3617,94 @@ export class Context {
     }
 
     /**
+     * The chunks one file is indexed as, or null for a file that is skipped
+     * (non-class-reference XML). Shared by the indexing loop and the
+     * `generated` build's chunk-set check, so both see the same chunks.
+     */
+    private async splitFileForIndex(filePath: string, splitter: Splitter, maxBytes: number, logOversized: boolean): Promise<{ content: string; chunks: CodeChunk[] } | null> {
+        let content = await fs.promises.readFile(filePath, 'utf-8');
+        let language = this.getLanguageFromExtension(path.extname(filePath));
+
+        // Class-reference XML (Godot's `doc/classes/*.xml`) carries the
+        // API prose and the GDScript/C# examples that exist nowhere in
+        // the C++ sources. Rewrite it to Markdown so it lands in the
+        // prose pool with a heading path; any other XML is metadata and
+        // is skipped rather than indexed as markup.
+        if (language === 'xml') {
+            const markdown = classDocXmlToMarkdown(content);
+            if (markdown === null) return null;
+            content = markdown;
+            language = 'markdown';
+        }
+
+        const rawChunks = await splitter.split(content, language, filePath);
+        const chunks = enforceChunkByteLimit(rawChunks, {
+            maxBytes,
+            onOversized: logOversized ? (info) => {
+                console.warn(
+                    `[Context] ✂️  Oversized chunk in ${info.filePath || filePath} at line ${info.startLine}: ` +
+                    `${info.bytes}B > ${maxBytes}B → split into ${info.parts} part(s)` +
+                    (info.truncatedBytes > 0 ? `, ${info.truncatedBytes}B truncated` : ''),
+                );
+            } : undefined,
+        });
+        return { content, chunks };
+    }
+
+    /**
+     * pilot-chunk-context-headers: a `generated` build refuses, before any
+     * collection is touched, a context file generated over another chunk set
+     * or covering too few of the chunks this build will index.
+     */
+    private async checkChunkContextFile(codebasePath: string, codeFiles: string[], splitter: Splitter): Promise<void> {
+        const maxBytes = Math.max(1, parseInt(envManager.get('CHUNK_MAX_BYTES') || String(MILVUS_CONTENT_MAX_BYTES), 10));
+        const ids = new Set<string>();
+        for (const filePath of codeFiles) {
+            let split: { chunks: CodeChunk[] } | null;
+            try {
+                split = await this.splitFileForIndex(filePath, splitter, maxBytes, false);
+            } catch {
+                continue; // the indexing loop skips an unreadable file the same way
+            }
+            if (!split) continue;
+            const relativePath = path.relative(codebasePath, filePath);
+            for (const chunk of split.chunks) {
+                ids.add(this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content, chunk.metadata.part));
+            }
+        }
+        const { covered, total } = assertChunkContextCoverage(this.getChunkContexts(), ids);
+        console.log(`[Context] 🏷️  CHUNK_CONTEXT_FILE covers ${covered} of ${total} chunk ids`);
+    }
+
+    /**
+     * pilot-chunk-context-headers: the text the dense, learned-sparse and BM25
+     * channels read for one chunk under a header mode. `maxChars` is the
+     * embedder's truncation point, for counting chunks the header pushed past it.
+     */
+    private indexTextFor(chunk: CodeChunk, codebasePath: string, mode: ChunkContextHeaderMode, maxChars: number): { embed: string; indexText: string } {
+        const meta = chunk.metadata as any;
+        const relativePath = path.relative(codebasePath, meta.filePath || '');
+        let context: string | undefined;
+        if (mode === 'generated') {
+            const id = this.generateId(relativePath, meta.startLine || 0, meta.endLine || 0, chunk.content, meta.part);
+            context = this.getChunkContexts().contexts.get(id);
+            if (!context) this.chunkContextReport.missing_contexts++;
+        }
+        const header = buildChunkContextHeader({
+            relativePath,
+            heading_path: meta.heading_path,
+            symbol_name: meta.symbol_name,
+            parent_symbol: meta.parent_symbol,
+            symbol_kind: meta.symbol_kind,
+        }, context);
+        const embed = withChunkContextHeader(header, chunk.content);
+        if (embed.length > maxChars && chunk.content.length <= maxChars) this.chunkContextReport.header_truncated_embedding++;
+        const indexText = truncateUtf8(embed, INDEX_TEXT_MAX_BYTES);
+        if (indexText !== embed && Buffer.byteLength(chunk.content, 'utf8') <= INDEX_TEXT_MAX_BYTES) this.chunkContextReport.header_truncated_index_text++;
+        return { embed, indexText };
+    }
+
+    /**
  * Process accumulated chunk buffer
  */
     private async processChunkBuffer(chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>): Promise<number> {
@@ -3614,8 +3765,17 @@ export class Context {
         // share the learned-sparse sidecar, so every chunk still carries the
         // learned-sparse lexical_weights for the sparse channel. Default path (no distinct
         // prose embedder) runs a single embedBatch — byte-identical to v6.
-        const chunkContents = chunks.map(chunk => chunk.content);
         const batchAddr = this.getCollectionAddress(codebasePath);
+        // pilot-chunk-context-headers: with a header mode the channels embed
+        // header + content; `off` embeds exactly the chunk text, as before.
+        const headerMode = this.getChunkContextHeaderMode();
+        const headerTexts = headerMode === 'off' ? null : chunks.map((chunk) => {
+            const ct = (chunk.metadata as any).content_type as string | undefined;
+            const pool: 'code' | 'prose' = batchAddr.isSplit && this.resolveChunkCollection(ct, batchAddr) === batchAddr.prose ? 'prose' : 'code';
+            const maxTokens = (this.embeddingForPool(pool) as any).maxTokens;
+            return this.indexTextFor(chunk, codebasePath, headerMode, typeof maxTokens === 'number' ? maxTokens * 4 : Infinity);
+        });
+        const chunkContents = headerTexts ? headerTexts.map((t) => t.embed) : chunks.map(chunk => chunk.content);
         let embeddings: EmbeddingVector[];
         if (batchAddr.isSplit && this.hasDistinctProseEmbedding()) {
             const proseIdx: number[] = [];
@@ -3735,6 +3895,7 @@ export class Context {
                     // Falsy when the embedding provider doesn't expose sparse;
                     // insertHybrid only attaches it when present and non-empty.
                     sparse_learned: embeddings[index].sparse,
+                    ...(headerTexts ? { index_text: headerTexts[index].indexText } : {}),
                 };
             });
 

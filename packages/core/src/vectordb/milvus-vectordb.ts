@@ -70,6 +70,7 @@ const JSON_ARRAY_VARCHARS = new Set(['imports', 'implements', 'mentioned_symbols
 export const UNCLAMPED_VARCHAR_LIMITS: Record<string, number> = {
     content: 65535,
     metadata: 65535,
+    index_text: 65535,
 };
 
 function clampVarcharField(field: string, value: any): any {
@@ -784,13 +785,26 @@ export class MilvusVectorDatabase implements VectorDatabase {
             });
         }
 
+        const indexText = Boolean(options?.indexText);
+        if (indexText) {
+            // pilot-chunk-context-headers: header + content for BM25. Sized at
+            // the VarChar ceiling; the indexer truncates the tail to fit.
+            schema.push({
+                name: 'index_text',
+                description: 'Chunk context header + content, the BM25 input',
+                data_type: DataType.VarChar,
+                max_length: 65535,
+                enable_analyzer: true,
+            });
+        }
+
         // Add BM25 function
         const functions = [
             {
                 name: "content_bm25_emb",
                 description: "content bm25 function",
                 type: FunctionType.BM25,
-                input_field_names: ["content"],
+                input_field_names: [indexText ? "index_text" : "content"],
                 output_field_names: ["sparse_vector"],
                 params: {},
             },
@@ -904,6 +918,11 @@ export class MilvusVectorDatabase implements VectorDatabase {
             // "skip when empty" guard never surfaced as an insert failure.
             if (doc.sparse_learned) {
                 row.sparse_learned = sparseToDict(doc.sparse_learned);
+            }
+            // pilot-chunk-context-headers: only rows of a header build carry it,
+            // so an `off` row keeps exactly today's fields.
+            if (doc.index_text !== undefined) {
+                row.index_text = doc.index_text;
             }
             return clampRow(row);
         });

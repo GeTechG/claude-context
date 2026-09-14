@@ -28,6 +28,9 @@ export interface VectorDocument {
     extends?: string;
     implements?: string;
     mentioned_symbols?: string;
+    // pilot-chunk-context-headers: header + content, the BM25 input of a
+    // collection built with a chunk context header. Absent on every `off` row.
+    index_text?: string;
 }
 
 /**
@@ -82,6 +85,10 @@ export interface HybridCollectionOptions {
     // the BGE-M3 learned-sparse third channel. Default false to keep v1
     // collections (dense + BM25) on the same code path.
     enableLearnedSparse?: boolean;
+    // pilot-chunk-context-headers: add the analyzer-enabled `index_text`
+    // column (header + content) and point the BM25 function at it instead of
+    // `content`. Default false keeps today's schema.
+    indexText?: boolean;
 }
 
 export interface RerankStrategy {
