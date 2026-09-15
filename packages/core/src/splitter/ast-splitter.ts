@@ -283,96 +283,82 @@ export class AstCodeSplitter implements Splitter {
         return undefined;
     }
 
-    private async refineChunks(chunks: CodeChunk[], originalCode: string): Promise<CodeChunk[]> {
-        const refinedChunks: CodeChunk[] = [];
-
+    private async refineChunks(chunks: CodeChunk[], _originalCode: string): Promise<CodeChunk[]> {
+        const refined: CodeChunk[] = [];
         for (const chunk of chunks) {
-            if (chunk.content.length <= this.chunkSize) {
-                refinedChunks.push(chunk);
-            } else {
-                // Split large chunks using character-based splitting
-                const subChunks = this.splitLargeChunk(chunk, originalCode);
-                refinedChunks.push(...subChunks);
-            }
+            if (chunk.content.length <= this.chunkSize) refined.push(chunk);
+            else refined.push(...this.splitLargeChunk(chunk));
         }
-
-        return this.addOverlap(refinedChunks);
+        return collapseIdenticalChunks(refined);
     }
 
-    private splitLargeChunk(chunk: CodeChunk, _originalCode: string): CodeChunk[] {
+    /**
+     * Cut a node longer than `chunkSize` into pieces on line boundaries.
+     *
+     * fix-code-chunk-line-ranges: a piece is a span of the node's lines, so its
+     * range always locates its text — the range is computed after the trim
+     * (D3), and the overlap with the previous piece is whole lines of that
+     * piece's span within `chunkOverlap` characters (D2). Overlap never crosses
+     * into another node: before this, every chunk got the last 300 characters
+     * of whatever chunk was emitted before it — often the enclosing class —
+     * and `startLine` was moved back by a line count that did not match.
+     */
+    private splitLargeChunk(chunk: CodeChunk): CodeChunk[] {
         const lines = chunk.content.split('\n');
-        const subChunks: CodeChunk[] = [];
-        let currentChunk = '';
-        let currentStartLine = chunk.metadata.startLine;
-        let currentLineCount = 0;
 
-        // Sub-chunks inherit content_type / symbol info from the parent AST node so
-        // every piece keeps its semantic tag after large-chunk splitting.
-        const inheritedMetadata = (startLine: number, endLine: number) => ({
-            ...chunk.metadata,
-            startLine,
-            endLine,
-        });
-
+        // Piece boundaries as before the fix: add lines until the next one
+        // would push the piece past chunkSize. `to` is exclusive.
+        const spans: Array<{ from: number; to: number }> = [];
+        let from = 0;
+        let length = 0;
         for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            const lineWithNewline = i === lines.length - 1 ? line : line + '\n';
-
-            if (currentChunk.length + lineWithNewline.length > this.chunkSize && currentChunk.length > 0) {
-                subChunks.push({
-                    content: currentChunk.trim(),
-                    metadata: inheritedMetadata(currentStartLine, currentStartLine + currentLineCount - 1),
-                });
-
-                currentChunk = lineWithNewline;
-                currentStartLine = chunk.metadata.startLine + i;
-                currentLineCount = 1;
-            } else {
-                currentChunk += lineWithNewline;
-                currentLineCount++;
+            const lineLength = lines[i].length + (i === lines.length - 1 ? 0 : 1);
+            if (length + lineLength > this.chunkSize && length > 0) {
+                spans.push({ from, to: i });
+                from = i;
+                length = 0;
             }
+            length += lineLength;
         }
+        spans.push({ from, to: lines.length });
 
-        if (currentChunk.trim().length > 0) {
+        const subChunks: CodeChunk[] = [];
+        for (let k = 0; k < spans.length; k++) {
+            const { to } = spans[k];
+            let spanFrom = spans[k].from;
+            if (k > 0 && this.chunkOverlap > 0) {
+                // Whole trailing lines of the previous piece, within the budget,
+                // leaving at least one of its lines out of the overlap.
+                const previous = spans[k - 1];
+                let budget = this.chunkOverlap;
+                let overlapFrom = previous.to;
+                while (overlapFrom - 1 > previous.from) {
+                    const cost = lines[overlapFrom - 1].length + 1;
+                    if (cost > budget) break;
+                    budget -= cost;
+                    overlapFrom--;
+                }
+                spanFrom = overlapFrom;
+            }
+
+            const raw = lines.slice(spanFrom, to).join('\n');
+            const content = raw.trim();
+            if (content.length === 0) continue;
+            const trimmedHead = raw.slice(0, raw.length - raw.trimStart().length);
+            const startLine = chunk.metadata.startLine + spanFrom + countNewlines(trimmedHead);
             subChunks.push({
-                content: currentChunk.trim(),
-                metadata: inheritedMetadata(currentStartLine, currentStartLine + currentLineCount - 1),
+                content,
+                // Sub-chunks inherit content_type / symbol info from the parent
+                // AST node so every piece keeps its semantic tag.
+                metadata: {
+                    ...chunk.metadata,
+                    startLine,
+                    endLine: startLine + countNewlines(content),
+                },
             });
         }
 
         return subChunks;
-    }
-
-    private addOverlap(chunks: CodeChunk[]): CodeChunk[] {
-        if (chunks.length <= 1 || this.chunkOverlap <= 0) {
-            return chunks;
-        }
-
-        const overlappedChunks: CodeChunk[] = [];
-
-        for (let i = 0; i < chunks.length; i++) {
-            let content = chunks[i].content;
-            const metadata = { ...chunks[i].metadata };
-
-            // Add overlap from previous chunk
-            if (i > 0 && this.chunkOverlap > 0) {
-                const prevChunk = chunks[i - 1];
-                const overlapText = prevChunk.content.slice(-this.chunkOverlap);
-                content = overlapText + '\n' + content;
-                metadata.startLine = Math.max(1, metadata.startLine - this.getLineCount(overlapText));
-            }
-
-            overlappedChunks.push({
-                content,
-                metadata
-            });
-        }
-
-        return overlappedChunks;
-    }
-
-    private getLineCount(text: string): number {
-        return text.split('\n').length;
     }
 
     /**
@@ -399,4 +385,33 @@ export class AstCodeSplitter implements Splitter {
         'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala',
         'haxe', 'hx', 'hxml'
     ];
+}
+
+function countNewlines(text: string): number {
+    let count = 0;
+    for (let i = text.indexOf('\n'); i !== -1; i = text.indexOf('\n', i + 1)) count++;
+    return count;
+}
+
+/**
+ * fix-code-chunk-line-ranges (D4): chunks with the same range and text hash to
+ * the same chunk id. They come from nested nodes — a class and a method both cut
+ * into pieces, or a JS/TS `export_statement` and the declaration it wraps, which
+ * span the same lines. Nodes are emitted before their descendants, so the later
+ * copy is the inner node, with the specific symbol: it takes the earlier slot.
+ */
+function collapseIdenticalChunks(chunks: CodeChunk[]): CodeChunk[] {
+    const slot = new Map<string, number>();
+    const out: CodeChunk[] = [];
+    for (const chunk of chunks) {
+        const key = `${chunk.metadata.startLine}:${chunk.metadata.endLine}:${chunk.content}`;
+        const at = slot.get(key);
+        if (at === undefined) {
+            slot.set(key, out.length);
+            out.push(chunk);
+        } else {
+            out[at] = chunk;
+        }
+    }
+    return out;
 }

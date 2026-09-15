@@ -223,6 +223,27 @@ export function enforceChunkByteLimit(
     if (!oversized) return chunks;
 
     const out: CodeChunk[] = [];
-    for (const chunk of chunks) out.push(...splitOversizedChunk(chunk, options));
+    const seen = new Map<string, number>();
+    for (const chunk of chunks) {
+        for (const piece of splitOversizedChunk(chunk, options)) {
+            // fix-code-chunk-line-ranges: one oversized line inside both a class
+            // and a method is split in both, and parts cut mid-line can coincide
+            // in range, part and text even when the two chunks did not — the
+            // same chunk id twice. Splitters emit a node before its descendants,
+            // so the later copy comes from the narrower node: it takes the slot.
+            if (!piece.metadata.part) {
+                out.push(piece);
+                continue;
+            }
+            const key = `${piece.metadata.startLine}:${piece.metadata.endLine}:${piece.metadata.part}:${piece.content}`;
+            const at = seen.get(key);
+            if (at === undefined) {
+                seen.set(key, out.length);
+                out.push(piece);
+            } else {
+                out[at] = piece;
+            }
+        }
+    }
     return out;
 }

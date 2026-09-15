@@ -68,6 +68,13 @@ export class MarkdownSplitter implements Splitter {
                 let lineCursor = block.startLine;
                 for (const piece of subChunks) {
                     const lineCount = piece.split('\n').length;
+                    // fix-code-chunk-line-ranges: a blank line before a line
+                    // longer than chunkSize came out as an empty piece — an
+                    // empty chunk locates no text and embeds nothing.
+                    if (piece.trim().length === 0) {
+                        lineCursor += lineCount;
+                        continue;
+                    }
                     const mentioned = extractMentionedSymbolsFromText(piece, vocab);
                     chunks.push({
                         content: piece,
