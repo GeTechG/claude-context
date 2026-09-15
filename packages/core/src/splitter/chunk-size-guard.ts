@@ -202,8 +202,9 @@ export function splitOversizedChunk(
 }
 
 /**
- * Enforce the byte ceiling over a whole chunk list. Order is preserved and
- * chunks that already fit are passed through by reference.
+ * Enforce the byte ceiling over a whole chunk list, dropping empty chunks.
+ * Order is preserved and chunks that already fit are passed through by
+ * reference.
  */
 export function enforceChunkByteLimit(
     chunks: CodeChunk[],
@@ -212,6 +213,13 @@ export function enforceChunkByteLimit(
     const maxBytes = options.maxBytes ?? MILVUS_CONTENT_MAX_BYTES;
     if (!Number.isFinite(maxBytes) || maxBytes < 4) {
         throw new RangeError(`chunk-size-guard: maxBytes must be at least 4, got ${maxBytes}`);
+    }
+    // fix-code-chunk-line-ranges: an empty or whitespace-only chunk locates no
+    // text and embeds nothing. Every splitter's whole-file fallback emitted one
+    // for a zero-byte file (three rows in the v8l1 audit), so the stream drops
+    // them here, once, for every splitter.
+    if (chunks.some((chunk) => chunk.content.trim().length === 0)) {
+        chunks = chunks.filter((chunk) => chunk.content.trim().length > 0);
     }
     let oversized = false;
     for (const chunk of chunks) {
