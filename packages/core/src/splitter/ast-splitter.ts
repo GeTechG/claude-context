@@ -11,7 +11,6 @@ import {
     NODE_TYPE_TO_SYMBOL_KIND,
     PARAMETER_LIST_NODE_TYPES,
     PARENT_SCOPE_NODE_TYPES,
-    WRAPPER_NODE_TYPES,
 } from './grammar-registry';
 
 // Symbol kinds that declare a type (grammar-registry kinds); inside a function body they stay chunks.
@@ -160,7 +159,10 @@ export class AstCodeSplitter implements Splitter {
             const kind = NODE_TYPE_TO_SYMBOL_KIND[currentNode.type];
             const emit = isSplittable && (!insideBody
                 || (Boolean(this.extractSymbolName(currentNode)) && (TYPE_SYMBOL_KINDS.has(kind) || hasParameterList(currentNode))));
-            const bodyForChildren = insideBody || (isSplittable && (kind === 'function' || kind === 'method') && !WRAPPER_NODE_TYPES.has(currentNode.type) && opensBody(currentNode, splittableTypes));
+            // A body is the node's own `body` field. Wrappers (`export …`), declarations holding a
+            // type (C++ `field_declaration` → `struct`) and OCaml `let` bindings have none, so OCaml
+            // chunks as before: a local `let result = if … in` answered an exact-symbol query (u213).
+            const bodyForChildren = insideBody || (isSplittable && (kind === 'function' || kind === 'method') && currentNode.childForFieldName('body') !== null);
 
             if (emit) {
                 const startLine = currentNode.startPosition.row + 1;
@@ -398,19 +400,6 @@ export class AstCodeSplitter implements Splitter {
         'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala',
         'haxe', 'hx', 'hxml'
     ];
-}
-
-/**
- * A function or method node's descendants are inside its body when it has a `body` field,
- * or a direct child that is not itself splittable has one (OCaml `value_definition` →
- * `let_binding`). A wrapper (`export_statement`, registered as one) opens no body, whatever
- * it wraps — `export namespace N {…}` holds declarations, not statements. A declaration whose
- * child is a type with a body (C++ `field_declaration` → `struct_specifier`) opens none either:
- * that child is splittable and decides for itself.
- */
-function opensBody(node: Parser.SyntaxNode, splittableTypes: string[]): boolean {
-    if (node.childForFieldName('body')) return true;
-    return node.namedChildren.some((child) => !splittableTypes.includes(child.type) && child.childForFieldName('body') !== null);
 }
 
 /** A parameter list among the node's descendants within four levels, not looking into its body. */
