@@ -9,8 +9,13 @@ import {
     getSplittableTypes,
     loadLanguage,
     NODE_TYPE_TO_SYMBOL_KIND,
+    PARAMETER_LIST_NODE_TYPES,
     PARENT_SCOPE_NODE_TYPES,
+    WRAPPER_NODE_TYPES,
 } from './grammar-registry';
+
+// Symbol kinds that declare a type (grammar-registry kinds); inside a function body they stay chunks.
+const TYPE_SYMBOL_KINDS = new Set(['class', 'enum', 'interface', 'typedef', 'abstract']);
 
 // Terminal identifier node types at the end of a C/C++ declarator chain.
 const DECLARATOR_NAME_TYPES = new Set([
@@ -145,11 +150,19 @@ export class AstCodeSplitter implements Splitter {
         // extends/implements are computed inline below per node.
         const fileStructural = extractStructural(node, language);
 
-        const traverse = (currentNode: Parser.SyntaxNode, parentScope?: string) => {
+        // no-chunks-inside-function-bodies: inside a function body only a named type declaration
+        // or a named function with a parameter list becomes a chunk — not `int i = 0;`,
+        // `let n = … in` or a callback. Types stay because a class the parser misreads as a
+        // function (`class CC_DLL Foo {…}`) holds its public enums and nested classes in that body.
+        const traverse = (currentNode: Parser.SyntaxNode, parentScope?: string, insideBody = false) => {
             const isSplittable = splittableTypes.includes(currentNode.type);
             let scopeForChildren = parentScope;
+            const kind = NODE_TYPE_TO_SYMBOL_KIND[currentNode.type];
+            const emit = isSplittable && (!insideBody
+                || (Boolean(this.extractSymbolName(currentNode)) && (TYPE_SYMBOL_KINDS.has(kind) || hasParameterList(currentNode))));
+            const bodyForChildren = insideBody || (isSplittable && (kind === 'function' || kind === 'method') && !WRAPPER_NODE_TYPES.has(currentNode.type) && opensBody(currentNode, splittableTypes));
 
-            if (isSplittable) {
+            if (emit) {
                 const startLine = currentNode.startPosition.row + 1;
                 const endLine = currentNode.endPosition.row + 1;
                 const nodeText = code.slice(currentNode.startIndex, currentNode.endIndex);
@@ -211,7 +224,7 @@ export class AstCodeSplitter implements Splitter {
             }
 
             for (const child of currentNode.children) {
-                traverse(child, scopeForChildren);
+                traverse(child, scopeForChildren, bodyForChildren);
             }
         };
 
@@ -385,6 +398,31 @@ export class AstCodeSplitter implements Splitter {
         'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala',
         'haxe', 'hx', 'hxml'
     ];
+}
+
+/**
+ * A function or method node's descendants are inside its body when it has a `body` field,
+ * or a direct child that is not itself splittable has one (OCaml `value_definition` →
+ * `let_binding`). A wrapper (`export_statement`, registered as one) opens no body, whatever
+ * it wraps — `export namespace N {…}` holds declarations, not statements. A declaration whose
+ * child is a type with a body (C++ `field_declaration` → `struct_specifier`) opens none either:
+ * that child is splittable and decides for itself.
+ */
+function opensBody(node: Parser.SyntaxNode, splittableTypes: string[]): boolean {
+    if (node.childForFieldName('body')) return true;
+    return node.namedChildren.some((child) => !splittableTypes.includes(child.type) && child.childForFieldName('body') !== null);
+}
+
+/** A parameter list among the node's descendants within four levels, not looking into its body. */
+function hasParameterList(node: Parser.SyntaxNode, depth = 0): boolean {
+    if (depth > 4) return false;
+    const body = node.childForFieldName('body');
+    for (const child of node.children) {
+        if (PARAMETER_LIST_NODE_TYPES.has(child.type)) return true;
+        if (body && child.id === body.id) continue;
+        if (hasParameterList(child, depth + 1)) return true;
+    }
+    return false;
 }
 
 function countNewlines(text: string): number {

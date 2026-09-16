@@ -29,6 +29,11 @@ export interface NodeKindSpec {
     kind?: string;
     /** Node introduces a symbol scope inherited by descendants as parent_symbol. */
     parentScope?: boolean;
+    /**
+     * Node only wraps a declaration (`export …`, a decorator): it never opens a function body,
+     * whatever its child holds (no-chunks-inside-function-bodies).
+     */
+    wrapper?: boolean;
 }
 
 export interface GrammarSpec {
@@ -48,13 +53,14 @@ const cls = (): NodeKindSpec => ({ kind: 'class', parentScope: true });
 const iface = (): NodeKindSpec => ({ kind: 'interface', parentScope: true });
 const enm = (): NodeKindSpec => ({ kind: 'enum', parentScope: true });
 const typedef = (): NodeKindSpec => ({ kind: 'typedef' });
+const wrapper = (): NodeKindSpec => ({ kind: 'function', wrapper: true });
 
 export const GRAMMARS: GrammarSpec[] = [
     {
         langs: ['javascript', 'js'],
         module: 'tree-sitter-javascript',
         nodes: {
-            function_declaration: fn(), arrow_function: fn(), export_statement: fn(),
+            function_declaration: fn(), arrow_function: fn(), export_statement: wrapper(),
             method_definition: method(), class_declaration: cls(),
         },
     },
@@ -62,7 +68,7 @@ export const GRAMMARS: GrammarSpec[] = [
         langs: ['typescript', 'ts'],
         module: 'tree-sitter-typescript', export: 'typescript',
         nodes: {
-            function_declaration: fn(), arrow_function: fn(), export_statement: fn(),
+            function_declaration: fn(), arrow_function: fn(), export_statement: wrapper(),
             method_definition: method(), class_declaration: cls(),
             interface_declaration: iface(), type_alias_declaration: typedef(),
         },
@@ -71,7 +77,7 @@ export const GRAMMARS: GrammarSpec[] = [
         langs: ['python', 'py'],
         module: 'tree-sitter-python',
         nodes: {
-            function_definition: fn(), async_function_definition: fn(), decorated_definition: fn(),
+            function_definition: fn(), async_function_definition: fn(), decorated_definition: wrapper(),
             class_definition: cls(),
         },
     },
@@ -171,6 +177,14 @@ const splittableByLang = new Map<string, string[]>();
 export const NODE_TYPE_TO_SYMBOL_KIND: Record<string, string> = {};
 /** node types that introduce a parent symbol scope, merged across all grammars. */
 export const PARENT_SCOPE_NODE_TYPES = new Set<string>();
+/** node types that only wrap a declaration and never open a function body, merged across all grammars. */
+export const WRAPPER_NODE_TYPES = new Set<string>();
+/**
+ * no-chunks-inside-function-bodies: the parameter-list node types of the grammars above
+ * (JS/TS/Java `formal_parameters`, C/C++/Go/C# `parameter_list`, Python/Rust `parameters`,
+ * OCaml `parameter`). Inside a function body only a named node holding one becomes a chunk.
+ */
+export const PARAMETER_LIST_NODE_TYPES = new Set<string>(['parameter', 'parameters', 'formal_parameters', 'parameter_list']);
 
 for (const spec of GRAMMARS) {
     const splittable = Object.keys(spec.nodes);
@@ -181,6 +195,7 @@ for (const spec of GRAMMARS) {
     for (const [nodeType, meta] of Object.entries(spec.nodes)) {
         if (meta.kind) NODE_TYPE_TO_SYMBOL_KIND[nodeType] = meta.kind;
         if (meta.parentScope) PARENT_SCOPE_NODE_TYPES.add(nodeType);
+        if (meta.wrapper) WRAPPER_NODE_TYPES.add(nodeType);
     }
 }
 
