@@ -1835,6 +1835,7 @@ export class Context {
             if (await this.vectorDatabase.hasCollection(target)) await this.assertCollectionHeaderMode(target, headerMode);
         }
         const headerReport = () => (headerMode !== 'off' ? { chunkContextHeader: { mode: headerMode, ...this.chunkContextReport } } : {});
+        await this.assertSnapshotBaseline(codebasePath);
 
         if (!synchronizer) {
             // Recreate the synchronizer with the same request-scoped options that
@@ -1858,6 +1859,7 @@ export class Context {
         const totalChanges = added.length + removed.length + modified.length;
 
         if (totalChanges === 0) {
+            await FileSynchronizer.writeBaseline(codebasePath, deletionTargets);
             await preview.commit();
             progressCallback?.({ phase: 'No changes detected', current: 100, total: 100, percentage: 100 });
             console.log('[Context] ✅ No file changes detected.');
@@ -1865,6 +1867,8 @@ export class Context {
         }
 
         await this.assertWriteReady(codebasePath, deletionTargets, [...added, ...modified], { additionalIgnorePatterns, additionalSupportedExtensions, splitter });
+        // The record first: a commit without it would lose the change set to a failed write.
+        await FileSynchronizer.writeBaseline(codebasePath, deletionTargets);
         await preview.commit();
 
         console.log(`[Context] 🔄 Found changes: ${added.length} added, ${removed.length} removed, ${modified.length} modified.`);
@@ -1882,11 +1886,11 @@ export class Context {
             updateProgress(`Removed ${file}`);
         }
 
-        // Handle modified files
-        for (const file of modified) {
-            await this.deleteFileChunks(deletionTargets, file);
-            updateProgress(`Deleted old chunks for ${file}`);
-        }
+        // Handle modified and added files. #142: an added file may already have rows —
+        // a snapshot that predates the collections does not know it — and an insert
+        // does not replace rows with the same id.
+        await this.deleteFilesChunks(deletionTargets, [...modified, ...added]);
+        for (const file of [...modified, ...added]) updateProgress(`Deleted old chunks for ${file}`);
 
         // Handle added and modified files
         const filesToIndex = [...added, ...modified].map(f => path.join(codebasePath, f));
@@ -1934,6 +1938,27 @@ export class Context {
     }
 
     /**
+     * stale-snapshot-safe-updates (#143): refuse a change-set write whose merkle snapshot
+     * was taken against other collections (e.g. a promoted side build), before anything
+     * is deleted. A snapshot without a record predates it and is accepted.
+     */
+    async assertSnapshotBaseline(codebasePath: string): Promise<void> {
+        const addr = this.getCollectionAddress(codebasePath);
+        const targets = (addr.isSplit ? [addr.prose, addr.code] : [this.getCollectionName(codebasePath)]).sort();
+        const reseed = 'node infra/with-retrieval-env.js node infra/reindex-resume.js --reseed --seed-only';
+        let recorded: string[] | null;
+        try {
+            recorded = await FileSynchronizer.readBaseline(codebasePath);
+            if (recorded !== null && !(Array.isArray(recorded) && recorded.every((name) => typeof name === 'string'))) throw new Error('no collection list');
+        } catch (error: any) {
+            throw new Error(`[Context] The collections record of the merkle snapshot for ${codebasePath} is unreadable (${error.message}); re-seed the snapshot from the served collections: ${reseed}`);
+        }
+        if (recorded && recorded.join(',') !== targets.join(',')) {
+            throw new Error(`[Context] The merkle snapshot for ${codebasePath} was taken against ${recorded.join(', ')}, not ${targets.join(', ')}; re-seed it from the served collections first: ${reseed}`);
+        }
+    }
+
+    /**
      * Delete chunks for a single file across the active collection set.
      *
      * code-collection-split: in split mode a file's chunks may straddle
@@ -1943,6 +1968,23 @@ export class Context {
      * each provided target, so callers that already resolved the full
      * split set pass both; the legacy path passes a single name.
      */
+    /**
+     * The rows of many files, one query per collection per 500 paths: a single-path query
+     * costs ~400 ms on the served v8h2 collections (2026-09-17), a 500-path one ~270 ms.
+     */
+    async deleteFilesChunks(collectionNames: string[], relativePaths: string[]): Promise<void> {
+        const quote = (p: string) => `"${p.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+        for (let i = 0; i < relativePaths.length; i += 500) {
+            const batch = relativePaths.slice(i, i + 500);
+            for (const target of collectionNames) {
+                const rows = await this.vectorDatabase.query(target, `relativePath in [${batch.map(quote).join(', ')}]`, ['id']);
+                const ids = rows.map(r => r.id as string).filter(id => id);
+                for (let j = 0; j < ids.length; j += 5000) await this.vectorDatabase.delete(target, ids.slice(j, j + 5000));
+                if (ids.length) console.log(`[Context] Deleted ${ids.length} chunks of ${batch.length} file(s) (${target})`);
+            }
+        }
+    }
+
     private async deleteFileChunks(collectionNames: string | string[], relativePath: string): Promise<void> {
         const targets = Array.isArray(collectionNames) ? collectionNames : [collectionNames];
         const escapedPath = relativePath.replace(/\\/g, '\\\\');

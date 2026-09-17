@@ -347,9 +347,35 @@ export class FileSynchronizer {
     }
 
     /**
+     * stale-snapshot-safe-updates (#143): the collections a snapshot was taken against,
+     * in a file beside it (the snapshot JSON is rewritten by more than one writer).
+     */
+    static baselinePath(codebasePath: string): string {
+        const hash = crypto.createHash('md5').update(path.resolve(codebasePath)).digest('hex');
+        return path.join(os.homedir(), '.context', 'merkle', `${hash}.collections.json`);
+    }
+
+    /** The recorded collections, or null when the snapshot predates the record. */
+    static async readBaseline(codebasePath: string): Promise<string[] | null> {
+        try {
+            return JSON.parse(await fs.readFile(FileSynchronizer.baselinePath(codebasePath), 'utf-8')).collections;
+        } catch (error: any) {
+            if (error.code === 'ENOENT') return null;
+            throw error;
+        }
+    }
+
+    static async writeBaseline(codebasePath: string, collections: string[]): Promise<void> {
+        const file = FileSynchronizer.baselinePath(codebasePath);
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        await fs.writeFile(file, JSON.stringify({ collections: [...collections].sort() }), 'utf-8');
+    }
+
+    /**
      * Delete snapshot file for a given codebase path
      */
     static async deleteSnapshot(codebasePath: string): Promise<void> {
+        await fs.rm(FileSynchronizer.baselinePath(codebasePath), { force: true });
         const homeDir = os.homedir();
         const merkleDir = path.join(homeDir, '.context', 'merkle');
         const normalizedPath = path.resolve(codebasePath);
