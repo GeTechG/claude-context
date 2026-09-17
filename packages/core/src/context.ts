@@ -1555,6 +1555,19 @@ export class Context {
     }
 
     /**
+     * Every collection a codebase's index lives in (#152). Index STATE — does
+     * this codebase have an index, how big is it, is it lost, what does
+     * clearing it remove — is a question about all of them: in split mode an
+     * all-prose corpus has no code collection at all, and asking
+     * `getCollectionName` (the code side by convention) answered "not indexed"
+     * for an index holding every row on its prose side.
+     */
+    public collectionsOf(codebasePath: string): string[] {
+        const addr = this.getCollectionAddress(codebasePath);
+        return addr.isSplit ? [addr.prose, addr.code] : [addr.legacy];
+    }
+
+    /**
      * code-collection-split: returns the full collection-name set for the
      * given codebase under the active SPLIT_COLLECTIONS / COLLECTION_VERSION
      * env state.
@@ -2023,15 +2036,24 @@ export class Context {
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath}`);
 
-        const collectionName = this.getCollectionName(codebasePath);
-        console.log(`[Context] 🔍 Using collection: ${collectionName}`);
-
-        // Check if collection exists and has data
-        const hasCollection = await this.vectorDatabase.hasCollection(collectionName);
-        if (!hasCollection) {
-            console.log(`[Context] ⚠️  Collection '${collectionName}' does not exist. Please index the codebase first.`);
+        // The gate is the whole address (#152): the split pools below are already
+        // address-aware and degrade per pool, so a corpus whose code collection
+        // was never created is searched on its prose side instead of answering
+        // "not indexed" for an index that holds every row.
+        const present: string[] = [];
+        for (const name of this.collectionsOf(codebasePath)) {
+            if (await this.vectorDatabase.hasCollection(name)) present.push(name);
+        }
+        if (present.length === 0) {
+            console.log(`[Context] ⚠️  No collection of ${codebasePath} exists (${this.collectionsOf(codebasePath).join(', ')}). Please index the codebase first.`);
             return [];
         }
+        // The single-collection paths below (MULTI_QUERY=false, non-hybrid
+        // search) need ONE name: the conventional one while it is there — byte
+        // -stable for every existing index — otherwise the side that exists.
+        const preferred = this.getCollectionName(codebasePath);
+        const collectionName = present.includes(preferred) ? preferred : present[0];
+        console.log(`[Context] 🔍 Using collection: ${collectionName}`);
         await this.noteSearchedHeaderModes(codebasePath);
 
         if (isHybrid === true) {
@@ -3414,12 +3436,22 @@ export class Context {
 
     /**
      * Check if index exists for codebase
+     *
+     * Asks the WHOLE address (#152): in split mode a codebase's index is the
+     * prose and the code collection, and an all-prose corpus has an empty or
+     * absent code side. Asking only `getCollectionName` (the code name by
+     * convention) answered "not indexed" for a codebase whose prose collection
+     * held every row — and the MCP server's recovery, gated on this answer,
+     * never ran.
+     *
      * @param codebasePath Codebase path to check
      * @returns Whether index exists
      */
     async hasIndex(codebasePath: string): Promise<boolean> {
-        const collectionName = this.getCollectionName(codebasePath);
-        return await this.vectorDatabase.hasCollection(collectionName);
+        for (const name of this.collectionsOf(codebasePath)) {
+            if (await this.vectorDatabase.hasCollection(name)) return true;
+        }
+        return false;
     }
 
     /**
@@ -3435,13 +3467,18 @@ export class Context {
 
         progressCallback?.({ phase: 'Checking existing index...', current: 0, total: 100, percentage: 0 });
 
-        const collectionName = this.getCollectionName(codebasePath);
-        const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
+        // Clearing removes the WHOLE address (#152): dropping only the code side
+        // left the prose collection alive, and with an address-wide `hasIndex`
+        // the next search recovered the snapshot entry from those surviving rows
+        // — a cleared codebase resurrecting itself.
+        const names = this.collectionsOf(codebasePath);
 
         progressCallback?.({ phase: 'Removing index data...', current: 50, total: 100, percentage: 50 });
 
-        if (collectionExists) {
-            await this.vectorDatabase.dropCollection(collectionName);
+        for (const name of names) {
+            if (await this.vectorDatabase.hasCollection(name)) {
+                await this.vectorDatabase.dropCollection(name);
+            }
         }
 
         // Delete snapshot file

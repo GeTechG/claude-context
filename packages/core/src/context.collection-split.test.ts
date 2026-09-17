@@ -195,3 +195,69 @@ describe('prose-embedding-swap: embeddingForPool / hasDistinctProseEmbedding', (
         expect((ctx as any).embeddingForPool('code')).not.toBe(prose);
     });
 });
+
+// #152: index state is read across the WHOLE address. An all-prose corpus has
+// an empty or absent code collection; asking the code name alone answered "not
+// indexed" for an index whose prose side held every row.
+describe('index state is read across the whole collection address (#152)', () => {
+    const saved: Record<string, string | undefined> = {};
+
+    beforeEach(() => {
+        for (const name of ['SPLIT_COLLECTIONS', 'COLLECTION_VERSION', 'HYBRID_MODE']) saved[name] = process.env[name];
+        process.env.SPLIT_COLLECTIONS = 'true';
+        process.env.HYBRID_MODE = 'true';
+        delete process.env.COLLECTION_VERSION;
+    });
+
+    afterEach(() => {
+        for (const [name, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[name];
+            else process.env[name] = value;
+        }
+    });
+
+    it('a prose-only index answers indexed, although the code collection is absent', async () => {
+        const vdb = makeVectorDb();
+        const ctx = new Context({ embedding: new TestEmbedding(), vectorDatabase: vdb });
+        const addr = ctx.getCollectionAddress('/path/to/codebase');
+        expect(addr.isSplit).toBe(true);
+        vdb.hasCollection.mockImplementation(async (name: string) => name === addr.prose);
+
+        expect(await ctx.hasIndex('/path/to/codebase')).toBe(true);
+    });
+
+    it('neither collection present answers not indexed', async () => {
+        const vdb = makeVectorDb();
+        const ctx = new Context({ embedding: new TestEmbedding(), vectorDatabase: vdb });
+        const addr = ctx.getCollectionAddress('/path/to/codebase');
+        expect(addr.isSplit).toBe(true);
+        vdb.hasCollection.mockResolvedValue(false);
+
+        expect(await ctx.hasIndex('/path/to/codebase')).toBe(false);
+    });
+
+    it('a prose-only index is SEARCHED, not answered as "not indexed"', async () => {
+        const vdb = makeVectorDb();
+        const ctx = new Context({ embedding: new TestEmbedding(), vectorDatabase: vdb });
+        const addr = ctx.getCollectionAddress('/path/to/codebase');
+        vdb.hasCollection.mockImplementation(async (name: string) => name === addr.prose);
+
+        await ctx.semanticSearch('/path/to/codebase', 'anything', 5, 0.5);
+
+        // The gate used to return [] before any pool ran when the CODE side was
+        // absent; the search must reach the store instead.
+        expect(vdb.hybridSearch.mock.calls.length + vdb.search.mock.calls.length).toBeGreaterThan(0);
+    });
+
+    it('clearing an index drops every collection of the address', async () => {
+        const vdb = makeVectorDb();
+        const ctx = new Context({ embedding: new TestEmbedding(), vectorDatabase: vdb });
+        const addr = ctx.getCollectionAddress('/path/to/codebase');
+        vdb.hasCollection.mockResolvedValue(true);
+
+        await ctx.clearIndex('/path/to/codebase');
+
+        const dropped = vdb.dropCollection.mock.calls.map((call: any[]) => call[0]).sort();
+        expect(dropped).toEqual([addr.code, addr.prose].sort());
+    });
+});

@@ -86,7 +86,19 @@ export class ToolHandlers {
     }
 
     /**
-     * Query Milvus for the real row count of a codebase's collection.
+     * The collections a codebase's index actually lives in (#152). In split
+     * mode that is BOTH sides: an all-prose corpus has an empty or absent code
+     * collection, and reading index state from the code name alone answered
+     * "not indexed" for an index that holds every row on its prose side.
+     * `getCollectionName` keeps its own meaning — the write/synchronizer key.
+     */
+    private indexCollections(codebasePath: string): string[] {
+        return this.context.collectionsOf(codebasePath);
+    }
+
+    /**
+     * Query Milvus for the real row count of a codebase's index, summed over
+     * every collection of its address.
      * Returns null if the count cannot be determined — callers must NOT write a
      * snapshot entry in that case. Writing { indexedFiles: 0, totalChunks: 0,
      * status: 'completed' } for an unknown-state collection poisons the client:
@@ -95,14 +107,22 @@ export class ToolHandlers {
      */
     private async queryCollectionStats(codebasePath: string): Promise<{ indexedFiles: number; totalChunks: number } | null> {
         try {
-            const collectionName = this.context.getCollectionName(codebasePath);
-            const rowCount = await this.context.getVectorDatabase().getCollectionRowCount(collectionName);
-            if (rowCount < 0) {
-                console.warn(`[SNAPSHOT-RECOVERY] Row count unknown for '${codebasePath}', skipping recovery write`);
-                return null;
+            const vdb = this.context.getVectorDatabase();
+            const names = this.indexCollections(codebasePath);
+            let rowCount = 0;
+            for (const name of names) {
+                // An absent side of a split address contributes 0; only a
+                // collection that EXISTS and cannot be counted is unknown.
+                if (!(await vdb.hasCollection(name))) continue;
+                const count = await vdb.getCollectionRowCount(name);
+                if (count < 0) {
+                    console.warn(`[SNAPSHOT-RECOVERY] Row count unknown for '${codebasePath}' (${name}), skipping recovery write`);
+                    return null;
+                }
+                rowCount += count;
             }
             if (rowCount === 0) {
-                console.warn(`[SNAPSHOT-RECOVERY] Collection '${collectionName}' truly empty — NOT writing recovered entry (would poison client)`);
+                console.warn(`[SNAPSHOT-RECOVERY] Collections ${names.join(', ')} truly empty — NOT writing recovered entry (would poison client)`);
                 return null;
             }
             // rowCount is chunk count, not file count. Without a metadata query
@@ -137,23 +157,33 @@ export class ToolHandlers {
                 if (info.indexedFiles !== 0 || info.totalChunks !== 0) continue;
 
                 checked++;
-                const collectionName = this.context.getCollectionName(codebasePath);
+                // The WHOLE address (#152): one side of a split index is
+                // legitimately absent, and probing the code name alone removed
+                // a healthy prose-only codebase's entry as a phantom.
+                const names = this.indexCollections(codebasePath);
                 const vdb = this.context.getVectorDatabase();
 
-                // First probe: does the collection even exist? A "no" here is
-                // authoritative (permanent orphan), while a throw is most likely
-                // transient (Milvus unreachable) — keep those two cases distinct
-                // so we don't destroy real state on a network blip.
-                let collectionExists: boolean;
-                try {
-                    collectionExists = await vdb.hasCollection(collectionName);
-                } catch (err) {
-                    console.warn(`[SNAPSHOT-VALIDATE] hasCollection failed for '${codebasePath}' (likely transient), skipping:`, err);
+                // First probe: does any collection of the address even exist? A
+                // "no" here is authoritative (permanent orphan), while a throw is
+                // most likely transient (Milvus unreachable) — keep those two
+                // cases distinct so we don't destroy real state on a network blip.
+                const existing: string[] = [];
+                let probeFailed = false;
+                for (const name of names) {
+                    try {
+                        if (await vdb.hasCollection(name)) existing.push(name);
+                    } catch (err) {
+                        console.warn(`[SNAPSHOT-VALIDATE] hasCollection failed for '${codebasePath}' (${name}, likely transient), skipping:`, err);
+                        probeFailed = true;
+                        break;
+                    }
+                }
+                if (probeFailed) {
                     skipped++;
                     continue;
                 }
 
-                if (!collectionExists) {
+                if (existing.length === 0) {
                     // Permanent orphan — no matching Milvus collection, so the
                     // 0/0+completed snapshot entry is a pure phantom. Remove it.
                     this.snapshotManager.removeCodebaseCompletely(codebasePath);
@@ -162,12 +192,21 @@ export class ToolHandlers {
                     continue;
                 }
 
-                // Collection exists — get an accurate row count.
-                let rowCount: number;
-                try {
-                    rowCount = await vdb.getCollectionRowCount(collectionName);
-                } catch (err) {
-                    console.warn(`[SNAPSHOT-VALIDATE] getCollectionRowCount failed for '${codebasePath}', skipping:`, err);
+                // Collections exist — get an accurate row count over all of them.
+                let rowCount = 0;
+                let countFailed = false;
+                for (const name of existing) {
+                    try {
+                        const count = await vdb.getCollectionRowCount(name);
+                        if (count < 0) { rowCount = -1; break; }
+                        rowCount += count;
+                    } catch (err) {
+                        console.warn(`[SNAPSHOT-VALIDATE] getCollectionRowCount failed for '${codebasePath}' (${name}), skipping:`, err);
+                        countFailed = true;
+                        break;
+                    }
+                }
+                if (countFailed) {
                     skipped++;
                     continue;
                 }
@@ -915,8 +954,13 @@ export class ToolHandlers {
             if (searchResults.length === 0) {
                 // Check if collection was lost (indexed locally but missing in Milvus)
                 if (isIndexed && !isIndexing) {
-                    const collectionName = this.context.getCollectionName(searchCodebasePath);
-                    const hasCollection = await this.context.getVectorDatabase().hasCollection(collectionName);
+                    // Lost means NO collection of the address is there (#152):
+                    // an all-prose index has no code collection and is not lost.
+                    const vdb = this.context.getVectorDatabase();
+                    let hasCollection = false;
+                    for (const name of this.indexCollections(searchCodebasePath)) {
+                        if (await vdb.hasCollection(name)) { hasCollection = true; break; }
+                    }
                     if (!hasCollection) {
                         return {
                             content: [{ type: "text", text: `Error: Index data for '${searchCodebasePath}' has been lost (collection not found in Milvus). Please re-index using index_codebase with force=true.` }],
