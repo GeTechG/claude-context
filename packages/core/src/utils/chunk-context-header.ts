@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as path from 'path';
 
 // pilot-chunk-context-headers (D1): an index-time option that indexes every
 // chunk as a short header plus its text. `content`, the chunk id and every
@@ -116,7 +117,7 @@ export function loadChunkContextFile(file: string | undefined | null): ChunkCont
 }
 
 /** Throws, naming the mismatch, when the file was generated over another chunk set or covers too few ids. */
-export function assertChunkContextCoverage(file: ChunkContextFile, ids: Set<string>, source = 'CHUNK_CONTEXT_FILE'): { covered: number; total: number } {
+export function assertChunkContextCoverage(file: ChunkContextFile, ids: Set<string>, source = 'CHUNK_CONTEXT_FILE', minCoverage = CHUNK_CONTEXT_MIN_COVERAGE): { covered: number; total: number } {
     const sha = chunkSetSha256(ids);
     if (file.header.chunk_set_sha256 !== sha) {
         // The generator records the collections it read and their row counts, so
@@ -128,8 +129,18 @@ export function assertChunkContextCoverage(file: ChunkContextFile, ids: Set<stri
     }
     let covered = 0;
     for (const id of ids) if (file.contexts.has(id)) covered++;
-    if (ids.size > 0 && covered / ids.size < CHUNK_CONTEXT_MIN_COVERAGE) {
-        throw new Error(`${source} covers ${covered} of ${ids.size} chunk ids (${(100 * covered / ids.size).toFixed(2)}%), below ${CHUNK_CONTEXT_MIN_COVERAGE * 100}%`);
+    if (ids.size > 0 && covered / ids.size < minCoverage) {
+        throw new Error(`${source} covers ${covered} of ${ids.size} chunk ids (${(100 * covered / ids.size).toFixed(2)}%), below ${minCoverage * 100}%`);
     }
     return { covered, total: ids.size };
+}
+
+/**
+ * serve-generated-chunk-contexts: a relative CHUNK_CONTEXT_FILE names a file under the
+ * knowledge root (LOCAL_RAG_KNOWLEDGE_ROOT when set, else the corpus being indexed), so
+ * one `.mcp.json` value works for the CLI, the MCP server and the panel container.
+ */
+export function resolveChunkContextFilePath(raw: string | undefined | null, knowledgeRoot: string | undefined | null, codebasePath: string): string | undefined {
+    if (!raw) return undefined;
+    return path.isAbsolute(raw) ? raw : path.join(knowledgeRoot || codebasePath, raw);
 }

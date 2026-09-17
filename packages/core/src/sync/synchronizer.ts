@@ -232,6 +232,17 @@ export class FileSynchronizer {
     }
 
     public async checkForChanges(): Promise<{ added: string[], removed: string[], modified: string[] }> {
+        const preview = await this.previewChanges();
+        await preview.commit();
+        return { added: preview.added, removed: preview.removed, modified: preview.modified };
+    }
+
+    /**
+     * serve-generated-chunk-contexts: the change set without saving the snapshot, so a
+     * caller can refuse (e.g. missing chunk contexts) and the next run still sees the
+     * changes. `commit` saves what `checkForChanges` would have saved.
+     */
+    public async previewChanges(): Promise<{ added: string[], removed: string[], modified: string[], commit: () => Promise<void> }> {
         console.log('[Synchronizer] Checking for file changes...');
 
         const newFileHashes = await this.generateFileHashes(this.rootDir);
@@ -244,17 +255,19 @@ export class FileSynchronizer {
         if (changes.added.length > 0 || changes.removed.length > 0) {
             console.log('[Synchronizer] Merkle DAG has changed. Comparing file states...');
             const fileChanges = this.compareStates(this.fileHashes, newFileHashes);
-
-            this.fileHashes = newFileHashes;
-            this.merkleDAG = newMerkleDAG;
-            await this.saveSnapshot();
-
             console.log(`[Synchronizer] Found changes: ${fileChanges.added.length} added, ${fileChanges.removed.length} removed, ${fileChanges.modified.length} modified.`);
-            return fileChanges;
+            return {
+                ...fileChanges,
+                commit: async () => {
+                    this.fileHashes = newFileHashes;
+                    this.merkleDAG = newMerkleDAG;
+                    await this.saveSnapshot();
+                },
+            };
         }
 
         console.log('[Synchronizer] No changes detected based on Merkle DAG comparison.');
-        return { added: [], removed: [], modified: [] };
+        return { added: [], removed: [], modified: [], commit: async () => {} };
     }
 
     private compareStates(oldHashes: Map<string, string>, newHashes: Map<string, string>): { added: string[], removed: string[], modified: string[] } {

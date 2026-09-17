@@ -34,6 +34,7 @@ import {
     truncateUtf8,
     loadChunkContextFile,
     assertChunkContextCoverage,
+    resolveChunkContextFilePath,
 } from './utils/chunk-context-header';
 import { classifyQuery, weightsForIntent, parseQualifiedName, parseSingleSymbol, isComparisonShape } from './search/query-classifier';
 import { routeQuery, ChannelWeights, QueryShape } from './search/query-router';
@@ -501,9 +502,89 @@ export class Context {
         return resolveChunkContextHeaderMode(envManager.get('CHUNK_CONTEXT_HEADER'));
     }
 
-    private getChunkContexts(): ChunkContextFile {
-        if (!this.chunkContextFile) this.chunkContextFile = loadChunkContextFile(envManager.get('CHUNK_CONTEXT_FILE'));
+    /**
+     * The context file a write indexes with. `fresh` (the start of every write: the full-build
+     * check and the write guard) loads it from disk and pins it; every header of that write
+     * then reads the pinned copy, so a served file rewritten mid-write cannot change what the
+     * checked write inserts (serve-generated-chunk-contexts review).
+     */
+    private getChunkContexts(codebasePath: string, fresh = false): ChunkContextFile {
+        if (fresh || !this.chunkContextFile) {
+            this.chunkContextFile = loadChunkContextFile(resolveChunkContextFilePath(envManager.get('CHUNK_CONTEXT_FILE'), envManager.get('LOCAL_RAG_KNOWLEDGE_ROOT'), codebasePath));
+        }
         return this.chunkContextFile;
+    }
+
+    /**
+     * serve-generated-chunk-contexts: the chunks the indexer would write for a corpus tree
+     * (every indexable file) or for a list of its files — the same discovery, split and
+     * chunk ids as `indexCodebase` / `processFileList`. A file that cannot be read or is
+     * skipped yields nothing, as in the indexing loop.
+     */
+    async splitForChunkContexts(
+        codebasePath: string,
+        options: { files?: string[]; additionalIgnorePatterns?: string[]; additionalSupportedExtensions?: string[]; splitter?: Splitter } = {}
+    ): Promise<{ id: string; relativePath: string; startLine: number; endLine: number; content: string }[]> {
+        const splitter = options.splitter || this.codeSplitter;
+        const files = options.files
+            ? options.files.map((f) => (path.isAbsolute(f) ? f : path.join(codebasePath, f)))
+            : await this.getCodeFiles(codebasePath, await this.loadIgnorePatterns(codebasePath, options.additionalIgnorePatterns || []), this.getEffectiveSupportedExtensions(options.additionalSupportedExtensions || []));
+        const maxBytes = Math.max(1, parseInt(envManager.get('CHUNK_MAX_BYTES') || String(MILVUS_CONTENT_MAX_BYTES), 10));
+        const rows: { id: string; relativePath: string; startLine: number; endLine: number; content: string }[] = [];
+        for (const filePath of files) {
+            let split: { chunks: CodeChunk[] } | null;
+            try {
+                split = await this.splitFileForIndex(filePath, splitter, maxBytes, false);
+            } catch {
+                continue; // the indexing loop skips an unreadable file the same way
+            }
+            if (!split) continue;
+            const relativePath = path.relative(codebasePath, filePath);
+            for (const chunk of split.chunks) {
+                const startLine = chunk.metadata.startLine || 0;
+                const endLine = chunk.metadata.endLine || 0;
+                rows.push({ id: this.generateId(relativePath, startLine, endLine, chunk.content, chunk.metadata.part), relativePath, startLine, endLine, content: chunk.content });
+            }
+        }
+        return rows;
+    }
+
+    /** serve-generated-chunk-contexts: the header counters of the last write. */
+    getChunkContextReport(): { missing_contexts: number; header_truncated_embedding: number; header_truncated_index_text: number } {
+        return { ...this.chunkContextReport };
+    }
+
+    /**
+     * serve-generated-chunk-contexts: every write into collections must pass this before it
+     * deletes or inserts a row. It refuses a collection built under another header mode;
+     * in `generated` mode it refuses a context file generated over another chunk set than
+     * the corpus this write leaves, and — unless CHUNK_CONTEXT_ACCEPT_MISSING=true says the
+     * operator accepts metadata headers — a write that would insert a chunk without a
+     * context. It resets the header counters for the write.
+     */
+    async assertWriteReady(
+        codebasePath: string,
+        targets: string[],
+        filesToIndex: string[],
+        options: { additionalIgnorePatterns?: string[]; additionalSupportedExtensions?: string[]; splitter?: Splitter } = {}
+    ): Promise<{ mode: ChunkContextHeaderMode; inserted: number; missing: number }> {
+        const mode = this.getChunkContextHeaderMode();
+        for (const target of targets) {
+            if (await this.vectorDatabase.hasCollection(target)) await this.assertCollectionHeaderMode(target, mode);
+        }
+        this.chunkContextReport = { missing_contexts: 0, header_truncated_embedding: 0, header_truncated_index_text: 0 };
+        if (mode !== 'generated') return { mode, inserted: 0, missing: 0 };
+        const contexts = this.getChunkContexts(codebasePath, true);
+        const whole = await this.splitForChunkContexts(codebasePath, options);
+        const { covered, total } = assertChunkContextCoverage(contexts, new Set(whole.map((r) => r.id)), 'CHUNK_CONTEXT_FILE', 0);
+        const inserted = filesToIndex.length ? await this.splitForChunkContexts(codebasePath, { ...options, files: filesToIndex }) : [];
+        const lacking = inserted.filter((r) => !contexts.contexts.has(r.id));
+        console.log(`[Context] 🏷️  CHUNK_CONTEXT_FILE matches the corpus (${covered} of ${total} chunk ids covered); this write inserts ${inserted.length} chunk(s), ${lacking.length} without a context`);
+        if (lacking.length && envManager.get('CHUNK_CONTEXT_ACCEPT_MISSING') !== 'true') {
+            const files = [...new Set(lacking.map((r) => r.relativePath))];
+            throw new Error(`[Context] ${lacking.length} chunk(s) this write inserts have no generated context (${files.slice(0, 5).join(', ')}${files.length > 5 ? `, … ${files.length} files` : ''}); run \`node infra/chunk-context-store.js prepare\` first, or set CHUNK_CONTEXT_ACCEPT_MISSING=true to index them with the metadata header`);
+        }
+        return { mode, inserted: inserted.length, missing: lacking.length };
     }
 
     /**
@@ -1737,7 +1818,7 @@ export class Context {
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
         requestSplitter?: Splitter
-    ): Promise<{ added: number, removed: number, modified: number, droppedChunks: number, status: 'completed' | 'limit_reached', processedFiles: number }> {
+    ): Promise<{ added: number, removed: number, modified: number, droppedChunks: number, status: 'completed' | 'limit_reached', processedFiles: number, chunkContextHeader?: { mode: ChunkContextHeaderMode; missing_contexts: number; header_truncated_embedding: number; header_truncated_index_text: number } }> {
         const collectionName = this.getCollectionName(codebasePath);
         // code-collection-split: deletion set spans both v6 collections in
         // split mode. The synchronizer key stays single (`collectionName`,
@@ -1753,6 +1834,7 @@ export class Context {
         for (const target of deletionTargets) {
             if (await this.vectorDatabase.hasCollection(target)) await this.assertCollectionHeaderMode(target, headerMode);
         }
+        const headerReport = () => (headerMode !== 'off' ? { chunkContextHeader: { mode: headerMode, ...this.chunkContextReport } } : {});
 
         if (!synchronizer) {
             // Recreate the synchronizer with the same request-scoped options that
@@ -1769,14 +1851,21 @@ export class Context {
         const currentSynchronizer = this.synchronizers.get(collectionName)!;
 
         progressCallback?.({ phase: 'Checking for file changes...', current: 0, total: 100, percentage: 0 });
-        const { added, removed, modified } = await currentSynchronizer.checkForChanges();
+        // serve-generated-chunk-contexts: preview the change set without saving the snapshot,
+        // check the write, and only then commit — a refused write leaves the changes detectable.
+        const preview = await currentSynchronizer.previewChanges();
+        const { added, removed, modified } = preview;
         const totalChanges = added.length + removed.length + modified.length;
 
         if (totalChanges === 0) {
+            await preview.commit();
             progressCallback?.({ phase: 'No changes detected', current: 100, total: 100, percentage: 100 });
             console.log('[Context] ✅ No file changes detected.');
             return { added: 0, removed: 0, modified: 0, droppedChunks: 0, status: 'completed', processedFiles: 0 };
         }
+
+        await this.assertWriteReady(codebasePath, deletionTargets, [...added, ...modified], { additionalIgnorePatterns, additionalSupportedExtensions, splitter });
+        await preview.commit();
 
         console.log(`[Context] 🔄 Found changes: ${added.length} added, ${removed.length} removed, ${modified.length} modified.`);
 
@@ -1820,6 +1909,10 @@ export class Context {
         }
 
         console.log(`[Context] ✅ Re-indexing complete. Added: ${added.length}, Removed: ${removed.length}, Modified: ${modified.length}`);
+        if (headerMode !== 'off') {
+            const r = this.chunkContextReport;
+            console.log(`[Context] 🏷️  Header ${headerMode}: ${r.missing_contexts} chunk(s) without a generated context, ${r.header_truncated_embedding} embedding input(s) and ${r.header_truncated_index_text} index text(s) truncated by the header`);
+        }
         // #138: the detected change set is not the processed set. The chunk
         // scan can stop at CHUNK_LIMIT part-way through it with zero rejected
         // batches — files past the cutoff were never embedded, so the #19 tap
@@ -1837,7 +1930,7 @@ export class Context {
         }
         progressCallback?.({ phase: 'Re-indexing complete!', current: totalChanges, total: totalChanges, percentage: 100 });
 
-        return { added: added.length, removed: removed.length, modified: modified.length, droppedChunks, status: scanStatus, processedFiles };
+        return { added: added.length, removed: removed.length, modified: modified.length, droppedChunks, status: scanStatus, processedFiles, ...headerReport() };
     }
 
     /**
@@ -3671,22 +3764,8 @@ export class Context {
      * or covering too few of the chunks this build will index.
      */
     private async checkChunkContextFile(codebasePath: string, codeFiles: string[], splitter: Splitter): Promise<void> {
-        const maxBytes = Math.max(1, parseInt(envManager.get('CHUNK_MAX_BYTES') || String(MILVUS_CONTENT_MAX_BYTES), 10));
-        const ids = new Set<string>();
-        for (const filePath of codeFiles) {
-            let split: { chunks: CodeChunk[] } | null;
-            try {
-                split = await this.splitFileForIndex(filePath, splitter, maxBytes, false);
-            } catch {
-                continue; // the indexing loop skips an unreadable file the same way
-            }
-            if (!split) continue;
-            const relativePath = path.relative(codebasePath, filePath);
-            for (const chunk of split.chunks) {
-                ids.add(this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content, chunk.metadata.part));
-            }
-        }
-        const { covered, total } = assertChunkContextCoverage(this.getChunkContexts(), ids);
+        const ids = new Set((await this.splitForChunkContexts(codebasePath, { files: codeFiles, splitter })).map((r) => r.id));
+        const { covered, total } = assertChunkContextCoverage(this.getChunkContexts(codebasePath, true), ids);
         console.log(`[Context] 🏷️  CHUNK_CONTEXT_FILE covers ${covered} of ${total} chunk ids`);
     }
 
@@ -3701,7 +3780,7 @@ export class Context {
         let context: string | undefined;
         if (mode === 'generated') {
             const id = this.generateId(relativePath, meta.startLine || 0, meta.endLine || 0, chunk.content, meta.part);
-            context = this.getChunkContexts().contexts.get(id);
+            context = this.getChunkContexts(codebasePath).contexts.get(id);
             if (!context) this.chunkContextReport.missing_contexts++;
         }
         const header = buildChunkContextHeader({
