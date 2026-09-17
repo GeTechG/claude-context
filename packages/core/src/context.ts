@@ -362,7 +362,7 @@ export class Context {
     // loaded once; the header counters of the current indexing run; and the
     // header mode each searched collection records, for the retrieval stamp.
     private chunkContextFile: ChunkContextFile | null = null;
-    private chunkContextReport = { missing_contexts: 0, header_truncated_embedding: 0, header_truncated_index_text: 0 };
+    private chunkContextReport: { missing_contexts: number; missing_by_file: Record<string, number>; header_truncated_embedding: number; header_truncated_index_text: number } = { missing_contexts: 0, missing_by_file: {}, header_truncated_embedding: 0, header_truncated_index_text: 0 };
     private searchedHeaderModes = new Map<string, string>();
 
     constructor(config: ContextConfig = {}) {
@@ -550,8 +550,8 @@ export class Context {
     }
 
     /** serve-generated-chunk-contexts: the header counters of the last write. */
-    getChunkContextReport(): { missing_contexts: number; header_truncated_embedding: number; header_truncated_index_text: number } {
-        return { ...this.chunkContextReport };
+    getChunkContextReport(): { missing_contexts: number; missing_by_file: Record<string, number>; header_truncated_embedding: number; header_truncated_index_text: number } {
+        return { ...this.chunkContextReport, missing_by_file: { ...this.chunkContextReport.missing_by_file } };
     }
 
     /**
@@ -572,7 +572,7 @@ export class Context {
         for (const target of targets) {
             if (await this.vectorDatabase.hasCollection(target)) await this.assertCollectionHeaderMode(target, mode);
         }
-        this.chunkContextReport = { missing_contexts: 0, header_truncated_embedding: 0, header_truncated_index_text: 0 };
+        this.chunkContextReport = { missing_contexts: 0, missing_by_file: {}, header_truncated_embedding: 0, header_truncated_index_text: 0 };
         if (mode !== 'generated') return { mode, inserted: 0, missing: 0 };
         const contexts = this.getChunkContexts(codebasePath, true);
         const whole = await this.splitForChunkContexts(codebasePath, options);
@@ -1687,14 +1687,14 @@ export class Context {
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
         requestSplitter?: Splitter
-    ): Promise<{ indexedFiles: number; totalChunks: number; droppedChunks: number; status: 'completed' | 'limit_reached'; chunkContextHeader?: { mode: ChunkContextHeaderMode; missing_contexts: number; header_truncated_embedding: number; header_truncated_index_text: number } }> {
+    ): Promise<{ indexedFiles: number; totalChunks: number; droppedChunks: number; status: 'completed' | 'limit_reached'; chunkContextHeader?: { mode: ChunkContextHeaderMode; missing_contexts: number; missing_by_file: Record<string, number>; header_truncated_embedding: number; header_truncated_index_text: number } }> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🚀 Starting to index codebase with ${searchType}: ${codebasePath}`);
         const splitter = requestSplitter || this.codeSplitter;
         // pilot-chunk-context-headers: an unreadable mode is refused before anything runs.
         const headerMode = this.getChunkContextHeaderMode();
-        this.chunkContextReport = { missing_contexts: 0, header_truncated_embedding: 0, header_truncated_index_text: 0 };
+        this.chunkContextReport = { missing_contexts: 0, missing_by_file: {}, header_truncated_embedding: 0, header_truncated_index_text: 0 };
 
         // 1. Compute ignore patterns for this codebase/request without
         // retaining file-based patterns from previous codebases.
@@ -1818,7 +1818,7 @@ export class Context {
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
         requestSplitter?: Splitter
-    ): Promise<{ added: number, removed: number, modified: number, droppedChunks: number, status: 'completed' | 'limit_reached', processedFiles: number, chunkContextHeader?: { mode: ChunkContextHeaderMode; missing_contexts: number; header_truncated_embedding: number; header_truncated_index_text: number } }> {
+    ): Promise<{ added: number, removed: number, modified: number, droppedChunks: number, status: 'completed' | 'limit_reached', processedFiles: number, chunkContextHeader?: { mode: ChunkContextHeaderMode; missing_contexts: number; missing_by_file: Record<string, number>; header_truncated_embedding: number; header_truncated_index_text: number } }> {
         const collectionName = this.getCollectionName(codebasePath);
         // code-collection-split: deletion set spans both v6 collections in
         // split mode. The synchronizer key stays single (`collectionName`,
@@ -3823,7 +3823,10 @@ export class Context {
         if (mode === 'generated') {
             const id = this.generateId(relativePath, meta.startLine || 0, meta.endLine || 0, chunk.content, meta.part);
             context = this.getChunkContexts(codebasePath).contexts.get(id);
-            if (!context) this.chunkContextReport.missing_contexts++;
+            if (!context) {
+                this.chunkContextReport.missing_contexts++;
+                this.chunkContextReport.missing_by_file[relativePath] = (this.chunkContextReport.missing_by_file[relativePath] || 0) + 1;
+            }
         }
         const header = buildChunkContextHeader({
             relativePath,
