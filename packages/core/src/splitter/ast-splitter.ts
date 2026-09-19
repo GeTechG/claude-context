@@ -22,6 +22,69 @@ const DECLARATOR_NAME_TYPES = new Set([
     'destructor_name', 'operator_name',
 ]);
 
+// reference-edges-from-the-index: the node types whose text is a name a chunk
+// can reference. Deliberately the same shallow list across languages — the point
+// is "this chunk names X", not a typed call graph, and the symbol vocabulary is
+// what keeps the list from becoming noise.
+const REFERENCE_NAME_TYPES = new Set([
+    'identifier', 'type_identifier', 'field_identifier', 'qualified_identifier',
+    'scoped_identifier', 'property_identifier', 'namespace_identifier',
+    'constructor_name', 'class_name',
+    // tree-sitter-haxe names a type reference `type_name`, not `type_identifier`
+    // (`ComplexType > TypePath > type_name`), so without it a type in a
+    // signature — the thing a signature change breaks — was invisible.
+    'type_name',
+]);
+
+// Depth guard, not correctness: a pathological subtree should cost a bounded
+// walk, and a chunk is already size-capped by the splitter.
+const REFERENCE_SCAN_MAX_NODES = 20000;
+
+// The same floor the symbol-references pool activates on
+// (`MIN_SINGLE_SYMBOL_LEN` in query-classifier, `HOP2_SEED_MIN_SYMBOL_LEN` in
+// symbol-refs-pool): a name shorter than this can never be the symbol a query
+// resolves to, so storing it buys nothing and spends the field's 4096-character
+// clamp. Over real files it is what drops `b`, `i`, `pos`, `get` and `new` —
+// locals and parameters that happen to be in a 128,562-name vocabulary — from
+// the references of `haxe.io.Bytes`.
+const REFERENCE_MIN_NAME_LEN = 4;
+
+/**
+ * The vocabulary-known names a chunk's own subtree mentions, minus the chunk's
+ * own symbol and its enclosing scope, so a chunk never references itself.
+ *
+ * Read from the AST rather than the chunk text on measured grounds (2026-09-19):
+ * `extractMentionedSymbolsFromText` matches qualified dotted names and markdown
+ * code spans, so over real source it returns `this.length`, `b.endian`,
+ * `#include` targets and the URL in a licence header, and never sees the bare
+ * call that is the common case in C++ and Haxe.
+ */
+export function collectReferencedSymbols(
+    node: Parser.SyntaxNode,
+    vocabulary: ReadonlySet<string> | null | undefined,
+    exclude: ReadonlyArray<string | undefined>,
+): string[] {
+    if (!vocabulary || vocabulary.size === 0) return [];
+    const skip = new Set(exclude.filter((n): n is string => Boolean(n)));
+    const seen = new Set<string>();
+    const out: string[] = [];
+    let budget = REFERENCE_SCAN_MAX_NODES;
+    const walk = (cur: Parser.SyntaxNode) => {
+        if (budget-- <= 0) return;
+        if (REFERENCE_NAME_TYPES.has(cur.type)) {
+            const name = cur.text;
+            if (name && name.length >= REFERENCE_MIN_NAME_LEN
+                && !skip.has(name) && !seen.has(name) && vocabulary.has(name)) {
+                seen.add(name);
+                out.push(name);
+            }
+        }
+        for (const child of cur.children) walk(child);
+    };
+    walk(node);
+    return out;
+}
+
 /**
  * Resolve the identifier hiding under a C/C++ `declarator` chain, e.g.
  * `function_definition` → `function_declarator` → `qualified_identifier`.
@@ -47,6 +110,7 @@ export class AstCodeSplitter implements Splitter {
     private parser: Parser;
     private langchainFallback: any; // LangChainCodeSplitter for fallback
     private markdownSplitter: MarkdownSplitter;
+    private mentionedVocabProvider?: MentionedVocabProvider;
 
     constructor(chunkSize?: number, chunkOverlap?: number) {
         if (chunkSize) this.chunkSize = chunkSize;
@@ -123,6 +187,11 @@ export class AstCodeSplitter implements Splitter {
      * chunks get vocab-filtered `mentioned_symbols[]` at split time.
      */
     setMentionedVocabProvider(provider: MentionedVocabProvider | undefined): void {
+        // reference-edges-from-the-index: code chunks need it too. Until this
+        // change the provider only reached the markdown splitter, so
+        // `mentioned_symbols` was populated for doc / code_example chunks and
+        // empty on every one of the 365,022 code rows.
+        this.mentionedVocabProvider = provider;
         this.markdownSplitter.setMentionedVocabProvider(provider);
     }
 
@@ -148,6 +217,8 @@ export class AstCodeSplitter implements Splitter {
         // attached to every code chunk emitted from this file. Per-symbol
         // extends/implements are computed inline below per node.
         const fileStructural = extractStructural(node, language);
+        // reference-edges-from-the-index: resolved once per file, not per chunk.
+        const referenceVocab = this.mentionedVocabProvider?.();
 
         // no-chunks-inside-function-bodies: inside a function body only a named type declaration
         // or a named function with a parameter list becomes a chunk — not `int i = 0;`,
@@ -191,6 +262,14 @@ export class AstCodeSplitter implements Splitter {
                     const typeRelations = (symbolKind === 'abstract' || symbolKind === 'typedef')
                         ? extractTypeRelations(currentNode, language, symbolKind)
                         : {};
+                    // The names this chunk references. Broader than "calls": a
+                    // type in a signature and a field declaration count too,
+                    // because "what breaks if this changes" reaches them.
+                    const referenced = collectReferencedSymbols(
+                        currentNode,
+                        referenceVocab,
+                        [symbolName, rawSymbolName, symbolScope ?? parentScope],
+                    );
 
                     chunks.push({
                         content: nodeText,
@@ -214,6 +293,7 @@ export class AstCodeSplitter implements Splitter {
                                 ? { abstract_underlying: typeRelations.abstract_underlying }
                                 : {}),
                             ...(typeRelations.typedef_alias ? { typedef_alias: typeRelations.typedef_alias } : {}),
+                            ...(referenced.length > 0 ? { mentioned_symbols: referenced } : {}),
                         }
                     });
 
