@@ -139,6 +139,29 @@ const DOC_DOMAIN_TYPES = new Set(['doc', 'code_example']);
 const DEFAULT_GUARANTEE_CODE = 5;
 const DEFAULT_GUARANTEE_DOC = 5;
 
+/**
+ * sweep-symbol-refs-pool-weight: one row of the pre-rerank candidate dump
+ * (CANDIDATE_LOG_DIR). `pools` says which pool put the chunk into the
+ * reranker's input and at what rank inside that pool; `survived` says whether
+ * it is still there after the reranker's cut and the post-processing. Both are
+ * what separates "the references never entered the input" from "they entered
+ * and were cut".
+ */
+interface PreRerankCandidateRow {
+    rank: number;
+    chunk_id: string | null;
+    relativePath: string;
+    startLine: number;
+    endLine: number;
+    symbol_name: string | null;
+    parent_symbol: string | null;
+    content_type: string | null;
+    score: number;
+    pools: { pool: string; rank: number }[];
+    survived: boolean;
+    finalRank: number | null;
+}
+
 // Phase 2 reranker pool sizes. INPUT_K is how many merged candidates we
 // hand to the reranker; OUTPUT_K is the cut after reranking. Both are
 // overridable through env so eval / tuning runs can sweep without rebuilds.
@@ -291,6 +314,16 @@ export class Context {
     // (see loadSymbolVocabulary below).
     private indexedSymbols: Set<string> | null = null;
     private symbolVocabCache = new Map<string, ReadonlySet<string> | null>();
+    // sweep-symbol-refs-pool-weight: provenance for the pre-rerank candidate
+    // dump. weightedRrfMerge keeps only id -> summed score, so a dumped
+    // candidate cannot otherwise say which pool put it into the reranker's
+    // input. Collected ONLY while CANDIDATE_LOG_DIR is set (the eval harness;
+    // the MCP server never sets it), which also means this instance state
+    // assumes one search at a time in that process — the harness runs its
+    // queries serially. Null = the branch is dormant, not merely silent.
+    private candidateProvenance: Map<string, { pool: string; rank: number }[]> | null = null;
+    private pendingCandidateDump: { query: string; rows: PreRerankCandidateRow[] } | null = null;
+
     // rag-graph-layer Phase 2: in-memory accumulator for the cross-domain
     // graph builder. Populated by processChunkBatch as each chunk gets
     // assigned its Milvus chunk_id; written out as `.symbols-graph.json`
@@ -837,7 +870,7 @@ export class Context {
         channelWeights?: ChannelWeights,
     ): Promise<{
         mergedPreGraph: HybridSearchResult[];
-        mergePools: { results: HybridSearchResult[]; weight: number }[];
+        mergePools: { results: HybridSearchResult[]; weight: number; name?: string }[];
         codePool: HybridSearchResult[];
         docPool: HybridSearchResult[];
         symbolPool: HybridSearchResult[];
@@ -944,17 +977,17 @@ export class Context {
         console.log(`[Context] 🔍 Pool sizes for "${subject}": code=${codePool.length} doc=${docPool.length} symbol=${symbolPool.length} symbolRefs=${symbolRefsPool.length}`);
 
         const SYMBOL_POOL_WEIGHT = 2.0;
-        const mergePools: { results: HybridSearchResult[]; weight: number }[] = [
-            { results: codePool, weight: weights.code },
-            { results: docPool, weight: weights.doc },
+        const mergePools: { results: HybridSearchResult[]; weight: number; name?: string }[] = [
+            { results: codePool, weight: weights.code, name: 'code' },
+            { results: docPool, weight: weights.doc, name: 'doc' },
         ];
         if (symbolPool.length > 0) {
-            mergePools.push({ results: symbolPool, weight: SYMBOL_POOL_WEIGHT });
+            mergePools.push({ results: symbolPool, weight: SYMBOL_POOL_WEIGHT, name: 'symbolRouting' });
         }
         // Pool participates in the merge even when weight is 0, so callers
         // can A/B "compute but ignore" via SYMBOL_REFS_POOL_WEIGHT=0.
         if (symbolRefsPool.length > 0 && this.getSymbolRefsPool()) {
-            mergePools.push({ results: symbolRefsPool, weight: this.getSymbolRefsPoolWeight() });
+            mergePools.push({ results: symbolRefsPool, weight: this.getSymbolRefsPoolWeight(), name: 'symbolRefs' });
         }
         const mergedPreGraph = this.weightedRrfMerge(mergePools, mergeLimit, this.getRrfK());
         return { mergedPreGraph, mergePools, codePool, docPool, symbolPool };
@@ -2036,6 +2069,11 @@ export class Context {
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath}`);
 
+        // sweep-symbol-refs-pool-weight: arm the pre-rerank candidate dump for
+        // this search, or leave both fields null so the merge collects nothing.
+        this.candidateProvenance = (process.env.CANDIDATE_LOG_DIR || '').trim() ? new Map() : null;
+        this.pendingCandidateDump = null;
+
         // The gate is the whole address (#152): the split pools below are already
         // address-aware and degrade per pool, so a corpus whose code collection
         // was never created is searched on its prose side instead of answering
@@ -2110,7 +2148,7 @@ export class Context {
             // graph-expansion re-merge and guarantee-slots below.
             let codePool: HybridSearchResult[] = [];
             let docPool: HybridSearchResult[] = [];
-            let mergePools: { results: HybridSearchResult[]; weight: number }[] = [];
+            let mergePools: { results: HybridSearchResult[]; weight: number; name?: string }[] = [];
 
             if (multiQuery) {
                 console.log(`[Context] 🔍 MULTI_QUERY=true → running parallel code-domain + doc-domain hybrid searches (PER_POOL_K=${PER_POOL_K})`);
@@ -2147,8 +2185,8 @@ export class Context {
                     ]);
                     mergedPreGraph = this.weightedRrfMerge(
                         [
-                            { results: leftRun.mergedPreGraph, weight: 0.5 },
-                            { results: rightRun.mergedPreGraph, weight: 0.5 },
+                            { results: leftRun.mergedPreGraph, weight: 0.5, name: 'splitLeft' },
+                            { results: rightRun.mergedPreGraph, weight: 0.5, name: 'splitRight' },
                         ],
                         mergeLimit,
                         this.getRrfK(),
@@ -2210,7 +2248,7 @@ export class Context {
                                 // re-run the weighted RRF with a 3rd pool.
                                 const graphPoolMerge = [
                                     ...mergePools,
-                                    { results: fetched, weight: this.getGraphPoolWeight() },
+                                    { results: fetched, weight: this.getGraphPoolWeight(), name: 'graph' },
                                 ];
                                 const reMerged = this.weightedRrfMerge(
                                     graphPoolMerge,
@@ -2254,7 +2292,7 @@ export class Context {
                             if (fetched.length > 0) {
                                 const proseGraphMerge = [
                                     ...mergePools,
-                                    { results: fetched, weight: this.getProseGraphPoolWeight() },
+                                    { results: fetched, weight: this.getProseGraphPoolWeight(), name: 'proseGraph' },
                                 ];
                                 const reMerged = this.weightedRrfMerge(
                                     proseGraphMerge,
@@ -2300,7 +2338,7 @@ export class Context {
                             if (fetched.length > 0) {
                                 const bridgePoolMerge = [
                                     ...mergePools,
-                                    { results: fetched, weight: this.getComparisonBridgePoolWeight() },
+                                    { results: fetched, weight: this.getComparisonBridgePoolWeight(), name: 'comparisonBridge' },
                                 ];
                                 const reMerged = this.weightedRrfMerge(
                                     bridgePoolMerge,
@@ -2374,7 +2412,7 @@ export class Context {
             const dedupedResults = this.deduplicateResults(mergedResults);
             console.log(`[Context] ✅ Found ${mergedResults.length} results, ${dedupedResults.length} after dedup`);
 
-            this.maybeDumpPreRerankCandidates(query, dedupedResults);
+            this.maybeStagePreRerankCandidates(query, dedupedResults);
 
             // Phase R (rag-code-intent-recall): when the query is a
             // strictly-anchored qualified name AND code-intent only, allow
@@ -2423,6 +2461,16 @@ export class Context {
             if (quotaResults.length > 0) {
                 console.log(`[Context] 🔍 Top result score: ${quotaResults[0].score}, path: ${quotaResults[0].relativePath}`);
             }
+            // Before attachCandidateSymbols: that call awaits the symbol
+            // vocabulary and is not wrapped, so a malformed .symbols-vocab.json
+            // would take the diagnostic down with a search whose retrieval was
+            // fine. The dump needs nothing it produces.
+            this.flushPreRerankCandidateDump(quotaResults, {
+                topK,
+                rerankerBypassed,
+                reservedBridgeSlots: reservedBridge.length,
+                multiQuery,
+            });
             await this.attachCandidateSymbols(quotaResults, codebasePath);
             return quotaResults;
         } else {
@@ -2661,7 +2709,7 @@ export class Context {
      * without ever excluding doc-domain hits.
      */
     private weightedRrfMerge(
-        pools: { results: HybridSearchResult[]; weight: number }[],
+        pools: { results: HybridSearchResult[]; weight: number; name?: string }[],
         k: number,
         kRrf: number = 60
     ): HybridSearchResult[] {
@@ -2676,6 +2724,9 @@ export class Context {
                 if (!id) continue;
                 const contribution = weight / (kRrf + rank + 1);
                 scoreById.set(id, (scoreById.get(id) || 0) + contribution);
+                if (this.candidateProvenance && pool.name) {
+                    this.noteCandidatePool(id, pool.name, rank + 1);
+                }
                 if (!docById.has(id)) {
                     docById.set(id, r);
                 }
@@ -2992,12 +3043,77 @@ export class Context {
     }
 
     /**
+     * sweep-symbol-refs-pool-weight: record which pool contributed a chunk to
+     * the merge, and at what rank inside that pool. Only called while the
+     * candidate dump is on. A chunk found by two pools keeps one entry per
+     * pool, at its best (lowest) rank, so a subject fanned out twice does not
+     * read as two different findings.
+     */
+    private noteCandidatePool(id: string, pool: string, rank: number): void {
+        if (!this.candidateProvenance) return;
+        const entries = this.candidateProvenance.get(id);
+        if (!entries) {
+            this.candidateProvenance.set(id, [{ pool, rank }]);
+            return;
+        }
+        const existing = entries.find((e) => e.pool === pool);
+        if (!existing) entries.push({ pool, rank });
+        else if (rank < existing.rank) existing.rank = rank;
+    }
+
+    /**
+     * Key a result the way the provenance map is keyed. `chunk_id` is the
+     * Milvus primary key and is present on every hybrid path; the line-range
+     * fallback only matters for results that never went through a merge.
+     */
+    private candidateKey(r: SemanticSearchResult): string {
+        return r.chunk_id || `${r.relativePath}:${r.startLine}-${r.endLine}`;
+    }
+
+    /**
      * Diagnostic dump of the post-merge / pre-rerank candidate pool.
      * Triggered only when env CANDIDATE_LOG_DIR is set; one JSON file per
      * query, named by env CANDIDATE_LOG_QID (or a sha1 prefix of the query
      * if QID is not provided).
+     *
+     * Staged here rather than written here: `survived` is only knowable once
+     * the reranker has cut the pool and the post-processing has run, so the
+     * rows wait for flushPreRerankCandidateDump().
      */
-    private maybeDumpPreRerankCandidates(query: string, candidates: SemanticSearchResult[]): void {
+    private maybeStagePreRerankCandidates(query: string, candidates: SemanticSearchResult[]): void {
+        if (!this.candidateProvenance) return;
+        const rows: PreRerankCandidateRow[] = candidates.slice(0, 50).map((r, i) => ({
+            rank: i + 1,
+            chunk_id: r.chunk_id ?? null,
+            relativePath: r.relativePath,
+            startLine: r.startLine,
+            endLine: r.endLine,
+            symbol_name: r.symbol_name ?? null,
+            parent_symbol: r.parent_symbol ?? null,
+            content_type: r.content_type ?? null,
+            score: typeof r.score === 'number' ? Number(r.score.toFixed(6)) : r.score,
+            pools: (this.candidateProvenance!.get(this.candidateKey(r)) || [])
+                .map((e) => ({ ...e }))
+                .sort((a, b) => a.rank - b.rank),
+            survived: false,
+            finalRank: null,
+        }));
+        this.pendingCandidateDump = { query, rows };
+    }
+
+    /**
+     * Write the staged dump, marking which candidates are still in the results
+     * the caller receives. No-op when the dump is off or nothing was staged
+     * (an error between the merge and the return leaves no file, the same way
+     * an errored query leaves no metrics).
+     */
+    private flushPreRerankCandidateDump(
+        finalResults: SemanticSearchResult[],
+        meta: { topK: number; rerankerBypassed: boolean; reservedBridgeSlots: number; multiQuery: boolean },
+    ): void {
+        const staged = this.pendingCandidateDump;
+        this.pendingCandidateDump = null;
+        if (!staged) return;
         const dir = (process.env.CANDIDATE_LOG_DIR || '').trim();
         if (!dir) return;
         try {
@@ -3005,23 +3121,51 @@ export class Context {
             const qidRaw = (process.env.CANDIDATE_LOG_QID || '').trim();
             const safeQid = qidRaw
                 ? qidRaw.replace(/[^A-Za-z0-9_.-]/g, '_')
-                : crypto.createHash('sha1').update(query).digest('hex').slice(0, 12);
-            const top = candidates.slice(0, 50).map((r, i) => ({
-                rank: i + 1,
-                relativePath: r.relativePath,
-                startLine: r.startLine,
-                endLine: r.endLine,
-                symbol_name: r.symbol_name ?? null,
-                parent_symbol: r.parent_symbol ?? null,
-                content_type: r.content_type ?? null,
-                score: typeof r.score === 'number' ? Number(r.score.toFixed(6)) : r.score,
-            }));
+                : crypto.createHash('sha1').update(staged.query).digest('hex').slice(0, 12);
+            const finalRankByKey = new Map<string, number>();
+            finalResults.forEach((r, i) => {
+                const key = this.candidateKey(r);
+                if (!finalRankByKey.has(key)) finalRankByKey.set(key, i + 1);
+            });
+            for (const row of staged.rows) {
+                const key = row.chunk_id || `${row.relativePath}:${row.startLine}-${row.endLine}`;
+                const finalRank = finalRankByKey.get(key);
+                row.finalRank = finalRank ?? null;
+                row.survived = finalRank !== undefined;
+            }
             const payload = {
                 qid: qidRaw || null,
-                query,
+                query: staged.query,
                 generatedAt: new Date().toISOString(),
-                count: top.length,
-                candidates: top,
+                count: staged.rows.length,
+                survived: staged.rows.filter((r) => r.survived).length,
+                // `survived` is measured at the list the caller receives —
+                // topK — which is the cut every gate metric reads. The
+                // reranker's own bounds are stated beside it because they are
+                // NOT the same number (topK=10 against RERANKER_OUTPUT_K=15 in
+                // the eval harness), and a reader that confuses the two
+                // undercounts what lived.
+                topK: meta.topK,
+                rerankerInputK: this.hasReranker() ? this.getRerankerInputK() : null,
+                rerankerOutputK: this.hasReranker() ? this.getRerankerOutputK() : null,
+                // Without this a bypassed reranker is indistinguishable from
+                // one that ran: on a qualified-name query the "cut" is the RRF
+                // order itself, and RERANKER_BYPASS_FOR_QUALIFIED_NAME is
+                // served on. Bridge-reserved slots skip the reranker the same
+                // way.
+                rerankerBypassed: meta.rerankerBypassed,
+                reservedBridgeSlots: meta.reservedBridgeSlots,
+                // MULTI_QUERY=false never reaches weightedRrfMerge, so every
+                // row would read `pools: []` — absence of provenance, not
+                // absence of the pool.
+                multiQuery: meta.multiQuery,
+                // A re-merge that rebuilds from the base pools discards an
+                // earlier expansion pool's contribution while its provenance
+                // entries remain. Both expansions are served off; when they
+                // are off, `pools` is exact.
+                graphExpand: this.getGraphExpand(),
+                proseGraphExpand: this.getProseGraphExpand(),
+                candidates: staged.rows,
             };
             fs.writeFileSync(path.join(dir, `${safeQid}.json`), JSON.stringify(payload, null, 2));
         } catch (err) {
