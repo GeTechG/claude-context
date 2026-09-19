@@ -241,8 +241,31 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
         }
     }
 
-    const hop1Locations: Location[] = [...refs, ...impls];
     const hop1NewIds: string[] = [];
+
+    // reference-edges-from-the-index: the index is the PRIMARY source of what
+    // references this symbol, and the language server is what may add to it.
+    // Ordered before the LSP ids for that reason; everything after — dedup,
+    // hop-2 seeding, hydration, RRF rank — is unchanged and does not care which
+    // source an id came from.
+    //
+    // The frequency bound applies here for the same reason it applies to the LSP
+    // call: a subject the corpus uses everywhere returns an arbitrary slice of
+    // the whole corpus, and an arbitrary slice is not evidence. `refsSkipped` is
+    // already the decision for this subject, recorded with its frequency.
+    const indexRefIds = refsSkipped
+        ? []
+        : await fetchReferencingChunkIds(opts.vectorDatabase, opts.collection, callPath, opts.maxRefs);
+    const indexImplIds = await fetchImplementingChunkIds(opts.vectorDatabase, opts.collection, lspName, opts.maxImpls);
+    for (const id of [...indexRefIds, ...indexImplIds]) {
+        if (orderedChunkIds.length >= TOTAL_CHUNK_CAP) break;
+        if (seenIds.has(id)) continue;
+        seenIds.add(id);
+        orderedChunkIds.push(id);
+        hop1NewIds.push(id);
+    }
+
+    const hop1Locations: Location[] = [...refs, ...impls];
     for (const loc of hop1Locations) {
         if (orderedChunkIds.length >= TOTAL_CHUNK_CAP) break;
         const chunkIds = await locationToChunkIds(
@@ -317,7 +340,7 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
     }
 
     if (orderedChunkIds.length === 0) {
-        console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, refs=${refs.length}, impls=${impls.length}, hop2=0 → 0 chunks (no Milvus matches)`);
+        console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, index(refs=${indexRefIds.length}, impls=${indexImplIds.length}), lsp(refs=${refs.length}, impls=${impls.length}), hop2=0 → 0 chunks (no Milvus matches)`);
         reportFrequency();
         return [];
     }
@@ -330,7 +353,7 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
 
     const hop2LogPart = maxHops >= 2 ? `, hop2=${hop2CountAdded}` : '';
     const skipLogPart = frequencySkips.length > 0 ? `, refs-skipped-by-frequency=${frequencySkips.length}` : '';
-    console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, refs=${refs.length}, impls=${impls.length}${hop2LogPart}${skipLogPart} → ${results.length} chunks`);
+    console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, index(refs=${indexRefIds.length}, impls=${indexImplIds.length}), lsp(refs=${refs.length}, impls=${impls.length})${hop2LogPart}${skipLogPart} → ${results.length} chunks`);
     reportFrequency();
     return results;
 }
@@ -416,6 +439,59 @@ async function fetchDeclarationChunks(
         if (out.length >= maxResults) break;
     }
     return out;
+}
+
+// reference-edges-from-the-index: the chunks that REFERENCE a symbol, read from
+// the index instead of from a language server.
+//
+// Why the index is the primary source here: measured 2026-09-19 over 98 type
+// declarations of the Haxe standard library, Serena returned three or more
+// external referencing files for 5 of them and implementations for none, and it
+// returned no cross-file references at all for C++ or JS/TS. A pool whose only
+// source answers that rarely runs empty whatever its weight.
+//
+// `mentioned_symbols` is a JSON-encoded string[], so the name is matched with its
+// quotes — `"Bytes"` never matches `"BytesBuffer"`, which a bare substring would.
+async function fetchReferencingChunkIds(
+    vectorDatabase: VectorDatabase,
+    collection: string,
+    symbolName: string,
+    limit: number,
+): Promise<string[]> {
+    if (!symbolName) return [];
+    const needle = escapeMilvusLiteral(`"${symbolName}"`);
+    try {
+        const rows = await vectorDatabase.query(collection, `mentioned_symbols like "%${needle}%"`, ['id'], limit);
+        return rows.map((r) => r?.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
+    } catch (err) {
+        console.warn(`[Context] ⚠️ symbol-refs index references query failed for ${symbolName}: ${err}`);
+        return [];
+    }
+}
+
+// The chunks that DECLARE a type derived from this one. `extends` holds a single
+// name, `implements` a JSON-encoded string[] — the same quoting rule applies.
+async function fetchImplementingChunkIds(
+    vectorDatabase: VectorDatabase,
+    collection: string,
+    symbolName: string,
+    limit: number,
+): Promise<string[]> {
+    if (!symbolName) return [];
+    const exact = escapeMilvusLiteral(symbolName);
+    const needle = escapeMilvusLiteral(`"${symbolName}"`);
+    try {
+        const rows = await vectorDatabase.query(
+            collection,
+            `extends == "${exact}" or implements like "%${needle}%"`,
+            ['id'],
+            limit,
+        );
+        return rows.map((r) => r?.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
+    } catch (err) {
+        console.warn(`[Context] ⚠️ symbol-refs index implementations query failed for ${symbolName}: ${err}`);
+        return [];
+    }
 }
 
 async function locationToChunkIds(
