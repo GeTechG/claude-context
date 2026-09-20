@@ -128,6 +128,12 @@ function parseStringArray(raw: string | undefined): string[] | undefined {
     }
 }
 
+// reserve-slots-for-reference-chunks (review): the markers a pool may claim a
+// chunk with. A partition asked for a marker nobody sets reserves nothing,
+// which reads exactly like "the pool did not fire" — a union turns that typo
+// into a compile error for free.
+type PoolMarker = 'comparisonBridge' | 'symbolRefs' | 'proseGraph';
+
 const CODE_DOMAIN_FILTER = `content_type in ["code","docstring"]`;
 const DOC_DOMAIN_FILTER = `content_type in ["doc","code_example"]`;
 const CODE_DOMAIN_TYPES = new Set(['code', 'docstring']);
@@ -874,6 +880,7 @@ export class Context {
         codePool: HybridSearchResult[];
         docPool: HybridSearchResult[];
         symbolPool: HybridSearchResult[];
+        symbolRefsPool: HybridSearchResult[];
     }> {
         console.log(`[Context] 🔍 Generating embeddings for subject: "${subject}"`);
         const queryEmbedding: EmbeddingVector = await this.embedding.embed(subject);
@@ -990,7 +997,7 @@ export class Context {
             mergePools.push({ results: symbolRefsPool, weight: this.getSymbolRefsPoolWeight(), name: 'symbolRefs' });
         }
         const mergedPreGraph = this.weightedRrfMerge(mergePools, mergeLimit, this.getRrfK());
-        return { mergedPreGraph, mergePools, codePool, docPool, symbolPool };
+        return { mergedPreGraph, mergePools, codePool, docPool, symbolPool, symbolRefsPool };
     }
 
     /**
@@ -1046,7 +1053,7 @@ export class Context {
             // that it degrades to a no-op rather than failing the query. A latch
             // that failed the whole hybrid search would trade a leaked transport
             // for a lost answer.
-            const lspClient = this.getOrCreateSymbolRefsLspClient();
+            const lspClient = this.getSymbolRefsLspEnabled() ? this.getOrCreateSymbolRefsLspClient() : null;
             return await runSymbolRefsPool({
                 query: subject,
                 parsed,
@@ -1215,6 +1222,34 @@ export class Context {
     private getSymbolRefsPoolWeight(): number {
         const raw = this.getNonNegativeFloatFromEnv('SYMBOL_REFS_POOL_WEIGHT', 1.0);
         return Math.min(raw, 3.0);
+    }
+
+    /**
+     * reserve-slots-for-reference-chunks: how many of the final top-K slots the
+     * references pool may take ahead of the reranker. 0 (default) is identical
+     * to the behaviour before this knob existed. Bounded like the bridge's own
+     * slots, so a typo cannot hand the whole page to one pool.
+     */
+    private getSymbolRefsBypassSlots(): number {
+        const raw = (envManager.get('SYMBOL_REFS_BYPASS_SLOTS') || '0').trim();
+        const n = parseInt(raw, 10);
+        if (!Number.isFinite(n) || n < 0) return 0;
+        return Math.min(n, 10);
+    }
+
+    /**
+     * reserve-slots-for-reference-chunks: whether the references pool may ALSO
+     * consult the language server. Default `true` - serving is unchanged until
+     * a measurement says otherwise. At `false` the pool resolves references
+     * from the index alone and is a pure function of it, which is what an
+     * arm of a paired run needs: the same query against the same index
+     * returned `lsp(refs=0)` in one run and `lsp(refs=1)` in the next, and
+     * that one contribution reshuffled a top-10.
+     */
+    private getSymbolRefsLspEnabled(): boolean {
+        const raw = (envManager.get('SYMBOL_REFS_LSP') || '').trim().toLowerCase();
+        if (raw === '') return true;
+        return raw !== 'false' && raw !== '0' && raw !== 'off';
     }
 
     private getSymbolRefsLspBaseUrl(): string | undefined {
@@ -2148,6 +2183,25 @@ export class Context {
             // graph-expansion re-merge and guarantee-slots below.
             let codePool: HybridSearchResult[] = [];
             let docPool: HybridSearchResult[] = [];
+            // reserve-slots-for-reference-chunks: which chunks the references
+            // pool contributed AND at what rank inside that pool, so the
+            // reserved-slot partition can see them after every re-merge has
+            // rebuilt the semantic results — and can reserve in the pool's own
+            // order (declaration, then references, then implementations, D2).
+            // The merged-RRF order must NOT decide this: it is the quantity
+            // already measured not to protect these chunks. With two subjects
+            // the rank is taken WITHIN each subject's own pool, so both
+            // declarations tie at 0 rather than one of them landing behind the
+            // whole of the other subject's pool.
+            const symbolRefsRank = new Map<string, number>();
+            const notePoolRanks = (pool: HybridSearchResult[]): void => {
+                pool.forEach((r, i) => {
+                    const id = r.document.id;
+                    if (!id) return;
+                    const seen = symbolRefsRank.get(id);
+                    if (seen === undefined || i < seen) symbolRefsRank.set(id, i);
+                });
+            };
             let mergePools: { results: HybridSearchResult[]; weight: number; name?: string }[] = [];
 
             if (multiQuery) {
@@ -2198,6 +2252,8 @@ export class Context {
                     mergePools = [{ results: mergedPreGraph, weight: 1.0 }];
                     codePool = [...leftRun.codePool, ...rightRun.codePool];
                     docPool = [...leftRun.docPool, ...rightRun.docPool];
+                    notePoolRanks(leftRun.symbolRefsPool);
+                    notePoolRanks(rightRun.symbolRefsPool);
                 } else {
                     const single = await this.runSubjectHybridPipeline(
                         query,
@@ -2213,6 +2269,7 @@ export class Context {
                     mergePools = single.mergePools;
                     codePool = single.codePool;
                     docPool = single.docPool;
+                    notePoolRanks(single.symbolRefsPool);
                 }
 
                 let semanticMerged: SemanticSearchResult[] = mergedPreGraph.map((r) => this.toSemanticResult(r));
@@ -2409,6 +2466,18 @@ export class Context {
             }
 
             console.log(`[Context] 🔍 Raw merged results count: ${mergedResults.length}`);
+            // reserve-slots-for-reference-chunks: the marker goes on here, not
+            // at the pool, because graph / prose-graph / bridge re-merges each
+            // rebuild the semantic results from scratch and would drop it. A
+            // chunk another pool has already claimed keeps that claim.
+            // At the default (0 slots) nothing reads this marker, so nothing
+            // is written: "the default path is untouched" is then true by
+            // construction rather than by auditing every reader of `pool`.
+            if (this.getSymbolRefsBypassSlots() > 0 && symbolRefsRank.size > 0) {
+                for (const r of mergedResults) {
+                    if (!r.pool && r.chunk_id && symbolRefsRank.has(r.chunk_id)) r.pool = 'symbolRefs';
+                }
+            }
             const dedupedResults = this.deduplicateResults(mergedResults);
             console.log(`[Context] ✅ Found ${mergedResults.length} results, ${dedupedResults.length} after dedup`);
 
@@ -2435,17 +2504,36 @@ export class Context {
             const bypassSlots = (this.hasReranker() && !rerankerBypassed)
                 ? this.getComparisonBridgeBypassSlots()
                 : 0;
-            const { reserved: reservedBridge, rerankInput } = this.partitionForBridgeBypass(
+            const { reserved: reservedBridge, rerankInput: afterBridge } = this.partitionForBridgeBypass(
                 dedupedResults,
                 topK,
                 bypassSlots,
             );
             if (reservedBridge.length > 0 && this.getComparisonBridgeDebug()) {
-                console.log(`[comparison-bridge-bypass] reserved=${reservedBridge.length} rerank_input=${rerankInput.length} final=${topK}`);
+                console.log(`[comparison-bridge-bypass] reserved=${reservedBridge.length} rerank_input=${afterBridge.length} final=${topK}`);
             }
-            const rerankerSlots = Math.max(topK - reservedBridge.length, 0);
+            // reserve-slots-for-reference-chunks: the same partition, for the
+            // pool that knows what a reference is. The reranker cuts labelled
+            // dependents out of its own input — 11 at the served weight, 51 at
+            // 1.5, some handed to it at rank 1 — so a bounded number of slots
+            // are decided by the pool's own order instead. Default 0: the
+            // partition returns the list untouched and this is a no-op.
+            const refSlots = (this.hasReranker() && !rerankerBypassed)
+                ? this.getSymbolRefsBypassSlots()
+                : 0;
+            const { reserved: reservedRefs, rerankInput } = this.partitionForBridgeBypass(
+                afterBridge,
+                Math.max(topK - reservedBridge.length, 0),
+                refSlots,
+                'symbolRefs',
+                (r) => (r.chunk_id ? symbolRefsRank.get(r.chunk_id) ?? Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER),
+            );
+            if (reservedRefs.length > 0) {
+                console.log(`[symbol-refs-bypass] reserved=${reservedRefs.length} rerank_input=${rerankInput.length} final=${topK}`);
+            }
+            const rerankerSlots = Math.max(topK - reservedBridge.length - reservedRefs.length, 0);
             const rerankedRest = await this.rerankForFinalResults(query, rerankInput, rerankerSlots, rerankerBypassed);
-            const finalResults = [...reservedBridge, ...rerankedRest].slice(0, topK);
+            const finalResults = [...reservedBridge, ...reservedRefs, ...rerankedRest].slice(0, topK);
             if (rerankerBypassed) {
                 console.log(`[Context] ⏭️  reranker bypassed for qualified-name code query "${query}"`);
             }
@@ -2469,6 +2557,7 @@ export class Context {
                 topK,
                 rerankerBypassed,
                 reservedBridgeSlots: reservedBridge.length,
+                reservedRefSlots: reservedRefs.length,
                 multiQuery,
             });
             await this.attachCandidateSymbols(quotaResults, codebasePath);
@@ -2766,16 +2855,27 @@ export class Context {
         candidates: SemanticSearchResult[],
         topK: number,
         bypassSlots: number,
+        poolMarker: PoolMarker = 'comparisonBridge',
+        rankOf?: (r: SemanticSearchResult) => number,
     ): { reserved: SemanticSearchResult[]; rerankInput: SemanticSearchResult[] } {
         if (bypassSlots <= 0) {
             return { reserved: [], rerankInput: candidates };
         }
-        const bridgeChunks = candidates.filter((r) => r.pool === 'comparisonBridge');
+        const bridgeChunks = candidates.filter((r) => r.pool === poolMarker);
         if (bridgeChunks.length === 0) {
             return { reserved: [], rerankInput: candidates };
         }
         const reservationCount = Math.min(bypassSlots, bridgeChunks.length, topK);
-        const reserved = bridgeChunks.slice(0, reservationCount);
+        // Without `rankOf` the candidates' own (merged-RRF) order decides,
+        // which is what the comparison bridge has always done. The references
+        // pool passes its own rank instead (D2): the merged score is the
+        // quantity already measured not to protect these chunks, so reserving
+        // by it would reserve whichever reference the code pool also liked —
+        // the one the reranker was least likely to cut anyway.
+        const ordered = rankOf
+            ? [...bridgeChunks].sort((a, b) => rankOf(a) - rankOf(b))
+            : bridgeChunks;
+        const reserved = ordered.slice(0, reservationCount);
         const reservedSet = new Set<SemanticSearchResult>(reserved);
         const rerankInput = candidates.filter((r) => !reservedSet.has(r));
         return { reserved, rerankInput };
@@ -3109,7 +3209,13 @@ export class Context {
      */
     private flushPreRerankCandidateDump(
         finalResults: SemanticSearchResult[],
-        meta: { topK: number; rerankerBypassed: boolean; reservedBridgeSlots: number; multiQuery: boolean },
+        meta: {
+            topK: number;
+            rerankerBypassed: boolean;
+            reservedBridgeSlots: number;
+            reservedRefSlots: number;
+            multiQuery: boolean;
+        },
     ): void {
         const staged = this.pendingCandidateDump;
         this.pendingCandidateDump = null;
@@ -3155,6 +3261,7 @@ export class Context {
                 // way.
                 rerankerBypassed: meta.rerankerBypassed,
                 reservedBridgeSlots: meta.reservedBridgeSlots,
+                reservedRefSlots: meta.reservedRefSlots,
                 // MULTI_QUERY=false never reaches weightedRrfMerge, so every
                 // row would read `pools: []` — absence of provenance, not
                 // absence of the pool.

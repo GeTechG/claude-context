@@ -50,6 +50,25 @@ describe('symbol-refs pool — the index is the source', () => {
         expect(ids).toContain('ref2');
     });
 
+    it('resolves from the index alone when there is no language server at all', async () => {
+        // reserve-slots-for-reference-chunks D7: SYMBOL_REFS_LSP=false hands the
+        // pool a null client, and that is the configuration every arm of that
+        // change's runs executed on. A null client must degrade to "the index
+        // is the only source", not throw and not silently skip the index work.
+        const decl = [{ id: 'decl1', relativePath: 'std/Bytes.hx', startLine: 1, endLine: 9 }];
+        const refs = [{ id: 'ref1' }, { id: 'ref2' }];
+        const impls = [{ id: 'impl1' }];
+        const vectorDatabase = makeVectorDb({ decl, refs, impls, hydrate: hydrationFor(['decl1', 'ref1', 'ref2', 'impl1']) });
+        const out = await runSymbolRefsPool({ ...base, parsed: { symbolName: 'Bytes' }, vectorDatabase, lspClient: null } as any);
+        const ids = out.map((r: any) => r.chunk_id ?? r.id ?? r.document?.id);
+        expect(ids).toEqual(expect.arrayContaining(['decl1', 'ref1', 'ref2', 'impl1']));
+        // And it is the same set a silent language server produces: turning the
+        // client off may not change what the index contributes.
+        const vdb2 = makeVectorDb({ decl, refs, impls, hydrate: hydrationFor(['decl1', 'ref1', 'ref2', 'impl1']) });
+        const withSilent = await runSymbolRefsPool({ ...base, parsed: { symbolName: 'Bytes' }, vectorDatabase: vdb2, lspClient: silentLsp() } as any);
+        expect(ids).toEqual(withSilent.map((r: any) => r.chunk_id ?? r.id ?? r.document?.id));
+    });
+
     it('matches the name with its quotes, so Bytes does not match BytesBuffer', async () => {
         const vectorDatabase = makeVectorDb({ decl: [{ id: 'd', relativePath: 'a.hx', startLine: 1, endLine: 2 }], hydrate: hydrationFor(['d']) });
         await runSymbolRefsPool({ ...base, parsed: { symbolName: 'Bytes' }, vectorDatabase, lspClient: silentLsp() } as any);

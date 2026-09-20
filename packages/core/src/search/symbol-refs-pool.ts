@@ -44,8 +44,18 @@ export interface SymbolRefsPoolOptions {
     query: string;
     /** Either a structured qualified-name parse or a single-symbol parse. */
     parsed: SymbolRefsParsed;
-    /** Connected LSP client (caller manages lifecycle). */
-    lspClient: SerenaLspClient;
+    /**
+     * Connected LSP client (caller manages lifecycle), or `null` to resolve
+     * references from the index alone.
+     *
+     * reserve-slots-for-reference-chunks: the language server is consulted at
+     * QUERY time, so its availability makes the pool - and therefore the served
+     * ranking - irreproducible: the same query against the same index returned
+     * `lsp(refs=0)` in one run and `lsp(refs=1)` in the next, which moved a
+     * chunk's merged score by one pool contribution and reshuffled a top-10.
+     * With `null` the pool is a pure function of the index.
+     */
+    lspClient: SerenaLspClient | null;
     /** Milvus connector. */
     vectorDatabase: VectorDatabase;
     /** Target Milvus collection. */
@@ -215,8 +225,12 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
         // keeps contributing what it can and the skip is a recorded decision
         // rather than an absence of rows.
         const [refsResult, implsResult] = await Promise.allSettled([
-            refsSkipped ? Promise.resolve([] as Location[]) : opts.lspClient.findReferencingSymbols(callPath, declRel, opts.maxRefs),
-            opts.lspClient.findImplementations(callPath, declRel, opts.maxImpls),
+            refsSkipped || !opts.lspClient
+                ? Promise.resolve([] as Location[])
+                : opts.lspClient.findReferencingSymbols(callPath, declRel, opts.maxRefs),
+            opts.lspClient
+                ? opts.lspClient.findImplementations(callPath, declRel, opts.maxImpls)
+                : Promise.resolve([] as Location[]),
         ]);
         if (refsResult.status === 'fulfilled') refs = refsResult.value;
         if (implsResult.status === 'fulfilled') impls = implsResult.value;
@@ -304,7 +318,12 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
             // further out.
             const hop2Results = await Promise.allSettled(
                 eligibleSeeds.map((seed) =>
-                    skipReferences(seed.symbolName, 2)
+                    // The client check comes FIRST: `skipReferences` records
+                    // a frequency skip as a side effect, and with no client
+                    // there was never a call to skip. Recording one would
+                    // over-report hop-2 frequency skips in the diagnostics of
+                    // every run made with the language server off.
+                    !opts.lspClient || skipReferences(seed.symbolName, 2)
                         ? Promise.resolve([] as Location[])
                         : opts.lspClient.findReferencingSymbols(seed.symbolName, seed.relativePath, maxHop2Refs),
                 ),
@@ -339,8 +358,16 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
         }
     }
 
+    // `lsp(refs=0, impls=0)` reads the same whether the language server
+    // answered nothing or was never asked. A run made with SYMBOL_REFS_LSP=false
+    // has to be readable as such from its own log, so the two say different
+    // things.
+    const lspLogPart = opts.lspClient
+        ? `lsp(refs=${refs.length}, impls=${impls.length})`
+        : 'lsp(off)';
+
     if (orderedChunkIds.length === 0) {
-        console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, index(refs=${indexRefIds.length}, impls=${indexImplIds.length}), lsp(refs=${refs.length}, impls=${impls.length}), hop2=0 → 0 chunks (no Milvus matches)`);
+        console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, index(refs=${indexRefIds.length}, impls=${indexImplIds.length}), ${lspLogPart}, hop2=0 → 0 chunks (no Milvus matches)`);
         reportFrequency();
         return [];
     }
@@ -353,7 +380,7 @@ export async function runSymbolRefsPool(opts: SymbolRefsPoolOptions): Promise<Hy
 
     const hop2LogPart = maxHops >= 2 ? `, hop2=${hop2CountAdded}` : '';
     const skipLogPart = frequencySkips.length > 0 ? `, refs-skipped-by-frequency=${frequencySkips.length}` : '';
-    console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, index(refs=${indexRefIds.length}, impls=${indexImplIds.length}), lsp(refs=${refs.length}, impls=${impls.length})${hop2LogPart}${skipLogPart} → ${results.length} chunks`);
+    console.log(`[Context] 🔍 symbol-refs pool: symbol="${lspName}" → decl=${declIdCount}, index(refs=${indexRefIds.length}, impls=${indexImplIds.length}), ${lspLogPart}${hop2LogPart}${skipLogPart} → ${results.length} chunks`);
     reportFrequency();
     return results;
 }

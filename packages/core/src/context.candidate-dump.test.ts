@@ -165,6 +165,7 @@ describe('Context — pre-rerank candidate dump', () => {
             topK: 10,
             rerankerBypassed: false,
             reservedBridgeSlots: 0,
+            reservedRefSlots: 0,
             multiQuery: true,
         });
 
@@ -197,6 +198,7 @@ describe('Context — pre-rerank candidate dump', () => {
             topK: 10,
             rerankerBypassed: true,
             reservedBridgeSlots: 2,
+            reservedRefSlots: 1,
             multiQuery: true,
         });
 
@@ -206,6 +208,7 @@ describe('Context — pre-rerank candidate dump', () => {
         expect(payload.topK).toBe(10);
         expect(payload.rerankerBypassed).toBe(true);
         expect(payload.reservedBridgeSlots).toBe(2);
+        expect(payload.reservedRefSlots).toBe(1);
         expect(payload.multiQuery).toBe(true);
         expect(payload).toHaveProperty('rerankerOutputK');
         expect(payload).toHaveProperty('graphExpand');
@@ -224,6 +227,7 @@ describe('Context — pre-rerank candidate dump', () => {
             topK: 10,
             rerankerBypassed: false,
             reservedBridgeSlots: 0,
+            reservedRefSlots: 0,
             multiQuery: true,
         });
         expect(fs.readdirSync(dir)).toEqual([]);
