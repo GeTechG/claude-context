@@ -200,6 +200,14 @@ export function isAstSupported(language: string): boolean {
     return specByLang.has(language.toLowerCase());
 }
 
+/**
+ * Every language id the registry answers to. `AstCodeSplitter.getSupportedLanguages()`
+ * reads this instead of keeping its own copy, which had drifted (see that method).
+ */
+export function astSupportedLanguages(): string[] {
+    return [...specByLang.keys()];
+}
+
 // Loaded tree-sitter Language objects, cached per language id.
 const languageCache = new Map<string, any>();
 

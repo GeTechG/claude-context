@@ -1793,12 +1793,14 @@ export class Context {
         // corpus the vocab is absent → no filter, mentioned_symbols are
         // raw qualified-names; the side-index builder handles filtering
         // through the post-indexing vocab.
+        this.assertSymbolVocabOverrideUsable(codebasePath);
         try {
             const priorVocab = await this.loadSymbolVocabulary(codebasePath);
             const vocabProvider = priorVocab ? () => priorVocab : undefined;
             (splitter as any).setMentionedVocabProvider?.(vocabProvider);
         } catch {
-            // Vocab is best-effort; never block indexing on its absence.
+            // Vocab is best-effort; never block indexing on its absence. An unusable
+            // SYMBOL_VOCAB_FILE is not absence, and has already thrown above.
         }
 
         if (headerMode === 'generated') {
@@ -3388,9 +3390,59 @@ export class Context {
      * Phase 3: filename for the per-codebase symbol vocabulary cache. We
      * stash it next to the codebase so a `git clean` style refresh wipes
      * the stale vocab automatically.
+     *
+     * This is the path a build WRITES, and it is never overridden: the side build
+     * (`infra/side-index-build.js`) snapshots and restores the root files it knows by
+     * name, and a build that wrote somewhere else would slip past that guarantee — and
+     * would overwrite the very vocabulary the run was told to filter through, so a second
+     * run of the same build would use a different one.
      */
     private getSymbolVocabPath(codebasePath: string): string {
         return path.join(codebasePath, '.symbols-vocab.json');
+    }
+
+    /**
+     * The vocabulary a build FILTERS THROUGH, which `SYMBOL_VOCAB_FILE` may point at a
+     * different file under the same root, the way `CHUNK_CONTEXT_FILE` already does for the
+     * chunk-context store. Read-only by construction: see `getSymbolVocabPath`.
+     *
+     * The value is a path that must resolve inside the codebase root — a vocabulary from
+     * another corpus would silently gate this corpus's reference edges. An absolute path
+     * inside the root is accepted; anything that escapes is refused.
+     */
+    private getSymbolVocabReadPath(codebasePath: string): string {
+        const override = (envManager.get('SYMBOL_VOCAB_FILE') || '').trim();
+        if (!override) return this.getSymbolVocabPath(codebasePath);
+        const resolved = path.resolve(codebasePath, override);
+        const root = path.resolve(codebasePath);
+        if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+            throw new Error(`SYMBOL_VOCAB_FILE must resolve inside the codebase root: got ${override}`);
+        }
+        return resolved;
+    }
+
+    /**
+     * Fail a build before it starts rather than after it finishes.
+     *
+     * The index-time read of the vocabulary is best-effort and catches everything, which is
+     * right when the file is simply absent on a fresh corpus. With `SYMBOL_VOCAB_FILE` set
+     * it is exactly wrong: a misspelled name is an ENOENT, the catch turns it into "no
+     * vocabulary", `collectReferencedSymbols` then returns `[]` for every chunk, and two
+     * hours later the index ships with no reference edges at all and nothing in the log
+     * says why. So when the override is set, the file has to be there and parse, now.
+     */
+    private assertSymbolVocabOverrideUsable(codebasePath: string): void {
+        if (!(envManager.get('SYMBOL_VOCAB_FILE') || '').trim()) return;
+        const vocabPath = this.getSymbolVocabReadPath(codebasePath);
+        let parsed: any;
+        try {
+            parsed = JSON.parse(fs.readFileSync(vocabPath, 'utf-8'));
+        } catch (err) {
+            throw new Error(`SYMBOL_VOCAB_FILE=${vocabPath} could not be read or parsed: ${err}`);
+        }
+        if (!Array.isArray(parsed?.symbols) || parsed.symbols.length === 0) {
+            throw new Error(`SYMBOL_VOCAB_FILE=${vocabPath} carries no 'symbols' array; every reference edge would be dropped`);
+        }
     }
 
     /**
@@ -3404,7 +3456,14 @@ export class Context {
         if (!collected || collected.size === 0) return;
         const vocabPath = this.getSymbolVocabPath(codebasePath);
         const sorted = Array.from(collected).sort();
-        const payload = JSON.stringify({ symbols: sorted, generatedAt: new Date().toISOString() }, null, 2);
+        const payload = JSON.stringify({
+            symbols: sorted,
+            generatedAt: new Date().toISOString(),
+            // name-declarations-and-refresh-the-vocabulary: the reader logs this, and a file
+            // without it reads as "unstated provenance" forever after the first build
+            // rewrites it — which would undo the very thing that log line was added for.
+            derived_from: `the symbols indexCodebase harvested from ${codebasePath}`,
+        }, null, 2);
         try {
             await fs.promises.writeFile(vocabPath, payload, 'utf-8');
             this.symbolVocabCache.set(codebasePath, new Set(sorted));
@@ -3666,7 +3725,7 @@ export class Context {
         if (this.symbolVocabCache.has(codebasePath)) {
             return this.symbolVocabCache.get(codebasePath) ?? null;
         }
-        const vocabPath = this.getSymbolVocabPath(codebasePath);
+        const vocabPath = this.getSymbolVocabReadPath(codebasePath);
         try {
             const raw = await fs.promises.readFile(vocabPath, 'utf-8');
             const parsed = JSON.parse(raw);
@@ -3677,7 +3736,15 @@ export class Context {
             }
             const set = new Set<string>(list.filter((s): s is string => typeof s === 'string' && s.length > 0));
             this.symbolVocabCache.set(codebasePath, set);
-            console.log(`[Context] 📚 Loaded symbol vocabulary (${set.size} symbols) from ${vocabPath}`);
+            // name-declarations-and-refresh-the-vocabulary: the date and the
+            // provenance, not only the count. Every reference edge a build writes
+            // is filtered through this file, so a build that does not say WHICH
+            // vocabulary it used cannot be read afterwards — the served index was
+            // built through a vocabulary four index generations old and nothing in
+            // its log said so.
+            const stamp = typeof parsed?.generatedAt === 'string' ? parsed.generatedAt : 'undated';
+            const from = typeof parsed?.derived_from === 'string' ? parsed.derived_from : 'unstated provenance';
+            console.log(`[Context] 📚 Loaded symbol vocabulary (${set.size} symbols, generated ${stamp}, ${from}) from ${vocabPath}`);
             return set;
         } catch {
             this.symbolVocabCache.set(codebasePath, null);

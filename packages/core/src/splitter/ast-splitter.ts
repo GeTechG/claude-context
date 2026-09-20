@@ -6,7 +6,9 @@ import { extractStructural, extractClassStructural, extractTypeRelations } from 
 // Language grammars, splittable node types, symbol-kind mapping and parent-scope
 // set all come from the data-driven registry. Adding a language = one entry there.
 import {
+    astSupportedLanguages,
     getSplittableTypes,
+    isAstSupported,
     loadLanguage,
     NODE_TYPE_TO_SYMBOL_KIND,
     PARAMETER_LIST_NODE_TYPES,
@@ -34,6 +36,14 @@ const REFERENCE_NAME_TYPES = new Set([
     // (`ComplexType > TypePath > type_name`), so without it a type in a
     // signature — the thing a signature change breaks — was invisible.
     'type_name',
+    // name-declarations-and-refresh-the-vocabulary: tree-sitter-ocaml names the
+    // callee of an application `value_name` (`application_expression >
+    // value_path > value_name`), so every OCaml function call was invisible while
+    // `constructor_name` and `class_name` above were collected. Measured
+    // 2026-09-20 on `typer.ml`: 4,134 `value_name` nodes uncollected, and the
+    // chunk calling `add_class_flag` stored `None`, `WithType`, `TFunction` — its
+    // constructors — and not the function it calls.
+    'value_name',
 ]);
 
 // Depth guard, not correctness: a pathological subtree should cost a bounded
@@ -101,6 +111,147 @@ export function declaratorName(node: Parser.SyntaxNode): string | undefined {
         if (DECLARATOR_NAME_TYPES.has(cur.type)) return cur.text || undefined;
         cur = (cur as any).childForFieldName?.('declarator') ?? null;
     }
+    return undefined;
+}
+
+// name-declarations-and-refresh-the-vocabulary: how far `extractSymbolName` may
+// step through wrapper nodes. Three covers `export_statement > lexical_declaration
+// > variable_declarator`, the deepest wrapper chain in this corpus; the bound is a
+// guard, not a rule.
+const WRAPPER_DESCENT_LIMIT = 3;
+
+/**
+ * The declaration a wrapper node wraps, or undefined when the node is not a
+ * wrapper. A wrapper names nothing itself and hands its whole payload to one
+ * child: `export …` exposes it as the `declaration` field, OCaml's
+ * `value_definition` / `type_definition` as their only named child.
+ *
+ * Deliberately structural — no grammar and no language is named — so a grammar
+ * added to the registry later is covered without an entry here.
+ *
+ * TWO GUARDS, both there because a WRONG name is worse than none: it enters the
+ * symbol vocabulary and then gates every other chunk's references.
+ *
+ *  - the single-named-child step is taken only from a node the grammar REGISTRY
+ *    knows as a declaration. Without it the walk followed `export { a };` into
+ *    `export_clause > export_specifier` and named that one-line re-export after
+ *    the class it re-exports — 1,312 of them in this corpus, each a decoy row
+ *    competing with the real declaration. `export_statement` is registered so
+ *    the first step is allowed; `export_clause` is not, so the walk stops there.
+ *  - never step into the node's own `body`. Without it `export default class {
+ *    foo() {} }` walked `class > class_body > method_definition` and named the
+ *    class after its only method.
+ *
+ * A third rule, for duplicates rather than for wrong names: the walk stops when the
+ * payload is ITSELF a registered declaration type, because that node emits its own chunk
+ * and already carries the name, the kind and the `extends`/`implements` the wrapper cannot
+ * work out. `export class X {}` therefore leaves the wrapper chunk unnamed exactly as
+ * today, and `export abstract class X {}` — whose `abstract_class_declaration` emits
+ * nothing, which is why those rows were nameless — is named.
+ *
+ * What this deliberately does NOT name: `export const thing = 3`, because
+ * `lexical_declaration` is not a registered declaration type. That is the
+ * conservative side of the same rule — those rows stay exactly as unnamed as
+ * they are today rather than risk a name the walk cannot justify.
+ */
+export function declarationPayload(node: Parser.SyntaxNode, splittable?: ReadonlySet<string>): Parser.SyntaxNode | undefined {
+    const body = (node as any).childForFieldName?.('body');
+    const notBody = (child: Parser.SyntaxNode | null | undefined): Parser.SyntaxNode | undefined =>
+        (child && (!body || child.id !== body.id)) ? child : undefined;
+    // "Emits its own chunk" is a property of THIS grammar: `enum_declaration` is splittable
+    // in Java and not in TypeScript, and the kind map is global across grammars. With the
+    // language's own list the rule is exact; without one (a caller testing the walk in
+    // isolation) it falls back to the global map, which refuses more and invents nothing.
+    const emitsItsOwnChunk = (child: Parser.SyntaxNode | undefined): Parser.SyntaxNode | undefined => {
+        if (!child) return undefined;
+        const emits = splittable ? splittable.has(child.type) : (child.type in NODE_TYPE_TO_SYMBOL_KIND);
+        return emits ? undefined : child;
+    };
+    const declared = notBody((node as any).childForFieldName?.('declaration'));
+    if (declared) return emitsItsOwnChunk(declared);
+    if (!(node.type in NODE_TYPE_TO_SYMBOL_KIND)) return undefined;
+    const named = node.namedChildren;
+    return named.length === 1 ? emitsItsOwnChunk(notBody(named[0])) : undefined;
+}
+
+/**
+ * Find the identifier child of a tree-sitter node and return its text.
+ *
+ * A free function, like `declaratorName` and `collectReferencedSymbols` beside it: the
+ * splitter's own grammar load is dynamic and this suite cannot run it, so naming is tested
+ * against parsed trees instead.
+ * Tree-sitter conventions vary across grammars; we try a few common shapes.
+ *
+ * `depth` bounds the walk into wrapper nodes (see the end of the method); a
+ * caller never passes it.
+ */
+export function symbolNameFor(node: Parser.SyntaxNode, depth = 0, splittable?: ReadonlySet<string>): string | undefined {
+    // Try field names that grammars commonly use for the symbol identifier.
+    const fieldCandidates = ['name', 'identifier'];
+    for (const field of fieldCandidates) {
+        const fieldNode = (node as any).childForFieldName?.(field);
+        if (fieldNode && fieldNode.text) {
+            return fieldNode.text;
+        }
+    }
+
+    // C/C++ hide the identifier under a `declarator` chain, and the loose
+    // scan below would return the return type — resolve declarators first.
+    const declared = declaratorName(node);
+    if (declared) return declared;
+
+    // Fall back to the first identifier-shaped direct child.
+    for (const child of node.children) {
+        if (
+            child.type === 'identifier' ||
+            child.type === 'type_identifier' ||
+            child.type === 'property_identifier' ||
+            child.type === 'field_identifier' ||
+            child.type === 'name' ||
+            child.type === 'IDENTIFIER' ||
+            // name-declarations-and-refresh-the-vocabulary: OCaml binds names
+            // under `value_name` (`let f x = …`) and `type_constructor`
+            // (`type t = …`), which no other grammar here uses, so adding them
+            // to this scan cannot rename a declaration another grammar already
+            // resolves.
+            child.type === 'value_name' ||
+            child.type === 'type_constructor'
+        ) {
+            if (child.text) return child.text;
+        }
+    }
+
+    // decorated_definition (Python) wraps a function/class — recurse into its inner def.
+    if (node.type === 'decorated_definition') {
+        for (const child of node.children) {
+            if (
+                child.type === 'function_definition' ||
+                child.type === 'class_definition' ||
+                child.type === 'async_function_definition'
+            ) {
+                return symbolNameFor(child, depth + 1, splittable);
+            }
+        }
+    }
+
+    // name-declarations-and-refresh-the-vocabulary: a grammar may wrap the
+    // declaration in a node that carries no name of its own — TS/JS
+    // `export_statement > class_declaration`, OCaml `value_definition >
+    // let_binding` and `type_definition > type_binding`. The chunk then went
+    // in with no `symbol_name`, and an unnamed declaration is not a cosmetic
+    // loss: its name never enters the symbol vocabulary, so it is dropped from
+    // every other chunk's `mentioned_symbols` too, and the whole index loses
+    // that symbol's edges. Measured 2026-09-20 on the served index: 100% of
+    // OCaml's 24,340 rows, 25.6% of TypeScript's, 21.8% of JavaScript's.
+    //
+    // One rule for every grammar: step into the node's `declaration` field if
+    // it has one, else into its only named child, and ask again. Reached ONLY
+    // when the rules above found nothing, so no name that resolves today moves.
+    if (depth < WRAPPER_DESCENT_LIMIT) {
+        const payload = declarationPayload(node, splittable);
+        if (payload) return symbolNameFor(payload, depth + 1, splittable);
+    }
+
     return undefined;
 }
 
@@ -224,12 +375,15 @@ export class AstCodeSplitter implements Splitter {
         // or a named function with a parameter list becomes a chunk — not `int i = 0;`,
         // `let n = … in` or a callback. Types stay because a class the parser misreads as a
         // function (`class CC_DLL Foo {…}`) holds its public enums and nested classes in that body.
+        // The same list `isSplittable` reads, as a set, so the naming walk can tell a payload
+        // that will emit its own chunk in THIS grammar from one that will not.
+        const splittableSet = new Set(splittableTypes);
         const traverse = (currentNode: Parser.SyntaxNode, parentScope?: string, insideBody = false) => {
             const isSplittable = splittableTypes.includes(currentNode.type);
             let scopeForChildren = parentScope;
             const kind = NODE_TYPE_TO_SYMBOL_KIND[currentNode.type];
             const emit = isSplittable && (!insideBody
-                || (Boolean(this.extractSymbolName(currentNode)) && (TYPE_SYMBOL_KINDS.has(kind) || hasParameterList(currentNode))));
+                || (Boolean(this.extractSymbolName(currentNode, splittableSet)) && (TYPE_SYMBOL_KINDS.has(kind) || hasParameterList(currentNode))));
             // A body is the node's own `body` field. Wrappers (`export …`), declarations holding a
             // type (C++ `field_declaration` → `struct`) and OCaml `let` bindings have none, so OCaml
             // chunks as before: a local `let result = if … in` answered an exact-symbol query (u213).
@@ -241,7 +395,7 @@ export class AstCodeSplitter implements Splitter {
                 const nodeText = code.slice(currentNode.startIndex, currentNode.endIndex);
 
                 if (nodeText.trim().length > 0) {
-                    const rawSymbolName = this.extractSymbolName(currentNode);
+                    const rawSymbolName = this.extractSymbolName(currentNode, splittableSet);
                     // C++ out-of-line definitions carry their class in the name
                     // (`CoreConstants::get_enum_values`). Store the bare name so
                     // lookups work as in every other language, and keep the
@@ -329,53 +483,8 @@ export class AstCodeSplitter implements Splitter {
         return chunks;
     }
 
-    /**
-     * Find the identifier child of a tree-sitter node and return its text.
-     * Tree-sitter conventions vary across grammars; we try a few common shapes.
-     */
-    private extractSymbolName(node: Parser.SyntaxNode): string | undefined {
-        // Try field names that grammars commonly use for the symbol identifier.
-        const fieldCandidates = ['name', 'identifier'];
-        for (const field of fieldCandidates) {
-            const fieldNode = (node as any).childForFieldName?.(field);
-            if (fieldNode && fieldNode.text) {
-                return fieldNode.text;
-            }
-        }
-
-        // C/C++ hide the identifier under a `declarator` chain, and the loose
-        // scan below would return the return type — resolve declarators first.
-        const declared = declaratorName(node);
-        if (declared) return declared;
-
-        // Fall back to the first identifier-shaped direct child.
-        for (const child of node.children) {
-            if (
-                child.type === 'identifier' ||
-                child.type === 'type_identifier' ||
-                child.type === 'property_identifier' ||
-                child.type === 'field_identifier' ||
-                child.type === 'name' ||
-                child.type === 'IDENTIFIER'
-            ) {
-                if (child.text) return child.text;
-            }
-        }
-
-        // decorated_definition (Python) wraps a function/class — recurse into its inner def.
-        if (node.type === 'decorated_definition') {
-            for (const child of node.children) {
-                if (
-                    child.type === 'function_definition' ||
-                    child.type === 'class_definition' ||
-                    child.type === 'async_function_definition'
-                ) {
-                    return this.extractSymbolName(child);
-                }
-            }
-        }
-
-        return undefined;
+    private extractSymbolName(node: Parser.SyntaxNode, splittable?: ReadonlySet<string>): string | undefined {
+        return symbolNameFor(node, 0, splittable);
     }
 
     private async refineChunks(chunks: CodeChunk[], _originalCode: string): Promise<CodeChunk[]> {
@@ -460,26 +569,25 @@ export class AstCodeSplitter implements Splitter {
      * Check if AST splitting is supported for the given language
      */
     static isLanguageSupported(language: string): boolean {
-        return AstCodeSplitter.SUPPORTED_LANGUAGES.includes(language.toLowerCase());
+        return isAstSupported(language);
     }
 
     /**
-     * The languages this splitter actually supports. #130: this static was
-     * called by `Context.getSplitterInfo()` through an untyped `require`, so a
-     * call to a method that did not exist surfaced as a runtime `TypeError`
-     * instead of a compile error. The list is the one `isLanguageSupported`
-     * reads — one list, two readers — and the caller now binds this class
-     * through a typed import, so the type checker holds the seam.
+     * The languages this splitter actually supports. #130 made this static the
+     * one list two readers share; it was still a SECOND list beside the grammar
+     * registry, and the two drifted: the registry has had `ocaml` since the Haxe
+     * compiler's own sources were indexed, the hand-written list never got it, so
+     * `getSplitterStrategyForLanguage('ocaml')` reported `langchain` for 24,340
+     * rows the AST splitter had in fact parsed — and a caller that believed the
+     * report skipped them (2026-09-20, the vocabulary pass of
+     * name-declarations-and-refresh-the-vocabulary did exactly that).
+     *
+     * The registry is the source; `split()` has always read it and nothing else.
+     * Adding a language stays one entry there.
      */
     static getSupportedLanguages(): string[] {
-        return [...AstCodeSplitter.SUPPORTED_LANGUAGES];
+        return astSupportedLanguages();
     }
-
-    private static readonly SUPPORTED_LANGUAGES: string[] = [
-        'javascript', 'js', 'typescript', 'ts', 'python', 'py',
-        'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala',
-        'haxe', 'hx', 'hxml'
-    ];
 }
 
 /** A parameter list among the node's descendants within four levels, not looking into its body. */
