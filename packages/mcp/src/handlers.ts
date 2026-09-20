@@ -13,6 +13,8 @@ import {
     clampLimit,
     formatExpansion,
 } from "./prose-graph-neighbours.js";
+import { formatReferences } from "./find-references-tool.js";
+import type { ReferenceRelation } from "@zilliz/claude-context-core";
 import {
     isUsageLogEnabled,
     newRequestId,
@@ -1751,6 +1753,153 @@ export class ToolHandlers {
         } catch (error: any) {
             return {
                 content: [{ type: "text", text: `Error listing categories: ${error?.message || String(error)}` }],
+                isError: true
+            };
+        }
+    }
+
+    /**
+     * find-references-as-a-tool: "what mentions / extends / implements X",
+     * answered from the served index's own scalar fields. Read-only, no
+     * ranking, no model call. Registration is gated by FIND_REFERENCES_TOOL
+     * (default off) in index.ts; this handler is the same code either way.
+     */
+    public async handleFindReferences(args: any) {
+        const { path: codebasePath, symbol, relations, categories, limit } = args ?? {};
+
+        if (typeof symbol !== "string" || symbol.trim().length === 0) {
+            return {
+                content: [{ type: "text", text: "Error: find_references requires a non-empty `symbol` — the exact declared name, not a question." }],
+                isError: true
+            };
+        }
+        // `%` is a Milvus `like` wildcard and nothing escapes it, so `Nod%`
+        // would prefilter `Node`, `NodePath`, `Node2D` … The exact post-check in
+        // findReferences() would then drop every one of them and the answer
+        // would be a confident, expensive "no such edge". No declared symbol
+        // contains one; say so instead.
+        if (symbol.includes('%')) {
+            return {
+                content: [{ type: "text", text: "Error: `symbol` must be a declared name, and `%` is a wildcard in the index filter, not a character in a name. Pass the exact symbol." }],
+                isError: true
+            };
+        }
+
+        try {
+            await this.syncIndexedCodebasesFromCloud();
+
+            const effectivePath = (typeof codebasePath === 'string' && codebasePath.trim().length > 0)
+                ? codebasePath
+                : resolveKnowledgeRoot();
+            if (!effectivePath) {
+                return {
+                    content: [{ type: "text", text: `Error: no 'path' was provided and the knowledge root could not be resolved. Set LOCAL_RAG_KNOWLEDGE_ROOT, add local-rag.config.json, or pass an absolute path.` }],
+                    isError: true
+                };
+            }
+            const absolutePath = ensureAbsolutePath(effectivePath);
+            if (!fs.existsSync(absolutePath)) {
+                return {
+                    content: [{ type: "text", text: `Error: Path '${absolutePath}' does not exist. Original input: '${effectivePath}'` }],
+                    isError: true
+                };
+            }
+            if (!fs.statSync(absolutePath).isDirectory()) {
+                return {
+                    content: [{ type: "text", text: `Error: Path '${absolutePath}' is not a directory` }],
+                    isError: true
+                };
+            }
+
+            // The SAME collection search_code would query: the active
+            // generation remap first (its path hash names the collection), then
+            // the snapshot's indexed root. A tool that answered from a
+            // different collection than the one being served would be
+            // measuring something nobody is using.
+            const knowledgeRootPath = resolveKnowledgeRoot();
+            const mapped = knowledgeRootPath
+                ? servingRoot.mapPathIntoServingRoot(knowledgeRootPath, absolutePath)
+                : null;
+            const usingGeneration = !!mapped && !!mapped.generation;
+            const searchRoot = mapped ? mapped.servingRoot : absolutePath;
+            const indexedCodebasePath = this.snapshotManager.findIndexedCodebasePath(absolutePath);
+            const indexingCodebasePath = this.snapshotManager.findIndexingCodebasePath(absolutePath);
+            const matchedCodebase = [indexedCodebasePath, indexingCodebasePath]
+                .filter((codebase): codebase is string => codebase !== undefined)
+                .sort((a, b) => b.length - a.length)[0];
+            const searchCodebasePath = usingGeneration ? searchRoot : (matchedCodebase || searchRoot);
+
+            // Without this, an unindexed path answers "No index edges for X"
+            // where search_code answers "not indexed" — the tool would be
+            // making a claim about an index that is not there.
+            if (matchedCodebase === undefined && !(await this.context.hasIndex(searchRoot))) {
+                return {
+                    content: [{ type: "text", text: `Error: Codebase '${absolutePath}' is not indexed. Please index it first using the index_codebase tool.` }],
+                    isError: true
+                };
+            }
+
+            // Category scope: the same shared cleaner/builder search_code uses
+            // (infra/lib/search-shared.js), so one spelling of a category name
+            // works on both surfaces.
+            let scopeFilter: string | undefined = undefined;
+            let scopedCategories: string[] | undefined = undefined;
+            if (Array.isArray(categories) && categories.length > 0) {
+                const { cleaned, invalid } = searchShared.cleanCategories(categories);
+                if (invalid.length > 0) {
+                    return {
+                        content: [{ type: 'text', text: `Error: Invalid category names in categories: ${JSON.stringify(invalid)}. Use plain directory names from list_categories (letters, digits, '.', '_', '-', '/').` }],
+                        isError: true
+                    };
+                }
+                if (cleaned.length > 0) {
+                    scopedCategories = cleaned;
+                    scopeFilter = searchShared.categoryExprFor(cleaned);
+                }
+            }
+
+            // An unknown relation is an ERROR, not a silent widening to all
+            // three: `calls` is the vocabulary of our own evaluation set
+            // (`structural_kind: "callers"`), so it is exactly the value an
+            // agent would try, and answering it with everything would look
+            // like the tool understood.
+            const validRelations: ReferenceRelation[] = ['mentions', 'extends', 'implements'];
+            let askedRelations: ReferenceRelation[] | undefined = undefined;
+            if (Array.isArray(relations) && relations.length > 0) {
+                const invalidRelations = relations.filter((r: any) => !validRelations.includes(r));
+                if (invalidRelations.length > 0) {
+                    return {
+                        content: [{ type: 'text', text: `Error: unknown relations ${JSON.stringify(invalidRelations)}. The index records ${validRelations.join(', ')} — there is no \`calls\` edge on this build.` }],
+                        isError: true
+                    };
+                }
+                askedRelations = relations as ReferenceRelation[];
+            }
+
+            const answer = await this.context.findReferences(searchCodebasePath, {
+                symbol: symbol.trim(),
+                relations: askedRelations,
+                scopeFilter,
+                limit: typeof limit === 'number' ? limit : undefined,
+            });
+
+            // A query that threw makes the answer a non-answer, and the client
+            // has to be able to see that without reading the prose.
+            const anyFailed = answer.groups.some((g) => g.failed);
+            return {
+                content: [{ type: "text", text: formatReferences(answer, scopedCategories) }],
+                ...(anyFailed ? { isError: true } : {}),
+                structuredContent: {
+                    symbol: answer.symbol,
+                    bounded: answer.bounded,
+                    groups: answer.groups,
+                    limit: answer.limit,
+                    categories: scopedCategories || null,
+                },
+            };
+        } catch (error: any) {
+            return {
+                content: [{ type: "text", text: `Error in find_references: ${error?.message || String(error)}` }],
                 isError: true
             };
         }

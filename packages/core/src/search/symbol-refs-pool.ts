@@ -28,6 +28,12 @@ import { ParsedQName } from './query-classifier';
 import { Location, SerenaLspClient } from './serena-lsp-client';
 import { SymbolFrequencyGate } from './symbol-frequency';
 import {
+    escapeMilvusLiteral,
+    fetchDeclarationChunks,
+    fetchImplementingChunkIds,
+    fetchReferencingChunkIds,
+} from './symbol-index-refs';
+import {
     HybridSearchResult,
     VectorDatabase,
     VectorDocument,
@@ -125,10 +131,6 @@ const HYBRID_OUTPUT_FIELDS = [
     'content_type', 'symbol_kind', 'symbol_name', 'parent_symbol', 'heading_path',
     'imports', 'extends', 'implements', 'mentioned_symbols',
 ];
-
-function escapeMilvusLiteral(s: string): string {
-    return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-}
 
 function namePathFor(parsed: SymbolRefsParsed): string {
     if ('className' in parsed && 'methodName' in parsed) {
@@ -429,96 +431,6 @@ async function fetchSeedMetadata(
         if (m) ordered.push(m);
     }
     return ordered;
-}
-
-interface DeclarationChunk {
-    id: string;
-    relativePath: string;
-}
-
-async function fetchDeclarationChunks(
-    vectorDatabase: VectorDatabase,
-    collection: string,
-    symbolName: string,
-    maxResults: number,
-): Promise<DeclarationChunk[]> {
-    const safeName = escapeMilvusLiteral(symbolName);
-    // Restrict to code/docstring chunks — the LSP works on source files,
-    // not docs. Limit to a small number; we only need the canonical
-    // file path to seed refs/impls.
-    const filter = `symbol_name == "${safeName}" and content_type in ["code","docstring"]`;
-    let rows: Record<string, any>[];
-    try {
-        rows = await vectorDatabase.query(collection, filter, ['id', 'relativePath'], maxResults * 4);
-    } catch (err) {
-        console.warn(`[Context] ⚠️ symbol-refs declaration lookup failed: ${err}`);
-        return [];
-    }
-    const out: DeclarationChunk[] = [];
-    const seenPaths = new Set<string>();
-    for (const row of rows) {
-        const id = row?.id;
-        const rel = row?.relativePath;
-        if (typeof id !== 'string' || typeof rel !== 'string' || rel.length === 0) continue;
-        if (seenPaths.has(rel)) continue;
-        seenPaths.add(rel);
-        out.push({ id, relativePath: rel });
-        if (out.length >= maxResults) break;
-    }
-    return out;
-}
-
-// reference-edges-from-the-index: the chunks that REFERENCE a symbol, read from
-// the index instead of from a language server.
-//
-// Why the index is the primary source here: measured 2026-09-19 over 98 type
-// declarations of the Haxe standard library, Serena returned three or more
-// external referencing files for 5 of them and implementations for none, and it
-// returned no cross-file references at all for C++ or JS/TS. A pool whose only
-// source answers that rarely runs empty whatever its weight.
-//
-// `mentioned_symbols` is a JSON-encoded string[], so the name is matched with its
-// quotes — `"Bytes"` never matches `"BytesBuffer"`, which a bare substring would.
-async function fetchReferencingChunkIds(
-    vectorDatabase: VectorDatabase,
-    collection: string,
-    symbolName: string,
-    limit: number,
-): Promise<string[]> {
-    if (!symbolName) return [];
-    const needle = escapeMilvusLiteral(`"${symbolName}"`);
-    try {
-        const rows = await vectorDatabase.query(collection, `mentioned_symbols like "%${needle}%"`, ['id'], limit);
-        return rows.map((r) => r?.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
-    } catch (err) {
-        console.warn(`[Context] ⚠️ symbol-refs index references query failed for ${symbolName}: ${err}`);
-        return [];
-    }
-}
-
-// The chunks that DECLARE a type derived from this one. `extends` holds a single
-// name, `implements` a JSON-encoded string[] — the same quoting rule applies.
-async function fetchImplementingChunkIds(
-    vectorDatabase: VectorDatabase,
-    collection: string,
-    symbolName: string,
-    limit: number,
-): Promise<string[]> {
-    if (!symbolName) return [];
-    const exact = escapeMilvusLiteral(symbolName);
-    const needle = escapeMilvusLiteral(`"${symbolName}"`);
-    try {
-        const rows = await vectorDatabase.query(
-            collection,
-            `extends == "${exact}" or implements like "%${needle}%"`,
-            ['id'],
-            limit,
-        );
-        return rows.map((r) => r?.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
-    } catch (err) {
-        console.warn(`[Context] ⚠️ symbol-refs index implementations query failed for ${symbolName}: ${err}`);
-        return [];
-    }
 }
 
 async function locationToChunkIds(

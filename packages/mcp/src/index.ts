@@ -28,6 +28,7 @@ import { createRerankerInstance } from "./reranker.js";
 import { SnapshotManager } from "./snapshot.js";
 import { SyncManager } from "./sync.js";
 import { ToolHandlers } from "./handlers.js";
+import { findReferencesEnabled, findReferencesTools } from "./find-references-tool.js";
 
 class ContextMcpServer {
     private server: Server;
@@ -321,6 +322,11 @@ This tool is versatile and can be used before completing various tasks to retrie
                             required: ["answer", "request_ids"]
                         }
                     },
+                    // find-references-as-a-tool D6: off by default. The
+                    // agent-visible surface does not change until the owner
+                    // flips FIND_REFERENCES_TOOL in chat; rollback is the
+                    // switch off.
+                    ...(findReferencesTools() as any[]),
                 ]
             };
         });
@@ -336,6 +342,9 @@ This tool is versatile and can be used before completing various tasks to retrie
                     return await this.toolHandlers.handleSearchCode(args);
                 case "expand_context":
                     return await this.toolHandlers.handleExpandContext(args);
+                case "find_references":
+                    if (!findReferencesEnabled()) throw new Error(`Unknown tool: ${name}`);
+                    return await this.toolHandlers.handleFindReferences(args);
                 case "record_answer":
                     return await this.toolHandlers.handleRecordAnswer(args);
                 case "clear_index":

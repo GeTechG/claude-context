@@ -45,6 +45,8 @@ import { buildComparisonBridgePool } from './search/comparison-bridge';
 import { SerenaLspClient } from './search/serena-lsp-client';
 import { runSymbolRefsPool, SymbolRefsParsed } from './search/symbol-refs-pool';
 import { createSymbolFrequencyGate, loadSymbolFrequencyTable, SymbolFrequencyGate } from './search/symbol-frequency';
+import { findReferences, FindReferencesAnswer } from './search/find-references';
+import { ReferenceRelation } from './search/symbol-index-refs';
 import { applyRewriting, RewriteFlags, RewriteResult } from './search/query-rewrite';
 import { Reranker } from './reranker';
 import { extractCandidateSymbols } from './enrichment';
@@ -1314,6 +1316,30 @@ export class Context {
             console.log(`[Context] 🔢 symbol frequency: ${gate.identifiers} identifiers over ${gate.documents} documents${gate.boundDocuments === null ? ', no bound configured' : `, bound ${gate.boundDocuments} documents (quantile ${gate.boundQuantile})`}`);
         }
         return gate;
+    }
+
+    /**
+     * find-references-as-a-tool: "what mentions / extends / implements X",
+     * answered from the index's scalar fields with no ranking in the path.
+     *
+     * Code-side collection, like the symbol-refs pool: the edges live on
+     * code/docstring rows. The frequency gate is the pool's own — a subject the
+     * corpus uses everywhere gets the bound as its answer rather than an
+     * arbitrary slice.
+     *
+     * Read-only and additive: `searchCode` and every pool behave identically
+     * whether this is ever called.
+     */
+    public async findReferences(
+        codebasePath: string,
+        args: { symbol: string; relations?: ReferenceRelation[]; scopeFilter?: string; limit?: number },
+    ): Promise<FindReferencesAnswer> {
+        return findReferences({
+            vectorDatabase: this.vectorDatabase,
+            collection: this.getCollectionName(codebasePath),
+            frequency: this.getSymbolFrequencyGate(codebasePath),
+            ...args,
+        });
     }
 
     /**
