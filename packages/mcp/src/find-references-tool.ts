@@ -34,7 +34,7 @@ Use it for "what depends on / uses / extends / implements X" once you know the e
 
 What it is NOT: not a search. It does no embedding, no ranking and no scoring, it does not accept natural language, and it returns nothing for a name the index does not carry — use search_code to find the name first.
 
-Measured on the served index (2026-09-20, \`infra/cross-corpus-runs/find-references-as-a-tool-2026-09-20\`): for a symbol declared as a TYPE (class / interface / typedef) 0.95 of its known dependents are present in these fields; for a FUNCTION or METHOD, 0.47 — so "what calls this function" is answered only partly on this build, and on JavaScript and C++ often not at all. Type-level questions are what this tool is good at.
+Measured on the served index (2026-09-21, \`infra/cross-corpus-runs/rebuild-for-the-reference-tool-2026-09-21\`): of 281 labelled dependents 0.89 come back, by question kind — who implements or extends this type 1.00, what is affected by this type 0.88, what calls this 0.78 — at precision 0.59, so a returned file is not always a real dependent. That is served recall on this index at that date, measured against another tool's graph edges rather than ground truth.
 
 A symbol the corpus uses everywhere gets the document count and a suggestion to narrow, not a truncated list: picking which rows to show would be the ranking decision this tool exists to avoid.`;
 
