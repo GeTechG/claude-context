@@ -3617,12 +3617,17 @@ export class Context {
             }
         }
 
+        // serve-a-symbol-graph-of-the-served-index: symbol names are DATA. In a plain `{}`,
+        // `bySymbol['constructor']` reads Object.prototype.constructor, so the entry was
+        // dropped and its fields were written onto the global `Object`; `toString`,
+        // `valueOf`, `hasOwnProperty` and `__proto__` fared the same. No prototype, no
+        // inherited names. JSON.stringify writes a null-prototype object like any other.
         const bySymbol: Record<string, {
             canonical_chunk_ids: string[];
             mentioned_by_chunk_ids: string[];
             abstract_underlying?: string[];
             typedef_alias?: string;
-        }> = {};
+        }> = Object.create(null);
 
         // rag-graph-comparison-bridge: v3-2 inverted indexes. Built from
         // every canonical chunk (post-demote-marker filter), not just the
@@ -3712,7 +3717,8 @@ export class Context {
         }
 
         const finalizeBucketMap = (m: Map<string, Set<string>>): Record<string, string[]> => {
-            const out: Record<string, string[]> = {};
+            // Same as `bySymbol`: a package or supertype called `__proto__` is a key.
+            const out: Record<string, string[]> = Object.create(null);
             const keys = Array.from(m.keys()).sort();
             for (const k of keys) {
                 const arr = Array.from(m.get(k)!).sort();
