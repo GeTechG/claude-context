@@ -1454,21 +1454,37 @@ export class Context {
     }
 
     /**
+     * audit-evidence-matching-and-bridge-reachability (2.1): which symbol graph this
+     * process reads. `SYMBOL_GRAPH_FILE` names one explicitly, so a graph built beside
+     * the served index can be measured without swapping the file the index serves from.
+     * Unset — the normal case — resolves to the codebase's own `.symbols-graph.json`,
+     * unchanged. This overrides ONLY the loader's path: nothing writes here.
+     */
+    public getSymbolGraphPath(codebasePath: string): string {
+        const override = (envManager.get('SYMBOL_GRAPH_FILE') || '').trim();
+        return override ? path.resolve(override) : path.join(codebasePath, '.symbols-graph.json');
+    }
+
+    /**
      * rag-graph-layer Phase 3.4: lazy cached load of the per-codebase
      * `.symbols-graph.json`. Returns null sentinel on missing/parse-error;
      * subsequent calls hit the cache without re-reading the disk.
+     *
+     * Keyed by the RESOLVED side path, not by the codebase: two codebases pointed at
+     * one override share the parse, and a test that moves the override does not read a
+     * cache entry belonging to the other file.
      */
     private loadGraphIndex(codebasePath: string): GraphIndex | null {
-        if (this.graphIndexCache.has(codebasePath)) {
-            return this.graphIndexCache.get(codebasePath) ?? null;
+        const sidePath = this.getSymbolGraphPath(codebasePath);
+        if (this.graphIndexCache.has(sidePath)) {
+            return this.graphIndexCache.get(sidePath) ?? null;
         }
-        const sidePath = path.join(codebasePath, '.symbols-graph.json');
         if (!fs.existsSync(sidePath)) {
-            this.graphIndexCache.set(codebasePath, null);
+            this.graphIndexCache.set(sidePath, null);
             return null;
         }
         const idx = GraphIndex.load(sidePath);
-        this.graphIndexCache.set(codebasePath, idx);
+        this.graphIndexCache.set(sidePath, idx);
         if (idx) {
             console.log(`[Context] 🕸️  Loaded graph index (${idx.symbolCount} symbols, version ${idx.version}) from ${sidePath}`);
         }
@@ -2315,6 +2331,13 @@ export class Context {
                 // (v3-3) so all downstream graph paths (expansion +
                 // comparison-bridge) accept both versions.
                 const v3Compatible = !collectionVersion || collectionVersion === 'v3' || collectionVersion === 'v6';
+                // audit-evidence-matching-and-bridge-reachability (2.1): GRAPH_EXPAND keeps the
+                // legacy version gate exactly as it is. The OPT-IN comparison bridge does not:
+                // a split address already speaks the v3 metadata contract — v6 is split and was
+                // allowlisted for that reason — so the generation NAME of a split index is not by
+                // itself a reason to refuse. The graph-schema gate, the caps and the stale-id
+                // fetch behaviour below are untouched, and the bridge still ships off.
+                const bridgeEligible = v3Compatible || this.getCollectionAddress(codebasePath).isSplit;
                 if (graphExpand >= 1 && v3Compatible) {
                     const graphIndex = this.loadGraphIndex(codebasePath);
                     if (graphIndex) {
@@ -2401,10 +2424,11 @@ export class Context {
 
                 // rag-graph-comparison-bridge: 5th pool. Activated when the
                 // env-flag is on, the query is comparison-shaped, the graph
-                // is v3-2, and v3 collections are in use. Failure modes are
-                // silent (empty pool); the comparison-bridge module never
-                // throws and degrades to a no-op on missing data.
-                if (this.getComparisonBridgeEnabled() && v3Compatible && isComparisonShape(query)) {
+                // supports the bridge schema, and the collections are eligible
+                // (legacy v3/v6, or split — see `bridgeEligible` above).
+                // Failure modes are silent (empty pool); the comparison-bridge
+                // module never throws and degrades to a no-op on missing data.
+                if (this.getComparisonBridgeEnabled() && bridgeEligible && isComparisonShape(query)) {
                     const graphIndex = this.loadGraphIndex(codebasePath);
                     if (graphIndex && graphIndex.supportsComparisonBridge()) {
                         const seeds = semanticMerged.slice(0, this.getGraphSeedK());
