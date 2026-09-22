@@ -2,6 +2,7 @@ import Parser from 'tree-sitter';
 import { Splitter, CodeChunk } from './index';
 import { MarkdownSplitter, MentionedVocabProvider } from './markdown-splitter';
 import { extractStructural, extractClassStructural, extractTypeRelations } from './ast-structural-extractor';
+import { envManager } from '../utils/env-manager';
 
 // Language grammars, splittable node types, symbol-kind mapping and parent-scope
 // set all come from the data-driven registry. Adding a language = one entry there.
@@ -105,6 +106,39 @@ export function collectReferencedSymbols(
  * (`StringName _global_enums(...)` was indexed as the symbol "StringName").
  * Pointer/reference/array/init declarators nest, hence the walk.
  */
+/**
+ * keep-doc-comments-with-their-declarations: `CODE_CHUNK_LEADING_COMMENTS=on` extends a code
+ * chunk over the comments written for its declaration. `off` (the default) is the splitter
+ * as it was, byte for byte.
+ */
+export function leadingCommentsEnabled(): boolean {
+    return (envManager.get('CODE_CHUNK_LEADING_COMMENTS') || '').trim().toLowerCase() === 'on';
+}
+
+/**
+ * The first of the comments that directly document `node`, or null. A comment is the node's
+ * preceding sibling (or precedes such a comment), is a comment by its GRAMMAR node type —
+ * every grammar here names them `*comment*`, so there is no language table — begins its own
+ * line (a trailing `x(); // note` belongs to the statement it ends), and has no blank line
+ * between it and what follows. A license header above a blank line therefore stays out.
+ *
+ * ponytail: stops at annotations/metadata between a comment and its declaration
+ * (`@:keep`, `@Override`); skipping those is the upgrade if the corpus measurement says
+ * they hide a large share of doc comments.
+ */
+export function firstLeadingComment(node: Parser.SyntaxNode, code: string): Parser.SyntaxNode | null {
+    let first: Parser.SyntaxNode | null = null;
+    let below: Parser.SyntaxNode = node;
+    for (let prev = node.previousSibling; prev && prev.type.includes('comment'); prev = prev.previousSibling) {
+        if (below.startPosition.row - prev.endPosition.row > 1) break;
+        const lineStart = code.lastIndexOf('\n', prev.startIndex - 1) + 1;
+        if (code.slice(lineStart, prev.startIndex).trim() !== '') break;
+        first = prev;
+        below = prev;
+    }
+    return first;
+}
+
 export function declaratorName(node: Parser.SyntaxNode): string | undefined {
     let cur: Parser.SyntaxNode | null = (node as any).childForFieldName?.('declarator') ?? null;
     for (let depth = 0; cur && depth < 8; depth++) {
@@ -370,6 +404,7 @@ export class AstCodeSplitter implements Splitter {
         const fileStructural = extractStructural(node, language);
         // reference-edges-from-the-index: resolved once per file, not per chunk.
         const referenceVocab = this.mentionedVocabProvider?.();
+        const withLeadingComments = leadingCommentsEnabled();
 
         // no-chunks-inside-function-bodies: inside a function body only a named type declaration
         // or a named function with a parameter list becomes a chunk — not `int i = 0;`,
@@ -390,9 +425,13 @@ export class AstCodeSplitter implements Splitter {
             const bodyForChildren = insideBody || (isSplittable && (kind === 'function' || kind === 'method') && currentNode.childForFieldName('body') !== null);
 
             if (emit) {
-                const startLine = currentNode.startPosition.row + 1;
+                // keep-doc-comments-with-their-declarations: only the START moves; everything
+                // read off the node below (symbol, kind, structure, references) is the declaration's.
+                const lead = withLeadingComments ? firstLeadingComment(currentNode, code) : null;
+                const startNode = lead ?? currentNode;
+                const startLine = startNode.startPosition.row + 1;
                 const endLine = currentNode.endPosition.row + 1;
-                const nodeText = code.slice(currentNode.startIndex, currentNode.endIndex);
+                const nodeText = code.slice(startNode.startIndex, currentNode.endIndex);
 
                 if (nodeText.trim().length > 0) {
                     const rawSymbolName = this.extractSymbolName(currentNode, splittableSet);
