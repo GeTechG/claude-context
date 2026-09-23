@@ -129,6 +129,11 @@ export function coverGapsEnabled(): boolean {
     return (envManager.get('CODE_CHUNK_COVER_GAPS') || '').trim().toLowerCase() === 'on';
 }
 
+/** split-oversized-declarations-on-syntax: how a declaration longer than the chunk size is cut. */
+export function splitOversizedMode(): 'lines' | 'syntax' {
+    return (envManager.get('CODE_CHUNK_SPLIT_OVERSIZED') || '').trim().toLowerCase() === 'syntax' ? 'syntax' : 'lines';
+}
+
 /**
  * A doc comment by its own syntax: `/**` (not `/**` + `/` or a `/***` banner), `/*!`, `///`
  * (not a `////` rule), `//!`, OCaml `(**` (not a `(***` banner), GDScript `##` (not `###`). The doc-comment forms of the corpus's languages — a
@@ -140,6 +145,13 @@ export function coverGapsEnabled(): boolean {
  * ponytail: a fixed knob; the pre-build count reports the lines it drops.
  */
 const GAP_MIN_CHARS = 40;
+
+/** The offset each line of `code` starts at; line n (from 1) starts at index n - 1. */
+function lineStartOffsets(code: string): number[] {
+    const starts = [0];
+    for (let i = code.indexOf('\n'); i >= 0; i = code.indexOf('\n', i + 1)) starts.push(i + 1);
+    return starts;
+}
 
 /** A comment or an import by the grammar's own node type — no language table. */
 function isCommentOrImport(node: Parser.SyntaxNode): boolean {
@@ -328,6 +340,10 @@ export function symbolNameFor(node: Parser.SyntaxNode, depth = 0, splittable?: R
 
 export class AstCodeSplitter implements Splitter {
     private chunkSize: number = 2500;
+    // split-oversized-declarations-on-syntax: the declaration node behind each chunk the walk
+    // emitted, so an oversized one can be cut on its own syntax. Keyed by the chunk object, so
+    // nothing leaks into the chunk itself.
+    private declarationNodes = new WeakMap<CodeChunk, Parser.SyntaxNode>();
     private chunkOverlap: number = 300;
     private parser: Parser;
     private langchainFallback: any; // LangChainCodeSplitter for fallback
@@ -442,6 +458,7 @@ export class AstCodeSplitter implements Splitter {
         // reference-edges-from-the-index: resolved once per file, not per chunk.
         const referenceVocab = this.mentionedVocabProvider?.();
         const commentsMode = leadingCommentsMode();
+        const splitSyntax = splitOversizedMode() === 'syntax';
         const withLeadingComments = commentsMode !== 'off';
         // cover-code-outside-declarations-and-attach-doc-blocks: what each declaration chunk
         // covers, as [start, end) offsets, so the gap pass can tell what lies outside them.
@@ -506,7 +523,7 @@ export class AstCodeSplitter implements Splitter {
                         [symbolName, rawSymbolName, symbolScope ?? parentScope],
                     );
 
-                    chunks.push({
+                    const declarationChunk: CodeChunk = {
                         content: nodeText,
                         metadata: {
                             startLine,
@@ -530,7 +547,9 @@ export class AstCodeSplitter implements Splitter {
                             ...(typeRelations.typedef_alias ? { typedef_alias: typeRelations.typedef_alias } : {}),
                             ...(referenced.length > 0 ? { mentioned_symbols: referenced } : {}),
                         }
-                    });
+                    };
+                    chunks.push(declarationChunk);
+                    if (splitSyntax) this.declarationNodes.set(declarationChunk, currentNode);
 
                     // If this node introduces a parent scope (class/interface/struct/etc.),
                     // its descendants inherit it as parent_symbol.
@@ -644,7 +663,7 @@ export class AstCodeSplitter implements Splitter {
             if (!symbolName && codeNodes.map((n) => n.text).join('').replace(/\s+/g, '').length < GAP_MIN_CHARS) { fragments.push(group); continue; }
             const referenced = new Set<string>();
             for (const n of group) for (const name of collectReferencedSymbols(n, referenceVocab, [symbolName])) referenced.add(name);
-            chunks.push({
+            const gapChunk: CodeChunk = {
                 content: code.slice(first.startIndex, last.endIndex),
                 metadata: {
                     startLine: first.startPosition.row + 1,
@@ -656,7 +675,9 @@ export class AstCodeSplitter implements Splitter {
                     ...(imports && imports.length > 0 ? { imports } : {}),
                     ...(referenced.size > 0 ? { mentioned_symbols: [...referenced] } : {}),
                 },
-            });
+            };
+            chunks.push(gapChunk);
+            if (single && splitOversizedMode() === 'syntax') this.declarationNodes.set(gapChunk, single);
         }
         this.attachFragments(fragments, code, covered, declarations);
         return chunks;
@@ -727,13 +748,112 @@ export class AstCodeSplitter implements Splitter {
         return symbolNameFor(node, 0, splittable);
     }
 
-    private async refineChunks(chunks: CodeChunk[], _originalCode: string): Promise<CodeChunk[]> {
+    private async refineChunks(chunks: CodeChunk[], originalCode: string): Promise<CodeChunk[]> {
         const refined: CodeChunk[] = [];
+        const syntax = splitOversizedMode() === 'syntax';
+        let lineStarts: number[] | null = null;
         for (const chunk of chunks) {
-            if (chunk.content.length <= this.chunkSize) refined.push(chunk);
-            else refined.push(...this.splitLargeChunk(chunk));
+            if (chunk.content.length <= this.chunkSize) { refined.push(chunk); continue; }
+            const node = syntax ? this.declarationNodes.get(chunk) : undefined;
+            const pieces = node ? this.splitBySyntax(chunk, node, originalCode, lineStarts ??= lineStartOffsets(originalCode)) : null;
+            refined.push(...(pieces ?? this.splitLargeChunk(chunk)));
         }
         return collapseIdenticalChunks(refined);
+    }
+
+    /**
+     * split-oversized-declarations-on-syntax — cAST inside one declaration. The declaration is
+     * descended into, child by child, while a node does not fit together with the text it
+     * carries; what the options attached above, tiny units and a descended node's head ride
+     * forward, so a signature and its doc block open the piece with the body's first statements.
+     * Units pack greedily while the piece stays within `chunkSize` (a glued unit or a leaf may
+     * exceed it); a group with under GAP_MIN_CHARS non-whitespace characters joins its
+     * neighbour. Pieces never overlap and inherit the declaration's metadata. Null when the
+     * chunk's text cannot be located at its start line — the caller keeps the line split.
+     */
+    private splitBySyntax(chunk: CodeChunk, node: Parser.SyntaxNode, code: string, lineStarts: number[]): CodeChunk[] | null {
+        const lineStart = lineStarts[(chunk.metadata.startLine ?? 1) - 1];
+        if (lineStart === undefined) return null;
+        const from = code.indexOf(chunk.content, lineStart);
+        if (from < 0 || from > (lineStarts[chunk.metadata.startLine ?? 1] ?? code.length)) return null;
+        const to = from + chunk.content.length;
+
+        // Units in document order. Text waiting to open the next unit is `carry`: what the options
+        // attached above the node, a tiny unit (`{`, `private`), and the head of a node about to be
+        // descended into (its signature). So a piece never ends on a signature or an opener, and a
+        // doc block stays with the declaration's first statements. A node is descended into when
+        // it would not fit TOGETHER with what it carries. A last tiny unit (`}`) joins the one
+        // before it. A leaf too large for a piece stays whole.
+        const folded: Array<[number, number]> = [];
+        let carry: number | null = from < node.startIndex ? from : null;
+        // Where the tiny units in the carry start: tininess is measured on them alone, never on
+        // a doc block or a head riding in front of them.
+        let tinyFrom: number | null = null;
+        // Where the head in the carry starts: its bound is measured on the head alone, never on a
+        // doc block in front of it (a long doc block must not cut a signature from its body).
+        let headFrom: number | null = null;
+        const small = (a: number, b: number) => code.slice(a, b).replace(/\s+/g, '').length < GAP_MIN_CHARS;
+        const tooBig = (n: Parser.SyntaxNode) => n.childCount > 0 && n.endIndex - (carry ?? n.startIndex) > this.chunkSize;
+        const visit = (n: Parser.SyntaxNode, last: boolean) => {
+            if (n.endIndex <= n.startIndex) return;
+            if (tooBig(n)) {
+                const kids = n.children.filter((c) => c.endIndex > c.startIndex);
+                kids.forEach((c, i) => {
+                    const next = kids[i + 1];
+                    const start = carry ?? c.startIndex;
+                    // A head: the sibling after it will be descended even from this unit's start. Only
+                    // a short one rides (a signature, not a run of list items), or the carry would
+                    // grow without bound over a long enum or array.
+                    if (next && next.childCount > 0 && next.endIndex - start > this.chunkSize
+                        && c.endIndex - (headFrom ?? c.startIndex) < this.chunkSize / 4) {
+                        carry = start; headFrom ??= c.startIndex; tinyFrom = null; return;
+                    }
+                    visit(c, last && i === kids.length - 1);
+                });
+                return;
+            }
+            const start = carry ?? n.startIndex;
+            if (!last && small(tinyFrom ?? n.startIndex, n.endIndex)) { carry = start; tinyFrom ??= n.startIndex; return; }
+            carry = null;
+            tinyFrom = null;
+            headFrom = null;
+            folded.push([start, n.endIndex]);
+        };
+        visit(node, node.endIndex >= to);
+        if (node.endIndex < to) folded.push([carry ?? node.endIndex, to]);
+        else if (carry !== null) folded.push([carry, node.endIndex]);
+        if (folded.length > 1 && small(...folded[folded.length - 1])) folded[folded.length - 2][1] = folded.pop()![1];
+
+        const groups: Array<[number, number]> = [];
+        for (const [s, e] of folded) {
+            const open = groups[groups.length - 1];
+            if (open && e - open[0] <= this.chunkSize) open[1] = e; else groups.push([s, e]);
+        }
+        const tiny = ([s, e]: [number, number]) => code.slice(s, e).replace(/\s+/g, '').length < GAP_MIN_CHARS;
+        for (let i = 0; i < groups.length && groups.length > 1;) {
+            if (!tiny(groups[i])) { i++; continue; }
+            if (i > 0) { groups[i - 1][1] = groups[i][1]; groups.splice(i, 1); }
+            else { groups[1][0] = groups[0][0]; groups.splice(0, 1); }
+        }
+
+        // Text between two groups (whitespace, a macro's line-continuation `\\` that no node
+        // holds) goes to the earlier piece, so no character of the declaration is dropped.
+        for (let i = 0; i + 1 < groups.length; i++) groups[i][1] = groups[i + 1][0];
+
+        const lineOf = (offset: number) => {
+            let lo = 0, hi = lineStarts.length - 1;
+            while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (lineStarts[mid] <= offset) lo = mid; else hi = mid - 1; }
+            return lo + 1;
+        };
+        const pieces: CodeChunk[] = [];
+        for (const [s, e] of groups) {
+            const raw = code.slice(s, e);
+            const content = raw.trim();
+            if (!content) continue;
+            const start = s + (raw.length - raw.trimStart().length);
+            pieces.push({ content, metadata: { ...chunk.metadata, startLine: lineOf(start), endLine: lineOf(start + content.length) } });
+        }
+        return pieces.length ? pieces : null;
     }
 
     /**
