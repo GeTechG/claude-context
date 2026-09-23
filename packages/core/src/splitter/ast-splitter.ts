@@ -548,7 +548,7 @@ export class AstCodeSplitter implements Splitter {
         traverse(node);
 
         if (chunks.length > 0 && coverGapsEnabled()) {
-            chunks.push(...this.packGaps(node, code, covered, language, filePath, fileStructural.imports, referenceVocab, splittableSet, commentsMode));
+            chunks.push(...this.packGaps(node, code, covered, chunks, language, filePath, fileStructural.imports, referenceVocab, splittableSet, commentsMode));
             // Document order, stable: a declaration keeps its place before what follows it.
             chunks.sort((a, b) => (a.metadata.startLine ?? 0) - (b.metadata.startLine ?? 0));
         }
@@ -583,7 +583,8 @@ export class AstCodeSplitter implements Splitter {
     private packGaps(
         root: Parser.SyntaxNode,
         code: string,
-        covered: ReadonlyArray<[number, number]>,
+        covered: Array<[number, number]>,
+        declarations: CodeChunk[],
         language: string,
         filePath: string | undefined,
         imports: string[] | undefined,
@@ -630,6 +631,7 @@ export class AstCodeSplitter implements Splitter {
         close();
 
         const chunks: CodeChunk[] = [];
+        const fragments: Parser.SyntaxNode[][] = [];
         for (const group of groups) {
             if (group.every((n) => isCommentOrImport(n))) continue;
             const first = group[0];
@@ -639,7 +641,7 @@ export class AstCodeSplitter implements Splitter {
             const single = codeNodes.length === 1 && codeNodes[0].type in NODE_TYPE_TO_SYMBOL_KIND ? codeNodes[0] : null;
             const symbolName = single ? this.extractSymbolName(single, splittableSet) : undefined;
             // The size floor is for fragments; a named declaration is kept however small.
-            if (!symbolName && codeNodes.map((n) => n.text).join('').replace(/\s+/g, '').length < GAP_MIN_CHARS) continue;
+            if (!symbolName && codeNodes.map((n) => n.text).join('').replace(/\s+/g, '').length < GAP_MIN_CHARS) { fragments.push(group); continue; }
             const referenced = new Set<string>();
             for (const n of group) for (const name of collectReferencedSymbols(n, referenceVocab, [symbolName])) referenced.add(name);
             chunks.push({
@@ -656,7 +658,69 @@ export class AstCodeSplitter implements Splitter {
                 },
             });
         }
+        this.attachFragments(fragments, code, covered, declarations);
         return chunks;
+    }
+
+    /**
+     * A fragment under the size floor (`#ifdef X`, `template <typename T>`, `@:native(…)`,
+     * `const X = {`, `#endif`, `} // namespace`) that sits directly against a declaration chunk —
+     * only whitespace with at most one line break between them — joins it: a fragment directly
+     * above moves the declaration's start up, one directly below moves its end down. Above is
+     * tried first, fragments bottom-up, so a stack (`#ifdef` over `template <…>` over a class)
+     * joins link by link; then below, top-down. A fragment touching no declaration stays out.
+     * Of nested declarations sharing the edge, the outermost takes it. A join that would make
+     * the chunk longer than the chunk size is skipped. A run touching declarations on both sides
+     * joins the one below (`#endif` + `#ifdef Y` between two functions opens the second).
+     */
+    private attachFragments(fragments: Parser.SyntaxNode[][], code: string, covered: Array<[number, number]>, declarations: CodeChunk[]): void {
+        // Where a node's text really ends: preprocessor nodes carry their line's newline.
+        const endOf = (n: Parser.SyntaxNode) => n.startIndex + n.text.trimEnd().length;
+        const lineOf = (offset: number) => (code.slice(0, offset).match(/\n/g) || []).length + 1;
+        const touching = (a: number, b: number) => {
+            const between = code.slice(a, b);
+            return between.trim() === '' && (between.match(/\n/g) || []).length <= 1;
+        };
+        // A fragment is cut at blank lines first: only the run of nodes that actually touches a
+        // declaration may join it (an `#include` two lines above an `#ifdef` stays out).
+        const runs: Parser.SyntaxNode[][] = [];
+        for (const group of fragments) {
+            let run: Parser.SyntaxNode[] = [];
+            for (const n of group) {
+                if (run.length && (code.slice(endOf(run[run.length - 1]), n.startIndex).match(/\n/g) || []).length > 1) { runs.push(run); run = []; }
+                run.push(n);
+            }
+            if (run.length) runs.push(run);
+        }
+        const candidates = runs.filter((run) => !run.every((n) => isCommentOrImport(n)));
+        const left = new Set(candidates);
+        for (const group of [...candidates].reverse()) {
+            const start = group[0].startIndex, end = endOf(group[group.length - 1]);
+            let best = -1;
+            covered.forEach(([s, e], i) => {
+                if (s >= end && touching(end, s) && (best < 0 || s < covered[best][0] || (s === covered[best][0] && e > covered[best][1]))) best = i;
+            });
+            // A join never pushes a declaration past the chunk size: that would cut it by lines.
+            if (best < 0 || covered[best][1] - start > this.chunkSize) continue;
+            const chunk = declarations[best];
+            chunk.content = code.slice(start, covered[best][1]);
+            chunk.metadata.startLine = group[0].startPosition.row + 1;
+            covered[best][0] = start;
+            left.delete(group);
+        }
+        for (const group of candidates) {
+            if (!left.has(group)) continue;
+            const start = group[0].startIndex, end = endOf(group[group.length - 1]);
+            let best = -1;
+            covered.forEach(([s, e], i) => {
+                if (e <= start && touching(e, start) && (best < 0 || e > covered[best][1] || (e === covered[best][1] && s < covered[best][0]))) best = i;
+            });
+            if (best < 0 || end - covered[best][0] > this.chunkSize) continue;
+            const chunk = declarations[best];
+            chunk.content = code.slice(covered[best][0], end);
+            chunk.metadata.endLine = lineOf(end);
+            covered[best][1] = end;
+        }
     }
 
     private extractSymbolName(node: Parser.SyntaxNode, splittable?: ReadonlySet<string>): string | undefined {
