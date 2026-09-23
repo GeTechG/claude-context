@@ -331,6 +331,10 @@ export class Context {
     // queries serially. Null = the branch is dormant, not merely silent.
     private candidateProvenance: Map<string, { pool: string; rank: number }[]> | null = null;
     private pendingCandidateDump: { query: string; rows: PreRerankCandidateRow[] } | null = null;
+    // measure-and-floor-the-code-pool-at-the-merge: each domain pool as it was
+    // BEFORE the merge cut it, so a row the merge dropped is still visible.
+    // Armed and reset with candidateProvenance.
+    private candidateDomainPools: Record<string, { subject: string; chunk_id: string | null; relativePath: string; startLine: number; endLine: number; rank: number }[]> | null = null;
 
     // rag-graph-layer Phase 2: in-memory accumulator for the cross-domain
     // graph builder. Populated by processChunkBatch as each chunk gets
@@ -984,6 +988,18 @@ export class Context {
         ]);
 
         console.log(`[Context] 🔍 Pool sizes for "${subject}": code=${codePool.length} doc=${docPool.length} symbol=${symbolPool.length} symbolRefs=${symbolRefsPool.length}`);
+        if (this.candidateDomainPools) {
+            for (const [name, pool] of [['code', codePool], ['doc', docPool]] as const) {
+                (this.candidateDomainPools[name] ??= []).push(...pool.map((r, i) => ({
+                    subject,
+                    chunk_id: r.document.id ?? null,
+                    relativePath: r.document.relativePath,
+                    startLine: r.document.startLine,
+                    endLine: r.document.endLine,
+                    rank: i + 1,
+                })));
+            }
+        }
 
         const SYMBOL_POOL_WEIGHT = 2.0;
         const mergePools: { results: HybridSearchResult[]; weight: number; name?: string }[] = [
@@ -2151,6 +2167,7 @@ export class Context {
         // sweep-symbol-refs-pool-weight: arm the pre-rerank candidate dump for
         // this search, or leave both fields null so the merge collects nothing.
         this.candidateProvenance = (process.env.CANDIDATE_LOG_DIR || '').trim() ? new Map() : null;
+        this.candidateDomainPools = this.candidateProvenance ? {} : null;
         this.pendingCandidateDump = null;
 
         // The gate is the whole address (#152): the split pools below are already
@@ -3325,6 +3342,10 @@ export class Context {
                 graphExpand: this.getGraphExpand(),
                 proseGraphExpand: this.getProseGraphExpand(),
                 candidates: staged.rows,
+                // Each domain pool before the merge, in its own order; a
+                // comparison split lists both subjects' rows, told apart by
+                // `subject`.
+                domain_pools: this.candidateDomainPools ?? {},
             };
             fs.writeFileSync(path.join(dir, `${safeQid}.json`), JSON.stringify(payload, null, 2));
         } catch (err) {

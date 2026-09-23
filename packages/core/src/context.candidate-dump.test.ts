@@ -102,10 +102,12 @@ describe('Context — pre-rerank candidate dump', () => {
         process.env.CANDIDATE_LOG_DIR = dir;
         await ctx.semanticSearch('/no/such/codebase', 'query');
         expect(ctx.candidateProvenance).toBeInstanceOf(Map);
+        expect(ctx.candidateDomainPools).toEqual({});
 
         delete process.env.CANDIDATE_LOG_DIR;
         await ctx.semanticSearch('/no/such/codebase', 'query');
         expect(ctx.candidateProvenance).toBeNull();
+        expect(ctx.candidateDomainPools).toBeNull();
     });
 
     it('the merge records which pool contributed a chunk, and at what rank', () => {
@@ -213,6 +215,28 @@ describe('Context — pre-rerank candidate dump', () => {
         expect(payload).toHaveProperty('rerankerOutputK');
         expect(payload).toHaveProperty('graphExpand');
         expect(payload).toHaveProperty('proseGraphExpand');
+    });
+
+    it('writes each domain pool as it was before the merge', () => {
+        const ctx = makeCtx();
+        process.env.CANDIDATE_LOG_DIR = dir;
+        process.env.CANDIDATE_LOG_QID = 'pools';
+        ctx.candidateProvenance = new Map();
+        // measure-and-floor-the-code-pool-at-the-merge: 'c15' was cut by the
+        // merge, so it is in no candidate row, yet the pool still lists it.
+        ctx.candidateDomainPools = {
+            code: [{ subject: 'q', chunk_id: 'c1', relativePath: 'src/c1.ts', startLine: 1, endLine: 10, rank: 1 },
+                   { subject: 'q', chunk_id: 'c15', relativePath: 'src/c15.ts', startLine: 1, endLine: 10, rank: 15 }],
+            doc: [],
+        };
+        ctx.maybeStagePreRerankCandidates('q', [semanticRow('c1', 0.02)]);
+        ctx.flushPreRerankCandidateDump([semanticRow('c1', 9)], {
+            topK: 10, rerankerBypassed: false, reservedBridgeSlots: 0, reservedRefSlots: 0, multiQuery: true,
+        });
+        const payload = JSON.parse(fs.readFileSync(path.join(dir, 'pools.json'), 'utf8'));
+        expect(payload.candidates.map((c: any) => c.chunk_id)).toEqual(['c1']);
+        expect(payload.domain_pools.code.map((r: any) => [r.chunk_id, r.rank])).toEqual([['c1', 1], ['c15', 15]]);
+        expect(payload.domain_pools.doc).toEqual([]);
     });
 
     it('stages nothing and writes nothing when the dump is off', () => {
