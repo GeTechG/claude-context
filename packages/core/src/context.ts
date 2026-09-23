@@ -1,4 +1,4 @@
-import { classDocXmlToMarkdown } from './enrichment/class-doc-xml';
+import { classDocXmlToMarkdownWithLines, XmlLineSpan } from './enrichment/class-doc-xml';
 import {
     Splitter,
     CodeChunk,
@@ -4190,10 +4190,12 @@ export class Context {
         // the C++ sources. Rewrite it to Markdown so it lands in the
         // prose pool with a heading path; any other XML is metadata and
         // is skipped rather than indexed as markup.
+        let xmlLineSpans: XmlLineSpan[] | null = null;
         if (language === 'xml') {
-            const markdown = classDocXmlToMarkdown(content);
-            if (markdown === null) return null;
-            content = markdown;
+            const rendered = classDocXmlToMarkdownWithLines(content);
+            if (rendered === null) return null;
+            content = rendered.markdown;
+            xmlLineSpans = rendered.lineSpans;
             language = 'markdown';
         }
 
@@ -4208,6 +4210,31 @@ export class Context {
                 );
             } : undefined,
         });
+        // cite-class-reference-xml-by-its-own-lines: a chunk of the rendering is cited by
+        // the XML lines its Markdown lines came from, so its range names the file on disk.
+        if (xmlLineSpans) {
+            const spans = xmlLineSpans;
+            for (const chunk of chunks) {
+                const from = Math.max(1, chunk.metadata.startLine || 1);
+                // A chunk past the rendering would keep Markdown lines silently: refuse instead.
+                if (from > spans.length) throw new Error(`class-reference chunk at Markdown line ${from} is past the ${spans.length}-line rendering of ${filePath}`);
+                const to = Math.min(spans.length, Math.max(from, chunk.metadata.endLine || from));
+                let start = Infinity, end = 0;
+                for (let i = from; i <= to; i++) { start = Math.min(start, spans[i - 1][0]); end = Math.max(end, spans[i - 1][1]); }
+                chunk.metadata.startLine = start;
+                chunk.metadata.endLine = end;
+            }
+            // Two identical pieces of one element's rendering (a repeated "Output:" line) now
+            // share a range and so an id; the file keeps one, as for any identical pair.
+            const seen = new Set<string>();
+            const unique = chunks.filter((chunk) => {
+                const key = `${chunk.metadata.startLine}:${chunk.metadata.endLine}:${chunk.metadata.part ?? ''}:${chunk.content}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+            });
+            return { content, chunks: unique };
+        }
         return { content, chunks };
     }
 

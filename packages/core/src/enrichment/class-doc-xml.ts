@@ -107,38 +107,76 @@ function signature(name: string, block: string, attrs: Record<string, string>): 
     return `${name}(${params.join(', ')})${retType ? ` -> ${retType}` : ''}${qualifiers}`;
 }
 
+/** An XML line span `[from, to]`, 1-based and inclusive. */
+export type XmlLineSpan = [number, number];
+
 /**
  * Convert one class-reference XML document to Markdown.
  * Returns null when the input is not such a document — the caller skips it.
  */
 export function classDocXmlToMarkdown(xml: string): string | null {
+    const rendered = classDocXmlToMarkdownWithLines(xml);
+    return rendered ? rendered.markdown : null;
+}
+
+/**
+ * cite-class-reference-xml-by-its-own-lines: the same Markdown, plus, for each of
+ * its lines (index 0 = Markdown line 1), the span of XML lines of the element that
+ * line was rendered from. A chunk cut from the Markdown is cited by the union of
+ * its lines' spans, so its range names the file on disk and not the rendering.
+ */
+export function classDocXmlToMarkdownWithLines(xml: string): { markdown: string; lineSpans: XmlLineSpan[] } | null {
     const open = CLASS_OPEN.exec(xml);
     if (!open) return null;
     const classAttrs = parseAttributes(open[1]);
     if (!classAttrs.name) return null;
 
-    const out: string[] = [`# ${classAttrs.name}`, ''];
-    if (classAttrs.inherits) out.push(`Inherits: \`${classAttrs.inherits}\``, '');
+    const newlines: number[] = [];
+    for (let i = xml.indexOf('\n'); i >= 0; i = xml.indexOf('\n', i + 1)) newlines.push(i);
+    const lineAt = (offset: number): number => {
+        let lo = 0, hi = newlines.length;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (newlines[mid] < offset) lo = mid + 1; else hi = mid; }
+        return lo + 1;
+    };
+    const spanOf = (m: RegExpExecArray | RegExpMatchArray, base = 0): XmlLineSpan =>
+        [lineAt(base + m.index!), lineAt(base + m.index! + m[0].length - 1)];
+    const elementSpan = (scope: string, tag: string, base = 0): XmlLineSpan | null => {
+        const m = new RegExp(`<${tag}(?:\\s[^>]*)?>[\\s\\S]*?</${tag}>`).exec(scope);
+        return m ? spanOf(m, base) : null;
+    };
+    const tagLine = (tag: string): XmlLineSpan => {
+        const i = xml.search(new RegExp(`<${tag}>`));
+        return i >= 0 ? [lineAt(i), lineAt(i)] : classLine;
+    };
+
+    // One entry per pushed string, which may hold several lines: they all share its span.
+    const out: Array<[string, XmlLineSpan]> = [];
+    const push = (span: XmlLineSpan, ...texts: string[]) => { for (const t of texts) out.push([t, span]); };
+
+    const classLine: XmlLineSpan = [lineAt(open.index), lineAt(open.index)];
+    push(classLine, `# ${classAttrs.name}`, '');
+    if (classAttrs.inherits) push(classLine, `Inherits: \`${classAttrs.inherits}\``, '');
 
     // The class-level <description> is the one before the first entry section;
     // every later <description> belongs to a method/member/signal/constant.
     const bodyStart = xml.indexOf('</brief_description>');
     const firstSection = xml.search(/<(constructors|methods|operators|members|signals|constants|theme_items)>/);
-    const head = xml.slice(bodyStart >= 0 ? bodyStart : 0, firstSection >= 0 ? firstSection : undefined);
+    const headFrom = bodyStart >= 0 ? bodyStart : 0;
+    const head = xml.slice(headFrom, firstSection >= 0 ? firstSection : undefined);
 
-    for (const [tag, text] of [
-        ['brief_description', sectionText(xml, 'brief_description')],
-        ['description', sectionText(head, 'description')],
+    for (const [text, span] of [
+        [sectionText(xml, 'brief_description'), elementSpan(xml, 'brief_description')],
+        [sectionText(head, 'description'), elementSpan(head, 'description', headFrom)],
     ] as const) {
-        if (text) out.push(text, '');
-        void tag;
+        if (text) push(span ?? classLine, text, '');
     }
 
     const links = [...xml.matchAll(/<link(?:\s+title="([^"]*)")?\s*>([\s\S]*?)<\/link>/g)];
     if (links.length) {
-        out.push('## Tutorials', '');
-        for (const l of links) out.push(`- ${l[1] ? `[${decodeEntities(l[1])}](${l[2].trim()})` : l[2].trim()}`);
-        out.push('');
+        const tutorials = elementSpan(xml, 'tutorials') ?? classLine;
+        push(tutorials, '## Tutorials', '');
+        for (const l of links) push(spanOf(l), `- ${l[1] ? `[${decodeEntities(l[1])}](${l[2].trim()})` : l[2].trim()}`);
+        push(tutorials, '');
     }
 
     for (const section of ENTRY_SECTIONS) {
@@ -146,59 +184,78 @@ export function classDocXmlToMarkdown(xml: string): string | null {
         const entries = [...xml.matchAll(
             new RegExp(`<${singular}\\s+([^>]*?)>([\\s\\S]*?)</${singular}>`, 'g'))];
         if (!entries.length) continue;
-        out.push(`## ${section[0].toUpperCase()}${section.slice(1)}`, '');
-        for (const [, rawAttrs, block] of entries) {
+        push(tagLine(section), `## ${section[0].toUpperCase()}${section.slice(1)}`, '');
+        for (const entry of entries) {
+            const [, rawAttrs, block] = entry;
             const attrs = parseAttributes(rawAttrs);
-            out.push(`### ${signature(attrs.name, block, attrs)}`, '');
+            const span = spanOf(entry);
+            push(span, `### ${signature(attrs.name, block, attrs)}`, '');
             const desc = sectionText(block, 'description');
-            if (desc) out.push(desc, '');
+            if (desc) push(span, desc, '');
         }
     }
 
     const members = [...xml.matchAll(/<member\s+([^>]*?)>([\s\S]*?)<\/member>/g)];
     if (members.length) {
-        out.push('## Properties', '');
-        for (const [, rawAttrs, body] of members) {
+        push(tagLine('members'), '## Properties', '');
+        for (const entry of members) {
+            const [, rawAttrs, body] = entry;
             const a = parseAttributes(rawAttrs);
-            out.push(`### ${a.name}: ${a.type}${a.default ? ` = ${a.default}` : ''}`, '');
+            const span = spanOf(entry);
+            push(span, `### ${a.name}: ${a.type}${a.default ? ` = ${a.default}` : ''}`, '');
             const desc = bbcodeToMarkdown(body);
-            if (desc) out.push(desc, '');
+            if (desc) push(span, desc, '');
         }
     }
 
     const signals = [...xml.matchAll(/<signal\s+([^>]*?)>([\s\S]*?)<\/signal>/g)];
     if (signals.length) {
-        out.push('## Signals', '');
-        for (const [, rawAttrs, block] of signals) {
+        push(tagLine('signals'), '## Signals', '');
+        for (const entry of signals) {
+            const [, rawAttrs, block] = entry;
             const a = parseAttributes(rawAttrs);
-            out.push(`### ${signature(a.name, block, a)}`, '');
+            const span = spanOf(entry);
+            push(span, `### ${signature(a.name, block, a)}`, '');
             const desc = sectionText(block, 'description');
-            if (desc) out.push(desc, '');
+            if (desc) push(span, desc, '');
         }
     }
 
     const constants = [...xml.matchAll(/<constant\s+([^>]*?)>([\s\S]*?)<\/constant>/g)];
     if (constants.length) {
-        out.push('## Constants', '');
-        for (const [, rawAttrs, body] of constants) {
+        push(tagLine('constants'), '## Constants', '');
+        for (const entry of constants) {
+            const [, rawAttrs, body] = entry;
             const a = parseAttributes(rawAttrs);
+            const span = spanOf(entry);
             const enumTag = a.enum ? ` (enum \`${a.enum}\`)` : '';
-            out.push(`### ${a.name} = ${a.value}${enumTag}`, '');
+            push(span, `### ${a.name} = ${a.value}${enumTag}`, '');
             const desc = bbcodeToMarkdown(body);
-            if (desc) out.push(desc, '');
+            if (desc) push(span, desc, '');
         }
     }
 
     const themeItems = [...xml.matchAll(/<theme_item\s+([^>]*?)>([\s\S]*?)<\/theme_item>/g)];
     if (themeItems.length) {
-        out.push('## Theme properties', '');
-        for (const [, rawAttrs, body] of themeItems) {
+        push(tagLine('theme_items'), '## Theme properties', '');
+        for (const entry of themeItems) {
+            const [, rawAttrs, body] = entry;
             const a = parseAttributes(rawAttrs);
-            out.push(`### ${a.name}: ${a.type}${a.default ? ` = ${a.default}` : ''}`, '');
+            const span = spanOf(entry);
+            push(span, `### ${a.name}: ${a.type}${a.default ? ` = ${a.default}` : ''}`, '');
             const desc = bbcodeToMarkdown(body);
-            if (desc) out.push(desc, '');
+            if (desc) push(span, desc, '');
         }
     }
 
-    return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+    // The text rule is the one the Markdown-only version applied to the joined string
+    // (`\n{3,}` → `\n\n`, then trim): run on lines, a blank line directly after a blank
+    // line is dropped, and leading and trailing blank lines go. Each kept line keeps its span.
+    const lines: Array<[string, XmlLineSpan]> = [];
+    for (const [text, span] of out) for (const line of text.split('\n')) {
+        if (line === '' && (lines.length === 0 || lines[lines.length - 1][0] === '')) continue;
+        lines.push([line, span]);
+    }
+    while (lines.length && lines[lines.length - 1][0] === '') lines.pop();
+    return { markdown: lines.map(([line]) => line).join('\n') + '\n', lineSpans: lines.map(([, span]) => span) };
 }
