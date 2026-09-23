@@ -239,6 +239,18 @@ describe('Context — pre-rerank candidate dump', () => {
         expect(payload.domain_pools.doc).toEqual([]);
     });
 
+    it('stages the whole reranker input, not a fixed 50', () => {
+        const ctx = makeCtx();
+        ctx.candidateProvenance = new Map();
+        const rows = Array.from({ length: 120 }, (_, i) => semanticRow(`c${i}`, 1 / (i + 1)));
+        ctx.maybeStagePreRerankCandidates('q', rows);
+        expect(ctx.pendingCandidateDump.rows).toHaveLength(50); // no reranker: the old top-50
+        ctx.hasReranker = () => true;
+        ctx.getRerankerInputK = () => 75;
+        ctx.maybeStagePreRerankCandidates('q', rows);
+        expect(ctx.pendingCandidateDump.rows).toHaveLength(75);
+    });
+
     it('stages nothing and writes nothing when the dump is off', () => {
         const ctx = makeCtx();
         delete process.env.CANDIDATE_LOG_DIR;

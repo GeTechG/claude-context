@@ -3251,7 +3251,10 @@ export class Context {
      */
     private maybeStagePreRerankCandidates(query: string, candidates: SemanticSearchResult[]): void {
         if (!this.candidateProvenance) return;
-        const rows: PreRerankCandidateRow[] = candidates.slice(0, 50).map((r, i) => ({
+        // The whole reranker input (50 at the served bound, as before); without a reranker the
+        // old top-50. measure-and-floor-the-code-pool-at-the-merge reads a wider bound whole.
+        const limit = this.hasReranker() ? this.getRerankerInputK() : 50;
+        const rows: PreRerankCandidateRow[] = candidates.slice(0, limit).map((r, i) => ({
             rank: i + 1,
             chunk_id: r.chunk_id ?? null,
             relativePath: r.relativePath,
