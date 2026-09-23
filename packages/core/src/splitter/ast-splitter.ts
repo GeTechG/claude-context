@@ -112,7 +112,42 @@ export function collectReferencedSymbols(
  * as it was, byte for byte.
  */
 export function leadingCommentsEnabled(): boolean {
-    return (envManager.get('CODE_CHUNK_LEADING_COMMENTS') || '').trim().toLowerCase() === 'on';
+    return leadingCommentsMode() !== 'off';
+}
+
+/**
+ * cover-code-outside-declarations-and-attach-doc-blocks: `doc` attaches only doc comments
+ * (see `isDocComment`); `on` every leading comment, as measured for v8q0; anything else `off`.
+ */
+export function leadingCommentsMode(): 'off' | 'on' | 'doc' {
+    const value = (envManager.get('CODE_CHUNK_LEADING_COMMENTS') || '').trim().toLowerCase();
+    return value === 'on' || value === 'doc' ? value : 'off';
+}
+
+/** cover-code-outside-declarations-and-attach-doc-blocks: pack the code outside every declaration. */
+export function coverGapsEnabled(): boolean {
+    return (envManager.get('CODE_CHUNK_COVER_GAPS') || '').trim().toLowerCase() === 'on';
+}
+
+/**
+ * A doc comment by its own syntax: `/**` (not `/**` + `/` or a `/***` banner), `/*!`, `///`
+ * (not a `////` rule), `//!`, OCaml `(**` (not a `(***` banner), GDScript `##` (not `###`). The doc-comment forms of the corpus's languages — a
+ * property of the languages, not a list of corpus files.
+ */
+/**
+ * A gap group whose text outside comments and whitespace is shorter than this is not emitted:
+ * stray braces, `namespace x {` openers, a lone `#endif`.
+ * ponytail: a fixed knob; the pre-build count reports the lines it drops.
+ */
+const GAP_MIN_CHARS = 40;
+
+/** A comment or an import by the grammar's own node type — no language table. */
+function isCommentOrImport(node: Parser.SyntaxNode): boolean {
+    return /comment|import|include|using|use_declaration|open_module/.test(node.type);
+}
+
+export function isDocComment(text: string): boolean {
+    return /^(\/\*\*(?![\/*])|\/\*!|\/\/\/(?!\/)|\/\/!|\(\*\*(?![)*])|##(?!#))/.test(text.trimStart());
 }
 
 /**
@@ -126,11 +161,13 @@ export function leadingCommentsEnabled(): boolean {
  * (`@:keep`, `@Override`); skipping those is the upgrade if the corpus measurement says
  * they hide a large share of doc comments.
  */
-export function firstLeadingComment(node: Parser.SyntaxNode, code: string): Parser.SyntaxNode | null {
+export function firstLeadingComment(node: Parser.SyntaxNode, code: string, docOnly = false): Parser.SyntaxNode | null {
     let first: Parser.SyntaxNode | null = null;
     let below: Parser.SyntaxNode = node;
     for (let prev = node.previousSibling; prev && prev.type.includes('comment'); prev = prev.previousSibling) {
         if (below.startPosition.row - prev.endPosition.row > 1) break;
+        // `doc`: the run stops at the first comment that is not a doc comment.
+        if (docOnly && !isDocComment(prev.text)) break;
         const lineStart = code.lastIndexOf('\n', prev.startIndex - 1) + 1;
         if (code.slice(lineStart, prev.startIndex).trim() !== '') break;
         first = prev;
@@ -404,7 +441,11 @@ export class AstCodeSplitter implements Splitter {
         const fileStructural = extractStructural(node, language);
         // reference-edges-from-the-index: resolved once per file, not per chunk.
         const referenceVocab = this.mentionedVocabProvider?.();
-        const withLeadingComments = leadingCommentsEnabled();
+        const commentsMode = leadingCommentsMode();
+        const withLeadingComments = commentsMode !== 'off';
+        // cover-code-outside-declarations-and-attach-doc-blocks: what each declaration chunk
+        // covers, as [start, end) offsets, so the gap pass can tell what lies outside them.
+        const covered: Array<[number, number]> = [];
 
         // no-chunks-inside-function-bodies: inside a function body only a named type declaration
         // or a named function with a parameter list becomes a chunk — not `int i = 0;`,
@@ -427,13 +468,14 @@ export class AstCodeSplitter implements Splitter {
             if (emit) {
                 // keep-doc-comments-with-their-declarations: only the START moves; everything
                 // read off the node below (symbol, kind, structure, references) is the declaration's.
-                const lead = withLeadingComments ? firstLeadingComment(currentNode, code) : null;
+                const lead = withLeadingComments ? firstLeadingComment(currentNode, code, commentsMode === 'doc') : null;
                 const startNode = lead ?? currentNode;
                 const startLine = startNode.startPosition.row + 1;
                 const endLine = currentNode.endPosition.row + 1;
                 const nodeText = code.slice(startNode.startIndex, currentNode.endIndex);
 
                 if (nodeText.trim().length > 0) {
+                    covered.push([startNode.startIndex, currentNode.endIndex]);
                     const rawSymbolName = this.extractSymbolName(currentNode, splittableSet);
                     // C++ out-of-line definitions carry their class in the name
                     // (`CoreConstants::get_enum_values`). Store the bare name so
@@ -505,6 +547,12 @@ export class AstCodeSplitter implements Splitter {
 
         traverse(node);
 
+        if (chunks.length > 0 && coverGapsEnabled()) {
+            chunks.push(...this.packGaps(node, code, covered, language, filePath, fileStructural.imports, referenceVocab, splittableSet, commentsMode));
+            // Document order, stable: a declaration keeps its place before what follows it.
+            chunks.sort((a, b) => (a.metadata.startLine ?? 0) - (b.metadata.startLine ?? 0));
+        }
+
         // If no meaningful chunks found, create a single chunk with the entire code
         if (chunks.length === 0) {
             chunks.push({
@@ -519,6 +567,95 @@ export class AstCodeSplitter implements Splitter {
             });
         }
 
+        return chunks;
+    }
+
+    /**
+     * cover-code-outside-declarations-and-attach-doc-blocks, decision 2 — cAST's split-then-merge
+     * over what the declaration walk left out. A node disjoint from every covered range is a gap
+     * node; one that overlaps a covered range is descended into; one inside a covered range is a
+     * wall. Gap nodes are packed greedily in document order while the group's text stays within
+     * `chunkSize`; a wall closes the group, so no chunk spans a declaration chunk; a gap node
+     * larger than `chunkSize` is packed through its children. Groups of only comments or
+     * imports, or with under GAP_MIN_CHARS characters outside comments and whitespace, are not
+     * emitted. Boundaries are node boundaries only, never a line window.
+     */
+    private packGaps(
+        root: Parser.SyntaxNode,
+        code: string,
+        covered: ReadonlyArray<[number, number]>,
+        language: string,
+        filePath: string | undefined,
+        imports: string[] | undefined,
+        referenceVocab: ReadonlySet<string> | null | undefined,
+        splittableSet: ReadonlySet<string>,
+        mode: 'off' | 'on' | 'doc',
+    ): CodeChunk[] {
+        const inside = (s: number, e: number) => covered.some(([a, b]) => a <= s && e <= b);
+        const overlaps = (s: number, e: number) => covered.some(([a, b]) => a < e && s < b);
+        const groups: Parser.SyntaxNode[][] = [];
+        let open: Parser.SyntaxNode[] = [];
+        const close = () => { if (open.length) groups.push(open); open = []; };
+        const visit = (n: Parser.SyntaxNode) => {
+            if (n.endIndex <= n.startIndex) return; // zero-width (a MISSING node)
+            if (inside(n.startIndex, n.endIndex)) { close(); return; }
+            if (overlaps(n.startIndex, n.endIndex)) {
+                if (n.childCount === 0) { close(); return; }
+                for (const child of n.children) visit(child);
+                return;
+            }
+            // A declaration the grammar table does not emit (a TypeScript `enum`) is its own
+            // chunk, with its doc block, whole — cut by size later like any declaration.
+            if (n.type in NODE_TYPE_TO_SYMBOL_KIND && this.extractSymbolName(n, splittableSet)) {
+                const lead = mode === 'off' ? null : firstLeadingComment(n, code, mode === 'doc');
+                const docs = lead ? open.filter((m) => m.startIndex >= lead.startIndex) : [];
+                open = open.filter((m) => !docs.includes(m));
+                close();
+                groups.push([...docs, n]);
+                return;
+            }
+            if (n.endIndex - n.startIndex > this.chunkSize) {
+                close();
+                // A single token longer than a chunk (a base64 or wasm blob in a string literal)
+                // is data, not code: it is not indexed.
+                if (n.childCount === 0) return;
+                for (const child of n.children) visit(child);
+                close();
+                return;
+            }
+            if (open.length && n.endIndex - open[0].startIndex > this.chunkSize) close();
+            open.push(n);
+        };
+        visit(root);
+        close();
+
+        const chunks: CodeChunk[] = [];
+        for (const group of groups) {
+            if (group.every((n) => isCommentOrImport(n))) continue;
+            const first = group[0];
+            const last = group[group.length - 1];
+            // Named when its code is one declaration node (any other nodes are its doc comments).
+            const codeNodes = group.filter((n) => !n.type.includes('comment'));
+            const single = codeNodes.length === 1 && codeNodes[0].type in NODE_TYPE_TO_SYMBOL_KIND ? codeNodes[0] : null;
+            const symbolName = single ? this.extractSymbolName(single, splittableSet) : undefined;
+            // The size floor is for fragments; a named declaration is kept however small.
+            if (!symbolName && codeNodes.map((n) => n.text).join('').replace(/\s+/g, '').length < GAP_MIN_CHARS) continue;
+            const referenced = new Set<string>();
+            for (const n of group) for (const name of collectReferencedSymbols(n, referenceVocab, [symbolName])) referenced.add(name);
+            chunks.push({
+                content: code.slice(first.startIndex, last.endIndex),
+                metadata: {
+                    startLine: first.startPosition.row + 1,
+                    endLine: last.endPosition.row + 1,
+                    language,
+                    filePath,
+                    content_type: 'code',
+                    ...(symbolName ? { symbol_kind: NODE_TYPE_TO_SYMBOL_KIND[single!.type], symbol_name: symbolName } : {}),
+                    ...(imports && imports.length > 0 ? { imports } : {}),
+                    ...(referenced.size > 0 ? { mentioned_symbols: [...referenced] } : {}),
+                },
+            });
+        }
         return chunks;
     }
 
