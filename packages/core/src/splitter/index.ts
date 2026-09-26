@@ -29,6 +29,9 @@ export interface CodeChunk {
         part_index?: number;
         part_count?: number;
         truncated?: boolean;
+        // index-class-skeletons-and-dedup-clones-across-paths: a class skeleton, whose text
+        // holds elision markers the file does not (CODE_CHUNK_CLASS_BODY=skeleton).
+        skeleton?: boolean;
     };
 }
 

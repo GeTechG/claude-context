@@ -157,6 +157,55 @@ describe('applyCanonicalDedup (Phase B)', () => {
         expect(out).toHaveLength(2);
     });
 
+    it('by default keeps one row per cluster, even of one path', () => {
+        const ctx = makeCtx();
+        const results = [
+            makeResult('src/Context.hx', 'Context', { startLine: 855, endLine: 926 }),
+            makeResult('src/Context.hx', 'Context', { startLine: 39, endLine: 123 }),
+        ];
+        const out: SemanticSearchResult[] = (ctx as any).applyCanonicalDedup(results);
+        expect(out.map((r) => r.startLine)).toEqual([855]);
+    });
+
+    it('CANONICAL_DEDUP=path keeps every piece of one class in one file', () => {
+        process.env.CANONICAL_DEDUP = 'path';
+        const ctx = makeCtx();
+        const results = [
+            makeResult('src/Context.hx', 'Context', { startLine: 855, endLine: 926 }),
+            makeResult('src/Context.hx', 'Context', { startLine: 39, endLine: 123 }),
+        ];
+        const out: SemanticSearchResult[] = (ctx as any).applyCanonicalDedup(results);
+        expect(out.map((r) => r.startLine)).toEqual([855, 39]);
+    });
+
+    it('CANONICAL_DEDUP=path keeps every row of the canonical path and drops every row of a vendored copy', () => {
+        process.env.CANONICAL_DEDUP = 'path';
+        const ctx = makeCtx();
+        const results = [
+            makeResult('haxe/std/php/_std/Std.hx', 'Std', { startLine: 1, endLine: 80 }),
+            makeResult('haxe/std/Std.hx', 'Std', { startLine: 100, endLine: 180 }),
+            makeResult('haxe/std/php/_std/Std.hx', 'Std', { startLine: 90, endLine: 160 }),
+            makeResult('haxe/std/Std.hx', 'Std', { startLine: 1, endLine: 90 }),
+        ];
+        const out: SemanticSearchResult[] = (ctx as any).applyCanonicalDedup(results);
+        expect(out.map((r) => `${r.relativePath}:${r.startLine}`)).toEqual([
+            'haxe/std/Std.hx:100',
+            'haxe/std/Std.hx:1',
+        ]);
+    });
+
+    it('CANONICAL_DEDUP=path leaves an all-clone group with several rows per path intact', () => {
+        process.env.CANONICAL_DEDUP = 'path';
+        const ctx = makeCtx();
+        const results = [
+            makeResult('haxe/std/php/_std/Std.hx', 'Std', { startLine: 1, endLine: 80 }),
+            makeResult('haxe/std/lua/_std/Std.hx', 'Std', { startLine: 1, endLine: 80 }),
+            makeResult('haxe/std/php/_std/Std.hx', 'Std', { startLine: 90, endLine: 160 }),
+        ];
+        const out: SemanticSearchResult[] = (ctx as any).applyCanonicalDedup(results);
+        expect(out).toHaveLength(3);
+    });
+
     it('results without symbol_name are not clustered', () => {
         const ctx = makeCtx();
         const results = [
@@ -165,5 +214,19 @@ describe('applyCanonicalDedup (Phase B)', () => {
         ];
         const out: SemanticSearchResult[] = (ctx as any).applyCanonicalDedup(results);
         expect(out).toHaveLength(2);
+    });
+
+    it('overlap dedup: a skeleton row never covers the member rows its range spans', () => {
+        const ctx = makeCtx();
+        const skeleton = { ...makeResult('src/Widget.ts', 'Widget', { startLine: 1, endLine: 80 }), skeleton: true };
+        const member = makeResult('src/Widget.ts', 'draw', { startLine: 30, endLine: 40 });
+        const piece = makeResult('src/Widget.ts', 'Widget', { startLine: 1, endLine: 80 });
+        const out: SemanticSearchResult[] = (ctx as any).deduplicateResults([skeleton, member]);
+        expect(out.map((r) => r.symbol_name)).toEqual(['Widget', 'draw']);
+        const memberFirst: SemanticSearchResult[] = (ctx as any).deduplicateResults([
+            makeResult('src/Widget.ts', 'big', { startLine: 7, endLine: 70 }), skeleton]);
+        expect(memberFirst.map((r) => r.symbol_name)).toEqual(['big', 'Widget']);
+        const verbatim: SemanticSearchResult[] = (ctx as any).deduplicateResults([piece, member]);
+        expect(verbatim.map((r) => r.symbol_name)).toEqual(['Widget']);
     });
 });

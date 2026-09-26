@@ -135,6 +135,18 @@ export function splitOversizedMode(): 'lines' | 'syntax' {
 }
 
 /**
+ * index-class-skeletons-and-dedup-clones-across-paths: `skeleton` indexes an oversized type
+ * declaration with member chunks as its skeleton instead of body pieces; `pieces` (the default)
+ * is the splitter as it was, byte for byte.
+ */
+export function classBodyMode(): 'pieces' | 'skeleton' {
+    return (envManager.get('CODE_CHUNK_CLASS_BODY') || '').trim().toLowerCase() === 'skeleton' ? 'skeleton' : 'pieces';
+}
+
+/** What stands for an elided member body in a skeleton; the only text of a skeleton not in the file. */
+export const SKELETON_ELISION = '…';
+
+/**
  * A doc comment by its own syntax: `/**` (not `/**` + `/` or a `/***` banner), `/*!`, `///`
  * (not a `////` rule), `//!`, OCaml `(**` (not a `(***` banner), GDScript `##` (not `###`). The doc-comment forms of the corpus's languages — a
  * property of the languages, not a list of corpus files.
@@ -145,6 +157,21 @@ export function splitOversizedMode(): 'lines' | 'syntax' {
  * ponytail: a fixed knob; the pre-build count reports the lines it drops.
  */
 const GAP_MIN_CHARS = 40;
+
+/** The line (from 1) holding `offset`, over `lineStartOffsets`. */
+function lineOfOffset(lineStarts: number[], offset: number): number {
+    let lo = 0, hi = lineStarts.length - 1;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (lineStarts[mid] <= offset) lo = mid; else hi = mid - 1; }
+    return lo + 1;
+}
+
+/** Where a chunk's text starts in `code`: on its start line, or -1. */
+function locateChunk(chunk: CodeChunk, code: string, lineStarts: number[]): number {
+    const lineStart = lineStarts[(chunk.metadata.startLine ?? 1) - 1];
+    if (lineStart === undefined) return -1;
+    const from = code.indexOf(chunk.content, lineStart);
+    return from < 0 || from > (lineStarts[chunk.metadata.startLine ?? 1] ?? code.length) ? -1 : from;
+}
 
 /** The offset each line of `code` starts at; line n (from 1) starts at index n - 1. */
 function lineStartOffsets(code: string): number[] {
@@ -459,6 +486,7 @@ export class AstCodeSplitter implements Splitter {
         const referenceVocab = this.mentionedVocabProvider?.();
         const commentsMode = leadingCommentsMode();
         const splitSyntax = splitOversizedMode() === 'syntax';
+        const keepNodes = splitSyntax || classBodyMode() === 'skeleton';
         const withLeadingComments = commentsMode !== 'off';
         // cover-code-outside-declarations-and-attach-doc-blocks: what each declaration chunk
         // covers, as [start, end) offsets, so the gap pass can tell what lies outside them.
@@ -549,7 +577,7 @@ export class AstCodeSplitter implements Splitter {
                         }
                     };
                     chunks.push(declarationChunk);
-                    if (splitSyntax) this.declarationNodes.set(declarationChunk, currentNode);
+                    if (keepNodes) this.declarationNodes.set(declarationChunk, currentNode);
 
                     // If this node introduces a parent scope (class/interface/struct/etc.),
                     // its descendants inherit it as parent_symbol.
@@ -752,13 +780,210 @@ export class AstCodeSplitter implements Splitter {
         const refined: CodeChunk[] = [];
         const syntax = splitOversizedMode() === 'syntax';
         let lineStarts: number[] | null = null;
+        const skeletons = classBodyMode() === 'skeleton'
+            ? this.buildSkeletons(chunks, originalCode, lineStarts ??= lineStartOffsets(originalCode))
+            : null;
         for (const chunk of chunks) {
+            const replaced = skeletons?.get(chunk);
+            if (replaced) { refined.push(...replaced); continue; }
             if (chunk.content.length <= this.chunkSize) { refined.push(chunk); continue; }
             const node = syntax ? this.declarationNodes.get(chunk) : undefined;
             const pieces = node ? this.splitBySyntax(chunk, node, originalCode, lineStarts ??= lineStartOffsets(originalCode)) : null;
             refined.push(...(pieces ?? this.splitLargeChunk(chunk)));
         }
         return collapseIdenticalChunks(refined);
+    }
+
+    /**
+     * index-class-skeletons-and-dedup-clones-across-paths, decisions 4–7. A type declaration
+     * (a parent-scope node of the grammar: class, struct, interface, enum, abstract, module,
+     * namespace) longer than the chunk size, with at least one
+     * member that is a chunk of its own, is
+     * replaced by its skeleton: every text of the declaration in document order, except that a
+     * member chunk contributes only the first worded line of its doc block, the lines attached
+     * above it, and its head up to its body, which is elided (`{ … }` for a braced body, `…`
+     * otherwise). A member without a body contributes in full. The skeleton is packed in
+     * member order into chunks of at most `chunkSize` (a single unit longer stays whole); each
+     * chunk after the first opens with the declaration's first line. A wrapper chunk ending
+     * with the declaration (`export class …`) goes with it and lends the skeleton its start.
+     * Returns the chunks to replace, each mapped to what replaces it (empty: dropped).
+     */
+    private buildSkeletons(chunks: CodeChunk[], code: string, lineStarts: number[]): Map<CodeChunk, CodeChunk[]> {
+        const out = new Map<CodeChunk, CodeChunk[]>();
+        const located = chunks.map((chunk) => {
+            const from = locateChunk(chunk, code, lineStarts);
+            return { chunk, from, to: from < 0 ? -1 : from + chunk.content.length, node: this.declarationNodes.get(chunk) };
+        }).filter((c) => c.from >= 0);
+        const lineOf = (offset: number) => lineOfOffset(lineStarts, offset);
+        for (const decl of located) {
+            const node = decl.node;
+            if (!node || !PARENT_SCOPE_NODE_TYPES.has(node.type) || decl.chunk.content.length <= this.chunkSize) continue;
+            // Outermost member chunks inside the declaration, in document order.
+            const members: typeof located = [];
+            for (const m of located.filter((c) => c !== decl && c.node && c.from >= node.startIndex && c.to <= node.endIndex
+                && !(c.from === decl.from && c.to === decl.to)).sort((a, b) => a.from - b.from || b.to - a.to)) {
+                const prev = members[members.length - 1];
+                if (!prev || m.from >= prev.to) members.push(m);
+            }
+            if (members.length === 0) continue;
+            // A wrapper is the declaration's own parent that is no declaration with a body of its
+            // own (`export …`, a decorator), never an enclosing class or function it ends.
+            const wrapper = located.find((c) => c !== decl && c.node && node.parent && c.node.id === node.parent.id
+                && !PARENT_SCOPE_NODE_TYPES.has(c.node.type) && c.node.childForFieldName('body') === null
+                && c.chunk.content.length > this.chunkSize);
+            const from = Math.min(decl.from, wrapper ? wrapper.from : decl.from);
+            const to = Math.max(decl.to, wrapper ? wrapper.to : decl.to);
+
+            // Units in document order: text outside every member, cut on node boundaries, and
+            // one unit per member. Each unit's text runs from the end of the previous one, so
+            // whitespace and anything no node holds is kept.
+            type Unit = { start: number; end: number; member?: typeof located[number] };
+            const units: Unit[] = [];
+            const inMember = (s: number, e: number) => members.some((m) => m.from <= s && e <= m.to);
+            const hitsMember = (s: number, e: number) => members.some((m) => m.from < e && s < m.to);
+            const visit = (n: Parser.SyntaxNode) => {
+                if (n.endIndex <= n.startIndex || inMember(n.startIndex, n.endIndex)) return;
+                if (hitsMember(n.startIndex, n.endIndex) && n.childCount > 0) { for (const c of n.children) visit(c); return; }
+                units.push({ start: n.startIndex, end: n.endIndex });
+            };
+            visit(node);
+            for (const m of members) units.push({ start: m.from, end: m.to, member: m });
+            units.sort((a, b) => a.start - b.start);
+            // Units that overlap mean the parse does not describe the text (a recovered syntax error
+            // across members): the declaration keeps its pieces.
+            if (units.some((u, i) => i > 0 && u.start < units[i - 1].end)) continue;
+            // The declaration header, up to and including its body opener, is one unit.
+            const body = node.childForFieldName('body');
+            const opener = body ?? node.children.find((c) => c.type === '{');
+            const headerEnd = opener ? opener.startIndex + 1 : members[0].from;
+            const headerCount = units.findIndex((u) => u.member || u.start >= headerEnd);
+            if (headerCount > 1) units.splice(0, headerCount, { start: units[0].start, end: units[headerCount - 1].end });
+
+            const texts: Array<{ text: string; first: number; last: number; start: number; end: number }> = [];
+            // A unit longer than the chunk size that is not elided (a data table, a member without
+            // a body) leaves the skeleton: a member is held by its own chunk, other text is cut as
+            // with `pieces`, verbatim.
+            const verbatimPieces: CodeChunk[] = [];
+            let cursor = from;
+            for (let k = 0; k < units.length; k++) {
+                const u = units[k];
+                let lead = code.slice(cursor, u.start);
+                // The rest of the previous unit's last line stays with it, so a chunk never opens mid-line.
+                const lineEnd = lead.indexOf('\n');
+                if (texts.length && lineEnd > 0) {
+                    const tail = lead.slice(0, lineEnd);
+                    const prev = texts[texts.length - 1];
+                    prev.text += tail;
+                    if (tail.trim()) prev.last = cursor + tail.trimEnd().length - 1;
+                    cursor += lineEnd;
+                    lead = lead.slice(lineEnd);
+                }
+                let text: string;
+                let last: number;
+                if (u.member) {
+                    const member = u.member.node!;
+                    const pre = code.slice(u.start, Math.max(u.start, member.startIndex)).split('\n');
+                    // Of the doc block: its opener, its first worded line and its closer, so it still
+                    // reads as a comment. Every other line above the head is not a comment and stays.
+                    // A comment line by the grammar: it lies inside a comment node above the head.
+                    const spans: Array<[number, number]> = [];
+                    for (let p = member.previousSibling; p && p.startIndex >= u.start; p = p.previousSibling) {
+                        if (p.type.includes('comment')) spans.push([p.startIndex, p.endIndex]);
+                    }
+                    const lineAt: number[] = [];
+                    pre.reduce((offset, line) => { lineAt.push(offset); return offset + line.length + 1; }, u.start);
+                    const isComment = (_line: string, i: number) => pre[i].trim() !== ''
+                        && spans.some(([a, b]) => a <= lineAt[i] + pre[i].length - pre[i].trimStart().length && lineAt[i] + pre[i].trimEnd().length <= b);
+                    const commentAt = pre.map((line, i) => (isComment(line, i) ? i : -1)).filter((i) => i >= 0);
+                    const worded = commentAt.find((i) => /[A-Za-z0-9]/.test(pre[i]));
+                    const lastComment = commentAt[commentAt.length - 1];
+                    const closes = lastComment !== undefined && /(\*\/|\*\))\s*$/.test(pre[lastComment]);
+                    const kept = pre.filter((line, i) => !isComment(line, i)
+                        || i === commentAt[0] || i === worded || (closes && i === lastComment));
+                    const body = memberBody(member);
+                    if (body && body.startIndex > member.startIndex) {
+                        const head = code.slice(member.startIndex, body.startIndex).trimEnd();
+                        const braced = body.text.startsWith('{') && body.text.endsWith('}');
+                        text = lead + kept.join('\n') + head + (braced ? ` { ${SKELETON_ELISION} }` : ` ${SKELETON_ELISION}`);
+                        last = member.startIndex + head.length - 1;
+                    } else {
+                        text = lead + kept.join('\n') + code.slice(member.startIndex, u.end);
+                        last = u.end - 1;
+                    }
+                } else {
+                    text = lead + code.slice(u.start, u.end);
+                    last = u.end - 1;
+                }
+                if (u !== units[0] && u.end - u.start > this.chunkSize && !text.endsWith(SKELETON_ELISION) && !text.endsWith(`${SKELETON_ELISION} }`)) {
+                    // What continues its last line (a `;`) goes with it.
+                    let end = u.end;
+                    while (units[k + 1] && !units[k + 1].member && lineOf(units[k + 1].start) === lineOf(end - 1)) end = units[++k].end;
+                    // A member's own chunk ends at the member: what continues its line is cut on its own.
+                    const cutFrom = u.member ? u.end + (code.slice(u.end, end).length - code.slice(u.end, end).trimStart().length) : u.start;
+                    if (code.slice(cutFrom, end).trim()) {
+                        verbatimPieces.push(...this.splitLargeChunk({ content: code.slice(cutFrom, end).trimEnd(), metadata: { ...decl.chunk.metadata, startLine: lineOf(cutFrom), endLine: lineOf(end - 1) } }));
+                    }
+                    cursor = end;
+                    continue;
+                }
+                const firstInUnit = cursor + (lead.length - lead.trimStart().length);
+                texts.push({ text, first: lead.trim() ? firstInUnit : u.start, last, start: u.start, end: u.end });
+                cursor = u.end;
+            }
+            if (texts.length && cursor < to) {
+                const tail = code.slice(cursor, to);
+                texts[texts.length - 1].text += tail;
+                if (tail.trim()) texts[texts.length - 1].last = cursor + tail.trimEnd().length - 1;
+            }
+
+            // Pack in member order; a chunk after the first opens with the declaration's first line.
+            // The header line holds the name (in Java and C# the node starts at its annotations).
+            const headerStart = lineStarts[(node.childForFieldName('name') ?? node.childForFieldName('body') ?? node).startPosition.row];
+            const headerLine = code.slice(headerStart, code.indexOf('\n', headerStart) < 0 ? code.length : code.indexOf('\n', headerStart));
+            const groups: Array<{ text: string; first: number; last: number }> = [];
+            for (const [i, t] of texts.entries()) {
+                const open = groups[groups.length - 1];
+                // A unit that starts on the line the previous one ended on never opens a chunk.
+                const sameLine = i > 0 && lineOf(t.start) === lineOf(texts[i - 1].end - 1);
+                if (open && (sameLine || (open.text + t.text).trimEnd().length <= this.chunkSize)) { open.text += t.text; open.last = t.last; continue; }
+                // The repeated header line lies above the range, which starts at the first unit held,
+                // so ranges of one skeleton never nest.
+                const opener = open ? headerLine.trim() + '\n' : '';
+                groups.push({ text: opener + t.text.replace(/^\s*\n/, ''), first: t.first, last: t.last });
+            }
+            const names = decl.chunk.metadata.mentioned_symbols ?? [];
+            const skeletons: CodeChunk[] = groups.map((g) => {
+                const content = g.text.trim();
+                const { mentioned_symbols: _unused, ...metadata } = decl.chunk.metadata;
+                const held = names.filter((name) => new RegExp(`(^|[^A-Za-z0-9_$])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^A-Za-z0-9_$])`).test(content));
+                return {
+                    content,
+                    metadata: {
+                        ...metadata,
+                        startLine: lineOf(g.first),
+                        endLine: lineOf(g.last),
+                        skeleton: true,
+                        ...(held.length > 0 ? { mentioned_symbols: held } : {}),
+                    },
+                };
+            }).filter((c) => c.content.length > 0);
+            // Every line of a skeleton, markers aside, is text of the declaration in order; a parse that
+            // misreads a macro as a function breaks that, and the declaration then keeps its pieces.
+            let at = from;
+            const faithful = skeletons.every((c, i) => c.content.split('\n').every((line, j) => {
+                if (i > 0 && j === 0) return true; // the repeated header line
+                const part = line.split(SKELETON_ELISION)[0].replace(/\s*\{\s*$/, '').trim();
+                if (!part) return true;
+                const found = code.indexOf(part, at);
+                if (found < 0 || found >= to) return false;
+                at = found + part.length;
+                return true;
+            }));
+            if (!faithful) continue;
+            out.set(decl.chunk, [...skeletons, ...verbatimPieces]);
+            if (wrapper && !out.has(wrapper.chunk)) out.set(wrapper.chunk, []);
+        }
+        return out;
     }
 
     /**
@@ -772,10 +997,8 @@ export class AstCodeSplitter implements Splitter {
      * chunk's text cannot be located at its start line — the caller keeps the line split.
      */
     private splitBySyntax(chunk: CodeChunk, node: Parser.SyntaxNode, code: string, lineStarts: number[]): CodeChunk[] | null {
-        const lineStart = lineStarts[(chunk.metadata.startLine ?? 1) - 1];
-        if (lineStart === undefined) return null;
-        const from = code.indexOf(chunk.content, lineStart);
-        if (from < 0 || from > (lineStarts[chunk.metadata.startLine ?? 1] ?? code.length)) return null;
+        const from = locateChunk(chunk, code, lineStarts);
+        if (from < 0) return null;
         const to = from + chunk.content.length;
 
         // Units in document order. Text waiting to open the next unit is `carry`: what the options
@@ -840,11 +1063,7 @@ export class AstCodeSplitter implements Splitter {
         // holds) goes to the earlier piece, so no character of the declaration is dropped.
         for (let i = 0; i + 1 < groups.length; i++) groups[i][1] = groups[i + 1][0];
 
-        const lineOf = (offset: number) => {
-            let lo = 0, hi = lineStarts.length - 1;
-            while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (lineStarts[mid] <= offset) lo = mid; else hi = mid - 1; }
-            return lo + 1;
-        };
+        const lineOf = (offset: number) => lineOfOffset(lineStarts, offset);
         const pieces: CodeChunk[] = [];
         for (const [s, e] of groups) {
             const raw = code.slice(s, e);
@@ -948,6 +1167,19 @@ export class AstCodeSplitter implements Splitter {
     static getSupportedLanguages(): string[] {
         return astSupportedLanguages();
     }
+}
+
+/**
+ * The body a member declaration elides in a skeleton: its `body` field, or that of its only
+ * named child (OCaml `value_definition > let_binding`), two levels deep at most.
+ */
+function memberBody(node: Parser.SyntaxNode, depth = 0): Parser.SyntaxNode | null {
+    const body = node.childForFieldName('body');
+    if (body) return body;
+    if (depth >= 2) return null;
+    // A wrapper hands its payload over as `definition` (a decorator) or as its only named child.
+    const inner = node.childForFieldName('definition') ?? (node.namedChildren.length === 1 ? node.namedChildren[0] : null);
+    return inner ? memberBody(inner, depth + 1) : null;
 }
 
 /** A parameter list among the node's descendants within four levels, not looking into its body. */

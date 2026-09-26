@@ -23,6 +23,9 @@ export interface SemanticSearchResult {
     // list that belongs to the response, not the chunk). MCP handlers lift it
     // out into the JSON response. Older clients ignore it without harm.
     candidateSymbols?: string[];
+    // index-class-skeletons-and-dedup-clones-across-paths: a class skeleton, whose text holds
+    // no member body, so it never stands for the rows its range spans in the overlap dedup.
+    skeleton?: boolean;
     // rag-graph-layer Phase 1.3: structural fields surfaced to search
     // pipeline so graph-expansion can resolve forward edges (imports /
     // extends / implements / mentioned_symbols) without an extra fetch.

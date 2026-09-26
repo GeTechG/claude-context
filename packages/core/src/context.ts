@@ -2661,6 +2661,7 @@ export class Context {
                 extends: result.document.extends,
                 implements: parseStringArray(result.document.implements),
                 mentioned_symbols: parseStringArray(result.document.mentioned_symbols),
+                ...(result.document.metadata?.skeleton === true ? { skeleton: true } : {}),
             }));
 
             const dedupedResults = this.deduplicateResults(results);
@@ -2821,6 +2822,7 @@ export class Context {
             extends: result.document.extends,
             implements: parseStringArray(result.document.implements),
             mentioned_symbols: parseStringArray(result.document.mentioned_symbols),
+            ...(result.document.metadata?.skeleton === true ? { skeleton: true } : {}),
         };
     }
 
@@ -3373,6 +3375,9 @@ export class Context {
         for (const result of results) {
             const overlaps = kept.some((existing) => {
                 if (existing.relativePath !== result.relativePath) return false;
+                // A skeleton's range spans its members, but its text holds none of their bodies, and
+                // a member holds none of the skeleton's fields: neither stands for the other.
+                if (existing.skeleton || result.skeleton) return false;
                 const overlapStart = Math.max(existing.startLine, result.startLine);
                 const overlapEnd = Math.min(existing.endLine, result.endLine);
                 if (overlapStart > overlapEnd) return false;
@@ -3391,14 +3396,16 @@ export class Context {
 
     /**
      * Phase B (rag-code-intent-recall): collapse each (symbol_name, basename)
-     * cluster down to its canonical (no demote-marker in path). Among multiple
-     * canonicals, keep the shortest path (fewest segments). Among ties, keep
-     * the original rerank-input order. No-op when the cluster has zero
+     * cluster down to its canonical path (no demote-marker in path). Among
+     * multiple canonicals, keep the shortest path (fewest segments). Among ties,
+     * the earliest row. CANONICAL_DEDUP=path keeps every row of the winner's
+     * path; the default keeps the winning row only. No-op when the cluster has zero
      * canonicals (all clones) — leaves the cluster untouched so we never
      * accidentally drop the only available match.
      */
     private applyCanonicalDedup(results: SemanticSearchResult[]): SemanticSearchResult[] {
-        if ((process.env.CANONICAL_DEDUP || 'true').toLowerCase() === 'false') {
+        const mode = (process.env.CANONICAL_DEDUP || 'true').trim().toLowerCase();
+        if (mode === 'false') {
             return results;
         }
         const markers = this.getPathDemoteMarkers();
@@ -3439,9 +3446,14 @@ export class Context {
                 if (segDelta !== 0) return segDelta;
                 return a.idx - b.idx;
             });
-            const winnerIdx = canonicals[0].idx;
+            // `path`: rows of one path are never clones of each other (pieces of one
+            // class, overloads in one file), so the winning path keeps every row.
+            const winner = canonicals[0];
             for (const item of bucket) {
-                if (item.idx !== winnerIdx) dropIdx.add(item.idx);
+                const keep = mode === 'path'
+                    ? item.result.relativePath === winner.result.relativePath
+                    : item.idx === winner.idx;
+                if (!keep) dropIdx.add(item.idx);
             }
         }
 
