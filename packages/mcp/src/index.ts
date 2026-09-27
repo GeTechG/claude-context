@@ -412,6 +412,23 @@ This tool is versatile and can be used before completing various tasks to retrie
 
     private async listenHttp(port: number) {
         const sessions = new Map<string, StreamableHTTPServerTransport>();
+        // Last request time per session: a client that vanishes without a
+        // DELETE is closed after MCP_SESSION_IDLE_MS (default 24 h). A later
+        // request with its id gets 404, the protocol's cue to re-initialize.
+        const lastSeen = new Map<string, number>();
+        const configuredIdle = Number(process.env.MCP_SESSION_IDLE_MS);
+        // "24h" (NaN), 0 or a negative value would sweep every session at once.
+        const idleMs = Number.isFinite(configuredIdle) && configuredIdle > 0 ? configuredIdle : 24 * 60 * 60 * 1000;
+        setInterval(() => {
+            const cutoff = Date.now() - idleMs;
+            for (const [id, seen] of lastSeen) {
+                if (seen >= cutoff) continue;
+                lastSeen.delete(id);
+                const transport = sessions.get(id);
+                sessions.delete(id);
+                transport?.close().catch(() => {});
+            }
+        }, Math.max(10, Math.min(idleMs / 4, 10 * 60 * 1000))).unref();
         const send = (res: ServerResponse, status: number, body: unknown) => {
             res.writeHead(status, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(body));
@@ -427,6 +444,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                 const sessionId = req.headers['mcp-session-id'];
                 if (typeof sessionId === 'string') {
                     const transport = sessions.get(sessionId);
+                    if (transport) lastSeen.set(sessionId, Date.now());
                     // 404 tells the client to re-initialize (MCP spec: session gone).
                     if (!transport) return send(res, 404, { jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null });
                     return await transport.handleRequest(req, res);
@@ -435,17 +453,16 @@ This tool is versatile and can be used before completing various tasks to retrie
                 // transport itself answers anything else with 400.
                 const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
                     sessionIdGenerator: () => randomUUID(),
-                    onsessioninitialized: (id) => { sessions.set(id, transport); },
+                    onsessioninitialized: (id) => { sessions.set(id, transport); lastSeen.set(id, Date.now()); },
                 });
                 const server = this.createServer();
                 await server.connect(transport);
                 // After connect(): Protocol.connect() overwrites transport.onclose
                 // without chaining it, so a handler set earlier never runs and a
                 // DELETEd session would stay in the map, still answering.
-                // ponytail: a client that vanishes without DELETE keeps its small
-                // Server object until the container restarts; add an idle sweep if
-                // the session count ever matters.
-                server.onclose = () => { if (transport.sessionId) sessions.delete(transport.sessionId); };
+                server.onclose = () => {
+                    if (transport.sessionId) { sessions.delete(transport.sessionId); lastSeen.delete(transport.sessionId); }
+                };
                 await transport.handleRequest(req, res);
             } catch (error: any) {
                 console.error('[HTTP] request failed:', error?.stack || error);
