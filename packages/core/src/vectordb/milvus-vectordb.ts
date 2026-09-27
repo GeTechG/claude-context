@@ -107,6 +107,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
     protected config: MilvusConfig;
     private client: MilvusClient | null = null;
     protected initializationPromise: Promise<void>;
+    private connectFailed = false;
 
     constructor(config: MilvusConfig) {
         this.config = config;
@@ -129,6 +130,14 @@ export class MilvusVectorDatabase implements VectorDatabase {
             password: milvusConfig.password,
             token: milvusConfig.token,
             ssl: milvusConfig.ssl || false,
+        });
+        // A MilvusClient built while Milvus is down keeps its rejected
+        // connectPromise forever (every call awaits it), and nothing handles
+        // the rejection, so the process dies. Mark it and rebuild on next use:
+        // a long-running server must outlive a Milvus restart.
+        const client = this.client;
+        client.connectPromise.catch(() => {
+            if (this.client === client) this.connectFailed = true;
         });
     }
 
@@ -156,6 +165,14 @@ export class MilvusVectorDatabase implements VectorDatabase {
      */
     protected async ensureInitialized(): Promise<void> {
         await this.initializationPromise;
+        if (this.connectFailed) {
+            this.connectFailed = false;
+            // Release the failed client's channels: a health probe every 30s
+            // through an outage would otherwise leak one per probe.
+            this.client?.closeConnection().catch(() => {});
+            this.initializationPromise = this.initialize();
+            await this.initializationPromise;
+        }
         if (!this.client) {
             throw new Error('Client not initialized');
         }

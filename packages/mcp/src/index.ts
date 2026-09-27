@@ -14,6 +14,9 @@ console.warn = (...args: any[]) => {
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import {
     ListToolsRequestSchema,
     CallToolRequestSchema
@@ -31,25 +34,15 @@ import { ToolHandlers } from "./handlers.js";
 import { findReferencesEnabled, findReferencesTools } from "./find-references-tool.js";
 
 class ContextMcpServer {
-    private server: Server;
+    private config: ContextMcpConfig;
+    private vectorDatabase: MilvusVectorDatabase;
     private context: Context;
     private snapshotManager: SnapshotManager;
     private syncManager: SyncManager;
     private toolHandlers: ToolHandlers;
 
     constructor(config: ContextMcpConfig) {
-        // Initialize MCP server
-        this.server = new Server(
-            {
-                name: config.name,
-                version: config.version
-            },
-            {
-                capabilities: {
-                    tools: {}
-                }
-            }
-        );
+        this.config = config;
 
         // Initialize embedding provider
         console.log(`[EMBEDDING] Initializing embedding provider: ${config.embeddingProvider}`);
@@ -63,7 +56,7 @@ class ContextMcpServer {
         const proseEmbedding = createProseEmbeddingInstance(config);
 
         // Initialize vector database
-        const vectorDatabase = new MilvusVectorDatabase({
+        const vectorDatabase = this.vectorDatabase = new MilvusVectorDatabase({
             address: config.milvusAddress,
             ...(config.milvusToken && { token: config.milvusToken })
         });
@@ -87,11 +80,20 @@ class ContextMcpServer {
 
         // Load existing codebase snapshot on startup
         this.snapshotManager.loadCodebaseSnapshot();
-
-        this.setupTools();
     }
 
-    private setupTools() {
+    // serve-mcp-from-container: one Server per MCP session (stdio has exactly
+    // one), all wired to the one shared Context / handlers built above.
+    private createServer(): Server {
+        const server = new Server(
+            { name: this.config.name, version: this.config.version },
+            { capabilities: { tools: {} } }
+        );
+        this.setupTools(server);
+        return server;
+    }
+
+    private setupTools(server: Server) {
         const index_description = `
 Index a codebase directory to enable semantic search using a configurable code splitter.
 
@@ -126,7 +128,7 @@ This tool is versatile and can be used before completing various tasks to retrie
 `;
 
         // Define available tools
-        this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+        server.setRequestHandler(ListToolsRequestSchema, async () => {
             return {
                 tools: [
                     {
@@ -332,7 +334,7 @@ This tool is versatile and can be used before completing various tasks to retrie
         });
 
         // Handle tool execution
-        this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
 
             switch (name) {
@@ -369,17 +371,91 @@ This tool is versatile and can be used before completing various tasks to retrie
         // requests so clients never observe the poisoning state. See Issue #295.
         await this.toolHandlers.validateLegacyZeroEntries();
 
-        const transport = new StdioServerTransport();
-        console.log('[SYNC-DEBUG] StdioServerTransport created, attempting server connection...');
+        if (process.env.MCP_TRANSPORT === 'http') {
+            await this.listenHttp(Number(process.env.MCP_HTTP_PORT || '7821'));
+        } else {
+            const transport = new StdioServerTransport();
+            console.log('[SYNC-DEBUG] StdioServerTransport created, attempting server connection...');
 
-        await this.server.connect(transport);
-        console.log("MCP server started and listening on stdio.");
-        console.log('[SYNC-DEBUG] Server connection established successfully');
+            await this.createServer().connect(transport);
+            console.log("MCP server started and listening on stdio.");
+            console.log('[SYNC-DEBUG] Server connection established successfully');
+        }
 
         // Start background sync after server is connected
         console.log('[SYNC-DEBUG] Initializing background sync...');
         this.syncManager.startBackgroundSync();
         console.log('[SYNC-DEBUG] MCP server initialization complete');
+    }
+
+    // serve-mcp-from-container: the served version and image commit, and a
+    // failure while Milvus holds no collection of that version — a dropped
+    // index must mark the container unhealthy, not serve empty results.
+    private async health(): Promise<{ status: number; body: Record<string, unknown> }> {
+        const version = process.env.COLLECTION_VERSION || null;
+        const commit = process.env.LOCAL_RAG_IMAGE_COMMIT || null;
+        try {
+            // Same rule as servedHealth in infra/lib/served-env.js: canonical pools
+            // only (no _bak copies), and with split collections both pools.
+            const pattern = new RegExp(`^hybrid_${version}_(prose|code)_[0-9a-f]+$`);
+            const collections = (await this.vectorDatabase.listCollections()).filter((n) => pattern.test(n));
+            const pools = new Set(collections.map((n) => n.split('_')[2]));
+            const needed = process.env.SPLIT_COLLECTIONS === 'true' ? ['prose', 'code'] : [];
+            if (!version || collections.length === 0 || needed.some((p) => !pools.has(p))) {
+                return { status: 503, body: { ok: false, version, commit, error: `no collections of served version ${version}` } };
+            }
+            return { status: 200, body: { ok: true, version, commit, collections: collections.length } };
+        } catch (error: any) {
+            return { status: 503, body: { ok: false, version, commit, error: `milvus unreachable: ${error?.message || error}` } };
+        }
+    }
+
+    private async listenHttp(port: number) {
+        const sessions = new Map<string, StreamableHTTPServerTransport>();
+        const send = (res: ServerResponse, status: number, body: unknown) => {
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(body));
+        };
+        const http = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+            try {
+                const url = new URL(req.url || '/', 'http://localhost');
+                if (url.pathname === '/health') {
+                    const { status, body } = await this.health();
+                    return send(res, status, body);
+                }
+                if (url.pathname !== '/mcp') return send(res, 404, { error: 'not found' });
+                const sessionId = req.headers['mcp-session-id'];
+                if (typeof sessionId === 'string') {
+                    const transport = sessions.get(sessionId);
+                    // 404 tells the client to re-initialize (MCP spec: session gone).
+                    if (!transport) return send(res, 404, { jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null });
+                    return await transport.handleRequest(req, res);
+                }
+                // No session: only an initialize request is accepted — the
+                // transport itself answers anything else with 400.
+                const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
+                    sessionIdGenerator: () => randomUUID(),
+                    onsessioninitialized: (id) => { sessions.set(id, transport); },
+                });
+                const server = this.createServer();
+                await server.connect(transport);
+                // After connect(): Protocol.connect() overwrites transport.onclose
+                // without chaining it, so a handler set earlier never runs and a
+                // DELETEd session would stay in the map, still answering.
+                // ponytail: a client that vanishes without DELETE keeps its small
+                // Server object until the container restarts; add an idle sweep if
+                // the session count ever matters.
+                server.onclose = () => { if (transport.sessionId) sessions.delete(transport.sessionId); };
+                await transport.handleRequest(req, res);
+            } catch (error: any) {
+                console.error('[HTTP] request failed:', error?.stack || error);
+                if (!res.headersSent) send(res, 500, { error: String(error?.message || error) });
+            }
+        });
+        const host = process.env.MCP_HTTP_HOST || '127.0.0.1';
+        await new Promise<void>((resolve) => http.listen(port, host, resolve));
+        const bound = (http.address() as { port: number }).port;
+        console.log(`MCP server listening on http://${host}:${bound}/mcp`);
     }
 }
 
