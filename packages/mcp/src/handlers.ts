@@ -36,14 +36,10 @@ const sourceRegistry: any = localRequire("../../../../../infra/lib/source-regist
 // smoke test infra/test/search-shared-path.smoke.js fails if either surface
 // grows a private copy of that logic again.
 const searchShared: any = localRequire("../../../../../infra/lib/search-shared.js");
-// auto-update-generations: the retrieval ROOT itself is resolved through the
-// ONE shared active-generation resolver the panel loads too
-// (infra/lib/serving-root.js). A present, resolvable pointer names the active
-// generation's corpus tree (whose path hash gives the switched collection
-// names); an absent pointer names the knowledge root; an unresolvable pointer
-// is a named error, never a silent fallback. The pointer lives on the shared
-// knowledge-root filesystem, so the host stdio server reads the same flip the
-// container panel does with no environment changes.
+// The retrieval ROOT is resolved through the ONE shared resolver the panel
+// loads too (infra/lib/serving-root.js): the knowledge root, refusing a
+// leftover per-source generation pointer. What serves is the index version the
+// serving pointer names, overlaid on the env before each tool call (index.ts).
 const servingRoot: any = localRequire("../../../../../infra/lib/serving-root.js");
 const defaultRegistryPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../../local-rag.sources.json");
 
