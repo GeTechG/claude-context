@@ -6,3 +6,4 @@ export * from './prose-graph-expansion';
 export * from './query-rewrite';
 export * from './symbol-index-refs';
 export * from './find-references';
+export * from './named-family-demotion';

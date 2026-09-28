@@ -48,6 +48,7 @@ import { createSymbolFrequencyGate, loadSymbolFrequencyTable, SymbolFrequencyGat
 import { findReferences, FindReferencesAnswer } from './search/find-references';
 import { ReferenceRelation } from './search/symbol-index-refs';
 import { applyRewriting, RewriteFlags, RewriteResult } from './search/query-rewrite';
+import { demoteProseOutsideNamedFamilies, NamedFamilyResolver, NamedFamilyDemotion } from './search/named-family-demotion';
 import { Reranker } from './reranker';
 import { extractCandidateSymbols } from './enrichment';
 import * as fs from 'fs';
@@ -330,6 +331,12 @@ export class Context {
     // assumes one search at a time in that process — the harness runs its
     // queries serially. Null = the branch is dormant, not merely silent.
     private candidateProvenance: Map<string, { pool: string; rank: number }[]> | null = null;
+    // prefer-the-named-engine-family: the host's name-to-family resolution
+    // (this engine knows no corpus) and what the step did on the last search.
+    // Same one-search-at-a-time assumption as the dump state above for the
+    // diagnostic; the resolver itself is stateless per call.
+    private namedFamilyResolver: NamedFamilyResolver | null = null;
+    private lastNamedFamilyDemotion: NamedFamilyDemotion | null = null;
     private pendingCandidateDump: { query: string; rows: PreRerankCandidateRow[] } | null = null;
     // measure-and-floor-the-code-pool-at-the-merge: each domain pool as it was
     // BEFORE the merge cut it, so a row the merge dropped is still visible.
@@ -1605,6 +1612,50 @@ export class Context {
     }
 
     /**
+     * prefer-the-named-engine-family: NAMED_FAMILY_DOC_DEMOTION — when true and
+     * a resolver is installed, prose from outside every engine family the query
+     * names is stable-moved below the rest of the final list. Default false.
+     */
+    private getNamedFamilyDocDemotion(): boolean {
+        return (envManager.get('NAMED_FAMILY_DOC_DEMOTION') || 'false').toLowerCase() === 'true';
+    }
+
+    /**
+     * prefer-the-named-engine-family: install the host's name-to-family
+     * resolution (the MCP server, the panel and the eval harness build it from
+     * the source registry through one shared module). Null uninstalls it.
+     */
+    setNamedFamilyResolver(resolver: NamedFamilyResolver | null): void {
+        this.namedFamilyResolver = resolver;
+    }
+
+    /** What the named-family step did on the last search; null when it did not run. */
+    getLastNamedFamilyDemotion(): NamedFamilyDemotion | null {
+        return this.lastNamedFamilyDemotion;
+    }
+
+    /**
+     * The step itself: after the reranker and the concept quota, before the
+     * candidate dump, so every consumer sees the final order. A no-op (the same
+     * array) with the knob off, no resolver, or a query naming no family.
+     */
+    private applyNamedFamilyDocDemotion(query: string, results: SemanticSearchResult[], codebasePath?: string): SemanticSearchResult[] {
+        if (!this.namedFamilyResolver || !this.getNamedFamilyDocDemotion()) return results;
+        let match = null;
+        try {
+            match = this.namedFamilyResolver(query, codebasePath);
+        } catch (error) {
+            console.warn(`[named-family] resolver failed, list unchanged: ${(error as Error)?.message || error}`);
+            return results;
+        }
+        if (!match || !match.named || match.named.length === 0) return results;
+        const { rows, demoted, moved, demotedPaths } = demoteProseOutsideNamedFamilies(results, match.pathPrefixes);
+        this.lastNamedFamilyDemotion = { named: match.named.slice(), members: match.members.slice(), demoted, moved, demotedPaths };
+        console.log(`[named-family] named=${match.named.join(',')} family=${match.members.join(',')} demoted=${demoted} moved=${moved}`);
+        return rows;
+    }
+
+    /**
      * Build the Milvus inner-rerank strategy for the per-pool 3-channel
      * hybrid_search. If any CHANNEL_WEIGHT_* env var is set, switches to
      * Milvus 'weighted' ranker with weights aligned to buildRequests order:
@@ -2173,6 +2224,7 @@ export class Context {
         this.candidateProvenance = (process.env.CANDIDATE_LOG_DIR || '').trim() ? new Map() : null;
         this.candidateDomainPools = this.candidateProvenance ? {} : null;
         this.pendingCandidateDump = null;
+        this.lastNamedFamilyDemotion = null;
 
         // The gate is the whole address (#152): the split pools below are already
         // address-aware and degrade per pool, so a corpus whose code collection
@@ -2615,9 +2667,13 @@ export class Context {
             // the reranker (unlike applyGuaranteeSlots, which is off when a
             // reranker is active) and only for query_shape=concept. No-op
             // when the quota is disabled or the route is not concept-shaped.
-            const quotaResults = route.conceptQuota
+            const conceptResults = route.conceptQuota
                 ? this.applyConceptSpanQuota(finalResults, dedupedResults, topK)
                 : finalResults;
+            // prefer-the-named-engine-family: prose from outside every engine
+            // family the query names moves below the rest; code never moves,
+            // nothing is dropped. No-op unless NAMED_FAMILY_DOC_DEMOTION=true.
+            const quotaResults = this.applyNamedFamilyDocDemotion(query, conceptResults, codebasePath);
 
             if (quotaResults.length > 0) {
                 console.log(`[Context] 🔍 Top result score: ${quotaResults[0].score}, path: ${quotaResults[0].relativePath}`);
@@ -2670,8 +2726,10 @@ export class Context {
 
             const dedupedResults = this.deduplicateResults(results);
             console.log(`[Context] ✅ Found ${results.length} results, ${dedupedResults.length} after dedup`);
-            await this.attachCandidateSymbols(dedupedResults, codebasePath);
-            return dedupedResults;
+            // prefer-the-named-engine-family: the same final step as the hybrid path.
+            const finalResults = this.applyNamedFamilyDocDemotion(query, dedupedResults, codebasePath);
+            await this.attachCandidateSymbols(finalResults, codebasePath);
+            return finalResults;
         }
     }
 

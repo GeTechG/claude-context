@@ -81,6 +81,19 @@ export class ToolHandlers {
         this.snapshotManager = snapshotManager;
         this.currentWorkspace = process.cwd();
         console.log(`[WORKSPACE] Current workspace: ${this.currentWorkspace}`);
+        // prefer-the-named-engine-family: the engine knows no corpus, so the
+        // name-to-family resolution its named-family prose demotion reads comes
+        // from the registry, through the SAME shared module the panel and the
+        // eval harness install (search-shared.namedFamilyResolverFor). Inert
+        // unless NAMED_FAMILY_DOC_DEMOTION=true.
+        if (typeof (context as any).setNamedFamilyResolver === "function") {
+            // The searched path is passed on: a search of anything but the
+            // knowledge root gets no family resolution.
+            context.setNamedFamilyResolver((query: string, codebasePath?: string) => {
+                const knowledgeRoot = resolveKnowledgeRoot();
+                return knowledgeRoot ? searchShared.namedFamilyResolverFor(knowledgeRoot)(query, codebasePath) : null;
+            });
+        }
     }
 
     /**
