@@ -177,6 +177,15 @@ interface PreRerankCandidateRow {
 const DEFAULT_RERANKER_INPUT_K = 50;
 const DEFAULT_RERANKER_OUTPUT_K = 15;
 
+// deepen-the-prose-pool-channels: the largest per-channel depth a search may
+// ask for. Milvus refuses a search whose topk exceeds its configured limit
+// (`quotaAndLimits.limits.topK`, default 16384), and neither the SDK nor the
+// server's API exposes the configured value, so the documented default is the
+// ceiling. The retrieval stamp mirrors it (infra/lib/retrieval-config-stamp.js).
+const MILVUS_TOPK_CEILING = 16384;
+// Resolved once per distinct HYBRID_DOC_CHANNEL_K setting, per process.
+let docChannelDepth: { raw: string; depth: number; inertLoggedFor: Set<number> } | null = null;
+
 // Outer weighted-RRF smoothing constant for cross-pool merge (code/doc).
 // Smaller k = more weight on top ranks of each pool. Tunable via RRF_K env.
 const DEFAULT_RRF_K = 60;
@@ -984,7 +993,9 @@ export class Context {
             }),
             this.vectorDatabase.hybridSearch(
                 docCollection,
-                this.buildHybridRequests(docQueryEmbedding, subject, sparseExtra, perPoolK),
+                // deepen-the-prose-pool-channels: each channel is read to the doc
+                // pool's channel depth; the pool still keeps `perPoolK` rows.
+                this.buildHybridRequests(docQueryEmbedding, subject, sparseExtra, this.getDocPoolChannelK(perPoolK)),
                 { rerank: innerRerank, limit: perPoolK, filterExpr: docExpr || undefined },
             ).catch((err) => {
                 console.warn(`[Context] ⚠️ doc-domain hybrid search failed: ${err}`);
@@ -1173,6 +1184,38 @@ export class Context {
             return fallback;
         }
         return n;
+    }
+
+    /**
+     * deepen-the-prose-pool-channels: HYBRID_DOC_CHANNEL_K — an absolute depth
+     * to which each channel (dense, BM25, learned sparse) of the doc-domain
+     * pool is read before the inner fusion; the pool still returns `perPoolK`
+     * rows. Unset or `0` is off. The value is resolved once per distinct
+     * setting (so an invalid one warns once): not a positive integer, or above
+     * the vector store's topK ceiling, is invalid and treated as off. A valid
+     * depth not above this search's `perPoolK` is inert (logged once). First
+     * measured in `infra/cross-corpus-runs/deepen-prose-channels-2026-09-28/`.
+     */
+    private getDocPoolChannelK(perPoolK: number): number {
+        const raw = (envManager.get('HYBRID_DOC_CHANNEL_K') ?? '').trim();
+        if (!docChannelDepth || docChannelDepth.raw !== raw) {
+            let depth = raw === '' || raw === '0' ? 0 : this.getPositiveIntFromEnv('HYBRID_DOC_CHANNEL_K', 0);
+            if (depth > MILVUS_TOPK_CEILING) {
+                console.warn(`[Context] ⚠️ Ignoring HYBRID_DOC_CHANNEL_K=${raw}: above the vector store's topK ceiling ${MILVUS_TOPK_CEILING}; the doc pool's channels are read ${perPoolK} deep`);
+                depth = 0;
+            }
+            docChannelDepth = { raw, depth, inertLoggedFor: new Set<number>() };
+        }
+        const { depth, inertLoggedFor } = docChannelDepth;
+        if (depth === 0) return perPoolK;
+        if (depth <= perPoolK) {
+            if (!inertLoggedFor.has(perPoolK)) {
+                inertLoggedFor.add(perPoolK);
+                console.log(`[Context] HYBRID_DOC_CHANNEL_K=${depth} is inert: this search already reads each doc-pool channel ${perPoolK} deep (PER_POOL_K)`);
+            }
+            return perPoolK;
+        }
+        return depth;
     }
 
     private getRerankerInputK(): number {
