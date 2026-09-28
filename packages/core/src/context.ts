@@ -1959,7 +1959,7 @@ export class Context {
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
         requestSplitter?: Splitter
-    ): Promise<{ added: number, removed: number, modified: number, droppedChunks: number, status: 'completed' | 'limit_reached', processedFiles: number, chunkContextHeader?: { mode: ChunkContextHeaderMode; missing_contexts: number; missing_by_file: Record<string, number>; header_truncated_embedding: number; header_truncated_index_text: number } }> {
+    ): Promise<{ added: number, removed: number, modified: number, droppedChunks: number, totalChunks: number, status: 'completed' | 'limit_reached', processedFiles: number, chunkContextHeader?: { mode: ChunkContextHeaderMode; missing_contexts: number; missing_by_file: Record<string, number>; header_truncated_embedding: number; header_truncated_index_text: number } }> {
         const collectionName = this.getCollectionName(codebasePath);
         // code-collection-split: deletion set spans both v6 collections in
         // split mode. The synchronizer key stays single (`collectionName`,
@@ -2004,7 +2004,7 @@ export class Context {
             await preview.commit();
             progressCallback?.({ phase: 'No changes detected', current: 100, total: 100, percentage: 100 });
             console.log('[Context] ✅ No file changes detected.');
-            return { added: 0, removed: 0, modified: 0, droppedChunks: 0, status: 'completed', processedFiles: 0 };
+            return { added: 0, removed: 0, modified: 0, droppedChunks: 0, totalChunks: 0, status: 'completed', processedFiles: 0 };
         }
 
         await this.assertWriteReady(codebasePath, deletionTargets, [...added, ...modified], { additionalIgnorePatterns, additionalSupportedExtensions, splitter });
@@ -2037,6 +2037,9 @@ export class Context {
         const filesToIndex = [...added, ...modified].map(f => path.join(codebasePath, f));
 
         let droppedChunks = 0;
+        // index-versions: the chunks produced (dropped included), so a version build can
+        // reconcile its row count against carried - deleted + inserted.
+        let totalChunks = 0;
         let scanStatus: 'completed' | 'limit_reached' = 'completed';
         let processedFiles = 0;
         if (filesToIndex.length > 0) {
@@ -2049,6 +2052,7 @@ export class Context {
                 splitter
             );
             droppedChunks = listResult.droppedChunks;
+            totalChunks = listResult.totalChunks;
             scanStatus = listResult.status;
             processedFiles = listResult.processedFiles;
         }
@@ -2075,7 +2079,7 @@ export class Context {
         }
         progressCallback?.({ phase: 'Re-indexing complete!', current: totalChanges, total: totalChanges, percentage: 100 });
 
-        return { added: added.length, removed: removed.length, modified: modified.length, droppedChunks, status: scanStatus, processedFiles, ...headerReport() };
+        return { added: added.length, removed: removed.length, modified: modified.length, droppedChunks, totalChunks, status: scanStatus, processedFiles, ...headerReport() };
     }
 
     /**
@@ -3552,7 +3556,7 @@ export class Context {
         }, null, 2);
         try {
             await fs.promises.writeFile(vocabPath, payload, 'utf-8');
-            this.symbolVocabCache.set(codebasePath, new Set(sorted));
+            this.symbolVocabCache.set(vocabPath, new Set(sorted));
             console.log(`[Context] 📚 Wrote symbol vocabulary (${sorted.length} unique symbols) → ${vocabPath}`);
         } catch (err) {
             console.warn(`[Context] ⚠️ Failed to persist symbol vocabulary: ${err}`);
@@ -3814,20 +3818,22 @@ export class Context {
      * fall back to unfiltered candidate extraction.
      */
     async loadSymbolVocabulary(codebasePath: string): Promise<ReadonlySet<string> | null> {
-        if (this.symbolVocabCache.has(codebasePath)) {
-            return this.symbolVocabCache.get(codebasePath) ?? null;
-        }
+        // index-versions: keyed by the RESOLVED read path, like the graph cache, so a
+        // swapped SYMBOL_VOCAB_FILE loads the new version's vocabulary.
         const vocabPath = this.getSymbolVocabReadPath(codebasePath);
+        if (this.symbolVocabCache.has(vocabPath)) {
+            return this.symbolVocabCache.get(vocabPath) ?? null;
+        }
         try {
             const raw = await fs.promises.readFile(vocabPath, 'utf-8');
             const parsed = JSON.parse(raw);
             const list: unknown = parsed?.symbols;
             if (!Array.isArray(list)) {
-                this.symbolVocabCache.set(codebasePath, null);
+                this.symbolVocabCache.set(vocabPath, null);
                 return null;
             }
             const set = new Set<string>(list.filter((s): s is string => typeof s === 'string' && s.length > 0));
-            this.symbolVocabCache.set(codebasePath, set);
+            this.symbolVocabCache.set(vocabPath, set);
             // name-declarations-and-refresh-the-vocabulary: the date and the
             // provenance, not only the count. Every reference edge a build writes
             // is filtered through this file, so a build that does not say WHICH
@@ -3839,7 +3845,7 @@ export class Context {
             console.log(`[Context] 📚 Loaded symbol vocabulary (${set.size} symbols, generated ${stamp}, ${from}) from ${vocabPath}`);
             return set;
         } catch {
-            this.symbolVocabCache.set(codebasePath, null);
+            this.symbolVocabCache.set(vocabPath, null);
             return null;
         }
     }

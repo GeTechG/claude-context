@@ -8,6 +8,7 @@ import { envManager } from '../utils/env-manager';
 // set all come from the data-driven registry. Adding a language = one entry there.
 import {
     astSupportedLanguages,
+    ATTACHED_NODE_TYPES,
     getSplittableTypes,
     isAstSupported,
     loadLanguage,
@@ -213,6 +214,20 @@ export function firstLeadingComment(node: Parser.SyntaxNode, code: string, docOn
         below = prev;
     }
     return first;
+}
+
+/**
+ * attach-haxe-docs-across-metadata: the first of the sibling nodes directly above `node` that the
+ * grammar registry marks as attached to a declaration (Haxe `@:keep`), or `node` when there is
+ * none. The run stops at a blank line, as the comment run does.
+ */
+export function attachedHead(node: Parser.SyntaxNode): Parser.SyntaxNode {
+    let head = node;
+    for (let prev = node.previousSibling; prev && ATTACHED_NODE_TYPES.has(prev.type); prev = prev.previousSibling) {
+        if (head.startPosition.row - prev.endPosition.row > 1) break;
+        head = prev;
+    }
+    return head;
 }
 
 export function declaratorName(node: Parser.SyntaxNode): string | undefined {
@@ -513,8 +528,10 @@ export class AstCodeSplitter implements Splitter {
             if (emit) {
                 // keep-doc-comments-with-their-declarations: only the START moves; everything
                 // read off the node below (symbol, kind, structure, references) is the declaration's.
-                const lead = withLeadingComments ? firstLeadingComment(currentNode, code, commentsMode === 'doc') : null;
-                const startNode = lead ?? currentNode;
+                // attach-haxe-docs-across-metadata: the head (metadata above it) is the declaration's too.
+                const head = withLeadingComments ? attachedHead(currentNode) : currentNode;
+                const lead = withLeadingComments ? firstLeadingComment(head, code, commentsMode === 'doc') : null;
+                const startNode = lead ?? head;
                 const startLine = startNode.startPosition.row + 1;
                 const endLine = currentNode.endPosition.row + 1;
                 const nodeText = code.slice(startNode.startIndex, currentNode.endIndex);
@@ -655,8 +672,11 @@ export class AstCodeSplitter implements Splitter {
             // A declaration the grammar table does not emit (a TypeScript `enum`) is its own
             // chunk, with its doc block, whole — cut by size later like any declaration.
             if (n.type in NODE_TYPE_TO_SYMBOL_KIND && this.extractSymbolName(n, splittableSet)) {
-                const lead = mode === 'off' ? null : firstLeadingComment(n, code, mode === 'doc');
-                const docs = lead ? open.filter((m) => m.startIndex >= lead.startIndex) : [];
+                // attach-haxe-docs-across-metadata: metadata above the declaration goes with it.
+                const head = mode === 'off' ? n : attachedHead(n);
+                const lead = mode === 'off' ? null : firstLeadingComment(head, code, mode === 'doc');
+                const from = (lead ?? head).startIndex;
+                const docs = open.filter((m) => m.startIndex >= from);
                 open = open.filter((m) => !docs.includes(m));
                 close();
                 groups.push([...docs, n]);

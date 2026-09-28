@@ -16,6 +16,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import {
     ListToolsRequestSchema,
@@ -32,6 +33,12 @@ import { SnapshotManager } from "./snapshot.js";
 import { SyncManager } from "./sync.js";
 import { ToolHandlers } from "./handlers.js";
 import { findReferencesEnabled, findReferencesTools } from "./find-references-tool.js";
+
+// index-versions: the serving pointer overlays the .mcp.json defaults and is
+// re-read (one stat) before every tool call and health check, so a swap reaches
+// this server without a restart. The shared, tested loader in infra/lib. It logs
+// every launcher-supplied value it replaces; LOCAL_RAG_NO_POINTER=1 opts out.
+const servedEnv: any = createRequire(import.meta.url)("../../../../../infra/lib/served-env.js");
 
 class ContextMcpServer {
     private config: ContextMcpConfig;
@@ -336,6 +343,7 @@ This tool is versatile and can be used before completing various tasks to retrie
         // Handle tool execution
         server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
+            await servedEnv.ensureServedEnv(() => this.vectorDatabase.listCollections());
 
             switch (name) {
                 case "index_codebase":
@@ -388,26 +396,14 @@ This tool is versatile and can be used before completing various tasks to retrie
         console.log('[SYNC-DEBUG] MCP server initialization complete');
     }
 
-    // serve-mcp-from-container: the served version and image commit, and a
-    // failure while Milvus holds no collection of that version — a dropped
-    // index must mark the container unhealthy, not serve empty results.
+    // serve-mcp-from-container + index-versions: the served version, its origin
+    // (pointer | default) and the image commit; unhealthy while Milvus holds no
+    // collection of that version, the pointer is unresolvable or a generation
+    // pointer is left over. The rule is servedHealth in infra/lib/served-env.js,
+    // which the panel's /api/served answers with too.
     private async health(): Promise<{ status: number; body: Record<string, unknown> }> {
-        const version = process.env.COLLECTION_VERSION || null;
-        const commit = process.env.LOCAL_RAG_IMAGE_COMMIT || null;
-        try {
-            // Same rule as servedHealth in infra/lib/served-env.js: canonical pools
-            // only (no _bak copies), and with split collections both pools.
-            const pattern = new RegExp(`^hybrid_${version}_(prose|code)_[0-9a-f]+$`);
-            const collections = (await this.vectorDatabase.listCollections()).filter((n) => pattern.test(n));
-            const pools = new Set(collections.map((n) => n.split('_')[2]));
-            const needed = process.env.SPLIT_COLLECTIONS === 'true' ? ['prose', 'code'] : [];
-            if (!version || collections.length === 0 || needed.some((p) => !pools.has(p))) {
-                return { status: 503, body: { ok: false, version, commit, error: `no collections of served version ${version}` } };
-            }
-            return { status: 200, body: { ok: true, version, commit, collections: collections.length } };
-        } catch (error: any) {
-            return { status: 503, body: { ok: false, version, commit, error: `milvus unreachable: ${error?.message || error}` } };
-        }
+        const list = () => this.vectorDatabase.listCollections();
+        return servedEnv.servedHealth(list, process.env, await servedEnv.refreshServedEnvChecked(list));
     }
 
     private async listenHttp(port: number) {
@@ -486,6 +482,9 @@ async function main() {
         showHelpMessage();
         process.exit(0);
     }
+
+    // The pointed version's settings before anything reads the env.
+    servedEnv.refreshServedEnv();
 
     // Create configuration
     const config = createMcpConfig();

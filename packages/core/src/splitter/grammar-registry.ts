@@ -40,6 +40,13 @@ export interface GrammarSpec {
     export?: string;
     /** Splittable node types → symbol metadata. */
     nodes: Record<string, NodeKindSpec>;
+    /**
+     * attach-haxe-docs-across-metadata: sibling node types written above a declaration that
+     * belong to it (Haxe `@:keep`). With leading comments on, the chunk starts at them and its
+     * doc comment is looked for above them. Grammars that nest annotations inside the
+     * declaration node (Java, TypeScript) need no entry.
+     */
+    attached?: string[];
 }
 
 const fn = (): NodeKindSpec => ({ kind: 'function' });
@@ -134,6 +141,7 @@ export const GRAMMARS: GrammarSpec[] = [
             ClassType: cls(), EnumType: enm(), AbstractType: { kind: 'abstract', parentScope: true },
             DefType: { kind: 'typedef', parentScope: true }, ClassMethod: method(),
         },
+        attached: ['MetaDataEntry'],
     },
     {
         langs: ['hxml'],
@@ -171,6 +179,7 @@ const splittableByLang = new Map<string, string[]>();
 export const NODE_TYPE_TO_SYMBOL_KIND: Record<string, string> = {};
 /** node types that introduce a parent symbol scope, merged across all grammars. */
 export const PARENT_SCOPE_NODE_TYPES = new Set<string>();
+export const ATTACHED_NODE_TYPES = new Set<string>();
 /**
  * no-chunks-inside-function-bodies: the parameter-list node types of the grammars above
  * (JS/TS/Java `formal_parameters`, C/C++/Go/C# `parameter_list`, Python/Rust `parameters`,
@@ -188,6 +197,7 @@ for (const spec of GRAMMARS) {
         if (meta.kind) NODE_TYPE_TO_SYMBOL_KIND[nodeType] = meta.kind;
         if (meta.parentScope) PARENT_SCOPE_NODE_TYPES.add(nodeType);
     }
+    for (const nodeType of spec.attached ?? []) ATTACHED_NODE_TYPES.add(nodeType);
 }
 
 /** Splittable node types for a language id, or null if unsupported by the AST splitter. */

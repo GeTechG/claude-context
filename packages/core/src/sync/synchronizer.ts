@@ -14,21 +14,25 @@ export class FileSynchronizer {
 
     constructor(rootDir: string, ignorePatterns: string[] = [], supportedExtensions: string[] = []) {
         this.rootDir = rootDir;
-        this.snapshotPath = this.getSnapshotPath(rootDir);
+        this.snapshotPath = FileSynchronizer.snapshotPath(rootDir);
         this.fileHashes = new Map();
         this.merkleDAG = new MerkleDAG();
         this.ignorePatterns = ignorePatterns;
         this.supportedExtensions = supportedExtensions;
     }
 
-    private getSnapshotPath(codebasePath: string): string {
-        const homeDir = os.homedir();
-        const merkleDir = path.join(homeDir, '.context', 'merkle');
-
-        const normalizedPath = path.resolve(codebasePath);
-        const hash = crypto.createHash('md5').update(normalizedPath).digest('hex');
-
-        return path.join(merkleDir, `${hash}.json`);
+    /**
+     * index-versions: `MERKLE_SNAPSHOT_FILE` names the snapshot of the knowledge root
+     * (`LOCAL_RAG_KNOWLEDGE_ROOT`) explicitly, so each index version keeps its own instead
+     * of every version sharing the per-path file. Any other codebase — and every path while
+     * either is unset — keeps the per-path file under ~/.context/merkle, as before.
+     */
+    static snapshotPath(codebasePath: string): string {
+        const explicit = process.env.MERKLE_SNAPSHOT_FILE;
+        const root = process.env.LOCAL_RAG_KNOWLEDGE_ROOT;
+        if (explicit && root && path.resolve(codebasePath) === path.resolve(root)) return path.resolve(explicit);
+        const hash = crypto.createHash('md5').update(path.resolve(codebasePath)).digest('hex');
+        return path.join(os.homedir(), '.context', 'merkle', `${hash}.json`);
     }
 
     private async hashFile(filePath: string): Promise<string> {
@@ -351,8 +355,7 @@ export class FileSynchronizer {
      * in a file beside it (the snapshot JSON is rewritten by more than one writer).
      */
     static baselinePath(codebasePath: string): string {
-        const hash = crypto.createHash('md5').update(path.resolve(codebasePath)).digest('hex');
-        return path.join(os.homedir(), '.context', 'merkle', `${hash}.collections.json`);
+        return FileSynchronizer.snapshotPath(codebasePath).replace(/(\.json)?$/, '.collections.json');
     }
 
     /** The recorded collections, or null when the snapshot predates the record. */
@@ -376,11 +379,7 @@ export class FileSynchronizer {
      */
     static async deleteSnapshot(codebasePath: string): Promise<void> {
         await fs.rm(FileSynchronizer.baselinePath(codebasePath), { force: true });
-        const homeDir = os.homedir();
-        const merkleDir = path.join(homeDir, '.context', 'merkle');
-        const normalizedPath = path.resolve(codebasePath);
-        const hash = crypto.createHash('md5').update(normalizedPath).digest('hex');
-        const snapshotPath = path.join(merkleDir, `${hash}.json`);
+        const snapshotPath = FileSynchronizer.snapshotPath(codebasePath);
 
         try {
             await fs.unlink(snapshotPath);
