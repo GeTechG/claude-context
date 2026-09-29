@@ -49,6 +49,7 @@ import { findReferences, FindReferencesAnswer } from './search/find-references';
 import { ReferenceRelation } from './search/symbol-index-refs';
 import { applyRewriting, RewriteFlags, RewriteResult } from './search/query-rewrite';
 import { demoteProseOutsideNamedFamilies, NamedFamilyResolver, NamedFamilyDemotion } from './search/named-family-demotion';
+import { isRelationalQuery } from './search/relational-query';
 import { Reranker } from './reranker';
 import { extractCandidateSymbols } from './enrichment';
 import * as fs from 'fs';
@@ -185,6 +186,10 @@ const DEFAULT_RERANKER_OUTPUT_K = 15;
 const MILVUS_TOPK_CEILING = 16384;
 // Resolved once per distinct HYBRID_DOC_CHANNEL_K setting, per process.
 let docChannelDepth: { raw: string; depth: number; inertLoggedFor: Set<number> } | null = null;
+// show-the-reranker-the-file-path: RERANKER_PASSAGE_PATH values already warned
+// about as unrecognised (once per process per value).
+const warnedRerankerPassagePath = new Set<string>();
+export type RerankerPassagePathMode = 'off' | 'on' | 'unless_relational';
 
 // Outer weighted-RRF smoothing constant for cross-pool merge (code/doc).
 // Smaller k = more weight on top ranks of each pool. Tunable via RRF_K env.
@@ -1216,6 +1221,35 @@ export class Context {
             return perPoolK;
         }
         return depth;
+    }
+
+    /**
+     * show-the-reranker-the-file-path: RERANKER_PASSAGE_PATH — what text the
+     * cross-encoder reads for each candidate. Unset / `off` / unrecognised: the
+     * chunk's content (the pre-change passage; an unrecognised value warns
+     * once). `on`: `File: <relativePath>`, a blank line, then the content.
+     * `unless_relational`: as `on`, except a relational question ("what calls
+     * X") keeps the content-only passage. Measured in
+     * `infra/cross-corpus-runs/rerank-path-text-2026-09-30/`.
+     */
+    private getRerankerPassagePathMode(): RerankerPassagePathMode {
+        const raw = (envManager.get('RERANKER_PASSAGE_PATH') ?? '').trim();
+        const v = raw.toLowerCase();
+        if (v === 'on' || v === 'unless_relational') return v;
+        if (v !== '' && v !== 'off' && !warnedRerankerPassagePath.has(raw)) {
+            warnedRerankerPassagePath.add(raw);
+            console.warn(`[Context] ⚠️ Ignoring unrecognised RERANKER_PASSAGE_PATH=${raw}; expected off, on or unless_relational — the reranker reads content only`);
+        }
+        return 'off';
+    }
+
+    /** The passages the reranker scores, one per candidate, in order. */
+    private rerankerPassages(query: string, candidates: SemanticSearchResult[]): string[] {
+        const mode = this.getRerankerPassagePathMode();
+        const withPath = mode === 'on' || (mode === 'unless_relational' && !isRelationalQuery(query));
+        return withPath
+            ? candidates.map((c) => `File: ${c.relativePath}\n\n${c.content}`)
+            : candidates.map((c) => c.content);
     }
 
     private getRerankerInputK(): number {
@@ -3089,7 +3123,7 @@ export class Context {
         const inputK = Math.min(this.getRerankerInputK(), candidates.length);
         const outputK = Math.max(this.getRerankerOutputK(), topK);
         const slice = candidates.slice(0, inputK);
-        const docs = slice.map((c) => c.content);
+        const docs = this.rerankerPassages(query, slice);
 
         let rerankResults;
         try {
