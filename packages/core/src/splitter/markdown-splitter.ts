@@ -1,5 +1,6 @@
 import { Splitter, CodeChunk } from './index';
 import { extractMentionedSymbolsFromText } from '../enrichment/symbol-extractor';
+import { envManager } from '../utils/env-manager';
 
 // rag-graph-layer Phase 1.2: provider for the vocabulary used to filter
 // `mentioned_symbols` at split time. The splitter calls `getMentionedVocab()`
@@ -7,6 +8,22 @@ import { extractMentionedSymbolsFromText } from '../enrichment/symbol-extractor'
 // skipped (raw extraction). Indexing-pipeline wiring sets this provider on
 // each splitter instance to point at `<codebasePath>/.symbols-vocab.json`.
 export type MentionedVocabProvider = () => ReadonlySet<string> | null | undefined;
+
+/**
+ * keep-code-lead-ins-with-their-blocks: `CODE_CHUNK_PROSE_LEADIN=on` joins the short paragraph
+ * that introduces a code block to that block's chunk. `off` (the default) is the splitter as it
+ * was, byte for byte.
+ */
+export function proseLeadInEnabled(): boolean {
+    return (envManager.get('CODE_CHUNK_PROSE_LEADIN') || '').trim().toLowerCase() === 'on';
+}
+
+/**
+ * The longest lead-in joined, in characters without surrounding whitespace: the census
+ * threshold of infra/cross-corpus-runs/fix-crawled-code-blocks-2026-09-29/intro-split-census.json,
+ * not tuned. A longer last paragraph is an explanation, not a caption, and stays prose.
+ */
+export const LEADIN_MAX_CHARS = 300;
 
 /**
  * Section-aware splitter for markdown (.md) and reStructuredText (.rst).
@@ -18,6 +35,8 @@ export type MentionedVocabProvider = () => ReadonlySet<string> | null | undefine
  *   - Fenced code blocks (``` ```...``` ```) are emitted as separate chunks
  *     with `content_type='code_example'`, `language` taken from the info string
  *     when present, and the same `heading_path` as the surrounding section.
+ *   - With `CODE_CHUNK_PROSE_LEADIN=on`, a short last paragraph of prose directly before a
+ *     code block is joined to that block's chunk (see `joinLeadIns`).
  *   - Sections that exceed `chunkSize` are split further by character count
  *     (heading_path is preserved on each sub-chunk).
  */
@@ -56,6 +75,10 @@ export class MarkdownSplitter implements Splitter {
         // rag-graph-layer Phase 1.2: resolve vocab once per file so the
         // provider isn't re-read per chunk.
         const vocab = this.mentionedVocabProvider?.() ?? undefined;
+
+        if (proseLeadInEnabled()) {
+            for (const section of sections) section.blocks = joinLeadIns(section.blocks, this.chunkSize);
+        }
 
         const chunks: CodeChunk[] = [];
         for (const section of sections) {
@@ -387,13 +410,50 @@ export class MarkdownSplitter implements Splitter {
     }
 }
 
+/**
+ * keep-code-lead-ins-with-their-blocks: within one section, the last paragraph (the maximal run of
+ * non-blank lines ending at the last non-blank line) of a prose block directly followed by a code
+ * block moves into that code block when it is at most LEADIN_MAX_CHARS long and the joined text
+ * fits `chunkSize`. The joined block is the file's lines from the paragraph's first line to the
+ * code's last, verbatim, and stays `code`; the prose before the paragraph keeps its lines minus
+ * trailing blank ones, or disappears when nothing else is left. Anything else is left as it was.
+ * Exported for tests.
+ */
+export function joinLeadIns(blocks: Block[], chunkSize: number): Block[] {
+    const out: Block[] = [];
+    for (let i = 0; i < blocks.length; i++) {
+        const prose = blocks[i];
+        const code = blocks[i + 1];
+        if (prose.kind !== 'doc' || !code || code.kind !== 'code') { out.push(prose); continue; }
+        const lines = prose.content.split('\n');
+        // Only a prose block whose lines run up to the code's first line is its lead-in.
+        if (prose.startLine + lines.length !== code.startLine) { out.push(prose); continue; }
+        let end = lines.length - 1;
+        while (end >= 0 && lines[end].trim().length === 0) end--;
+        if (end < 0) { out.push(prose); continue; }
+        let start = end;
+        while (start > 0 && lines[start - 1].trim().length > 0) start--;
+        const leadIn = lines.slice(start, end + 1).join('\n').trim();
+        const joined = lines.slice(start).join('\n') + '\n' + code.content;
+        if (leadIn.length > LEADIN_MAX_CHARS || joined.length > chunkSize) { out.push(prose); continue; }
+        let keep = start;
+        while (keep > 0 && lines[keep - 1].trim().length === 0) keep--;
+        if (keep > 0) {
+            out.push({ kind: 'doc', content: lines.slice(0, keep).join('\n'), startLine: prose.startLine, endLine: prose.startLine + keep - 1 });
+        }
+        out.push({ ...code, content: joined, startLine: prose.startLine + start });
+        i++; // the code block is consumed
+    }
+    return out;
+}
+
 interface Section {
     headingPath: string[];
     startLine: number;
     blocks: Block[];
 }
 
-interface Block {
+export interface Block {
     kind: 'doc' | 'code';
     content: string;
     startLine: number;
