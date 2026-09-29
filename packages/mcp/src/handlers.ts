@@ -41,17 +41,6 @@ const searchShared: any = localRequire("../../../../../infra/lib/search-shared.j
 // leftover per-source generation pointer. What serves is the index version the
 // serving pointer names, overlaid on the env before each tool call (index.ts).
 const servingRoot: any = localRequire("../../../../../infra/lib/serving-root.js");
-const defaultRegistryPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../../local-rag.sources.json");
-
-function loadProvenanceContext(knowledgeRoot: string): { registry: any; state: any; diagnostic: string | null } {
-    try {
-        const registryPath = process.env.LOCAL_RAG_SOURCE_REGISTRY || defaultRegistryPath;
-        return { registry: sourceRegistry.loadRegistry(registryPath), state: sourceRegistry.loadState(knowledgeRoot), diagnostic: null };
-    } catch (error: any) {
-        return { registry: { version: 1, sources: [] }, state: { version: 1, sources: {} }, diagnostic: error?.message || String(error) };
-    }
-}
-
 // retrieval-confidence-band: map a reranker relevance score (cross-encoder
 // sigmoid, saturates toward 1.0) onto a coarse low|medium|high band so any
 // caller of search_code can tell when a descriptive query under-performed and
@@ -1709,7 +1698,9 @@ export class ToolHandlers {
             // (codex review B9), even when the categories were listed under a
             // child path.
             const krPath = resolveKnowledgeRoot();
-            const provenanceContext = loadProvenanceContext(krPath ? servingRoot.knowledgeRootFor(krPath, absRoot) : absRoot);
+            // The ONE provenance loader search_code uses too (search-shared), so the
+            // two surfaces read the same registry and state the same way.
+            const provenanceContext = searchShared.provenanceContextFor(krPath ? servingRoot.knowledgeRootFor(krPath, absRoot) : absRoot);
             const categoryMetadata = rows.map((row) => ({
                 category: row.cat,
                 counts: row.counts,
@@ -1718,13 +1709,23 @@ export class ToolHandlers {
                 sources: provenanceContext.registry.sources
                     .filter((s: any) => s.category === row.cat)
                     .map((s: any) => {
-                        const observed = provenanceContext.state.sources?.[s.source_id] || null;
+                        // list-categories-reads-the-served-projection: the SAME
+                        // projection search provenance reads (resolveProvenance).
+                        // With a serving pointer the index stamp is the served
+                        // manifest's (dated by its build) and a git source's
+                        // revision is the commit the served version indexed —
+                        // never the shared state's pre-pointer stamp or the staged
+                        // snapshot's commit. Without a pointer it is the record.
+                        const state = provenanceContext.state;
+                        const observed = sourceRegistry.servedObserved(state, s.source_id);
                         return {
                             source_id: s.source_id,
                             kind: s.kind,
                             requested_ref: s.requested_ref || null,
                             declared_version: s.declared_version || null,
-                            resolved_revision: observed?.resolved_revision || observed?.checksum || null,
+                            resolved_revision: s.kind === 'git'
+                                ? sourceRegistry.servedCommitOf(state, s.source_id)
+                                : (observed?.resolved_revision || observed?.checksum || null),
                             active_index_fingerprint: observed?.index?.corpus_fingerprint || null,
                             freshness: sourceRegistry.freshnessFor(s, observed),
                         };
